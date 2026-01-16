@@ -27,10 +27,9 @@ pip install -r requirements.txt
 ```
 
 2. Ensure ROM files are available:
-   - Place C64 ROM files in `../lib/assets/` (relative to this directory):
-     - `basic.901226-01.bin`
-     - `kernal.901227-03.bin`
-     - `characters.901225-01.bin`
+   - By default, the emulator auto-detects ROMs from common locations, including a per-user directory and common VICE install paths.
+   - You can always point to ROMs explicitly with `--rom-dir`.
+   - If ROMs are not found and you are running interactively, the emulator can offer to install ROMs from a **local** directory or archive into a per-user directory (so future runs work automatically). ROMs are not shipped by default because many ROM binaries are copyrighted.
 
 ## Usage
 
@@ -49,7 +48,7 @@ python C64.py
 ### Command Line Options
 
 - `prg_file`: Optional PRG file to load and run
-- `--rom-dir DIR`: Directory containing ROM files (default: `../lib/assets`)
+- `--rom-dir DIR`: Directory containing ROM files (default: auto-detect common locations)
 - `--tcp-port PORT`: Enable TCP server on specified port
 - `--udp-port PORT`: Enable UDP server on specified port
 - `--max-cycles N`: Maximum CPU cycles to run (default: unlimited)
