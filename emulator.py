@@ -9,12 +9,16 @@ import struct
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional
+
+from rich.console import Console
+from rich.text import Text
 
 from .constants import SCREEN_MEM, COLOR_MEM, ROM_KERNAL_START
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
 from .memory import MemoryMap
+from .roms import REQUIRED_ROMS
 from .ui import TextualInterface
 
 class C64:
@@ -51,62 +55,65 @@ class C64:
         """
         import os
 
-        # Load BASIC ROM
-        basic_path = os.path.join(rom_dir, "basic.901226-01.bin")
-        if not os.path.exists(basic_path):
-            # Stop textual UI if it exists
-            if hasattr(self, 'interface') and hasattr(self.interface, 'exit'):
-                try:
-                    self.interface.exit()
-                except:
-                    pass
-            print(f"ERROR: BASIC ROM not found at {basic_path}")
-            sys.exit(1)
-        with open(basic_path, "rb") as f:
-            self.memory.basic_rom = f.read()
+        def _read_rom_file(filename: str) -> bytes:
+            """
+            Read a ROM file from rom_dir.
+
+            Supports both c64py's canonical dot-names and common VICE dash-names.
+            """
+            # Build name_candidates from REQUIRED_ROMS to maintain single source of truth
+            name_candidates = (filename,)
+            for spec in REQUIRED_ROMS:
+                if spec.filename == filename:
+                    name_candidates = (spec.filename, *spec.aliases)
+                    break
+
+            tried_paths = []
+            for name in name_candidates:
+                path = os.path.join(rom_dir, name)
+                tried_paths.append(path)
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        return f.read()
+            tried_paths_str = ", ".join(tried_paths) if tried_paths else "<no paths constructed>"
+            raise FileNotFoundError(
+                f"ROM not found. Tried candidate names {list(name_candidates)} at paths: {tried_paths_str}"
+            )
+
+        try:
+            # Load BASIC ROM
+            self.memory.basic_rom = _read_rom_file("basic.901226-01.bin")
             if self.rich_interface:
                 self.rich_interface.add_debug_log(f"💾 Loaded BASIC ROM: {len(self.memory.basic_rom)} bytes")
 
-        # Load KERNAL ROM
-        kernal_path = os.path.join(rom_dir, "kernal.901227-03.bin")
-        if not os.path.exists(kernal_path):
-            # Stop textual UI if it exists
-            if hasattr(self, 'interface') and hasattr(self.interface, 'exit'):
-                try:
-                    self.interface.exit()
-                except:
-                    pass
-            print(f"ERROR: KERNAL ROM not found at {kernal_path}")
-            sys.exit(1)
-        with open(kernal_path, "rb") as f:
-            self.memory.kernal_rom = f.read()
+            # Load KERNAL ROM
+            self.memory.kernal_rom = _read_rom_file("kernal.901227-03.bin")
             if self.rich_interface:
                 self.rich_interface.add_debug_log(f"💾 Loaded KERNAL ROM: {len(self.memory.kernal_rom)} bytes")
-        # Set reset vector in RAM (KERNAL ROM has it at $FFFC-$FFFD)
-        if len(self.memory.kernal_rom) >= (0x10000 - ROM_KERNAL_START):
-            reset_offset = 0xFFFC - ROM_KERNAL_START
-            reset_low = self.memory.kernal_rom[reset_offset]
-            reset_high = self.memory.kernal_rom[reset_offset + 1]
-            self.memory.ram[0xFFFC] = reset_low
-            self.memory.ram[0xFFFD] = reset_high
-            if self.rich_interface:
-                self.rich_interface.add_debug_log(f"🔄 Reset vector: ${reset_high:02X}{reset_low:02X}")
 
-        # Load Character ROM
-        char_path = os.path.join(rom_dir, "characters.901225-01.bin")
-        if not os.path.exists(char_path):
-            # Stop textual UI if it exists
-            if hasattr(self, 'interface') and hasattr(self.interface, 'exit'):
-                try:
-                    self.interface.exit()
-                except:
-                    pass
-            print(f"ERROR: Character ROM not found at {char_path}")
-            sys.exit(1)
-        with open(char_path, "rb") as f:
-            self.memory.char_rom = f.read()
+            # Set reset vector in RAM (KERNAL ROM has it at $FFFC-$FFFD)
+            if self.memory.kernal_rom and len(self.memory.kernal_rom) >= (0x10000 - ROM_KERNAL_START):
+                reset_offset = 0xFFFC - ROM_KERNAL_START
+                reset_low = self.memory.kernal_rom[reset_offset]
+                reset_high = self.memory.kernal_rom[reset_offset + 1]
+                self.memory.ram[0xFFFC] = reset_low
+                self.memory.ram[0xFFFD] = reset_high
+                if self.rich_interface:
+                    self.rich_interface.add_debug_log(f"🔄 Reset vector: ${reset_high:02X}{reset_low:02X}")
+
+            # Load Character ROM
+            self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
             if self.rich_interface:
                 self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+        except Exception:
+            # Stop textual UI if it exists so error is visible to user.
+            if hasattr(self, "interface") and hasattr(self.interface, "exit"):
+                try:
+                    self.interface.exit()
+                except Exception as exit_err:
+                    # Best-effort cleanup: log failure to exit interface but do not mask the original error.
+                    sys.stderr.write(f"Failed to cleanly exit interface: {exit_err}\n")
+            raise
 
         # Initialize C64 state (sets memory config $01 = 0x37)
         self._initialize_c64()
