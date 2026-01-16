@@ -278,9 +278,20 @@ def _find_rom_dir_within_tree(root: Path) -> Optional[Path]:
     """
     if roms_present_in_dir(root):
         return root
+
+    # Limit recursion depth when walking large or deeply nested trees to avoid
+    # excessive traversal time on pathological directory structures.
+    max_depth = 10
+    base_depth = len(root.parts)
+
     try:
         for dirpath, dirnames, filenames in os.walk(root):
             dp = Path(dirpath)
+            current_depth = len(dp.parts) - base_depth
+            if current_depth > max_depth:
+                # Prevent os.walk from descending further under this directory.
+                dirnames[:] = []
+                continue
             if roms_present_in_dir(dp):
                 return dp
     except Exception:
