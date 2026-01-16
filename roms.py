@@ -21,6 +21,24 @@ from typing import Iterable, Optional, Sequence
 
 @dataclass(frozen=True)
 class RomSpec:
+    """
+    Specification for a required Commodore 64 ROM file.
+
+    This dataclass defines the metadata needed to identify and validate
+    a single ROM file required by the emulator.
+
+    Attributes:
+        key: A unique identifier for the ROM type (e.g., "basic", "kernal",
+            "characters"). This serves as a human-readable label for the ROM
+            and may be used for programmatic identification.
+        filename: The canonical/preferred filename for this ROM
+            (e.g., "basic.901226-01.bin").
+        aliases: Alternative filenames that are acceptable for this ROM.
+            Used to support different naming conventions across ROM sources.
+        expected_size: The expected size in bytes for this ROM file, or None
+            if no size validation is required. Used for basic validation
+            without being overly strict about ROM revisions.
+    """
     key: str
     filename: str
     aliases: Sequence[str] = ()
@@ -231,18 +249,20 @@ def _extract_archive_to_temp(archive_path: Path) -> Path:
                 for info in zf.infolist():
                     # Directories are represented with trailing slash names.
                     name = info.filename
-                    if not name or name.endswith("/"):
+                    if not name:
                         continue
+                    # Validate the target path before extraction.
                     _safe_extract_path(temp_dir, name)
-                zf.extractall(temp_dir)
+                    zf.extract(info, temp_dir)
             return temp_dir
         if tarfile.is_tarfile(archive_path):
             with tarfile.open(archive_path, "r:*") as tf:
                 for member in tf.getmembers():
                     if not member.name:
                         continue
+                    # Validate the target path before extraction.
                     _safe_extract_path(temp_dir, member.name)
-                tf.extractall(temp_dir)
+                    tf.extract(member, temp_dir)
             return temp_dir
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -258,9 +278,20 @@ def _find_rom_dir_within_tree(root: Path) -> Optional[Path]:
     """
     if roms_present_in_dir(root):
         return root
+
+    # Limit recursion depth when walking large or deeply nested trees to avoid
+    # excessive traversal time on pathological directory structures.
+    max_depth = 10
+    base_depth = len(root.parts)
+
     try:
         for dirpath, dirnames, filenames in os.walk(root):
             dp = Path(dirpath)
+            current_depth = len(dp.parts) - base_depth
+            if current_depth > max_depth:
+                # Prevent os.walk from descending further under this directory.
+                dirnames[:] = []
+                continue
             if roms_present_in_dir(dp):
                 return dp
     except Exception:

@@ -68,14 +68,17 @@ class C64:
                     name_candidates = (spec.filename, *spec.aliases)
                     break
 
-            last_path = None
+            tried_paths = []
             for name in name_candidates:
                 path = os.path.join(rom_dir, name)
-                last_path = path
+                tried_paths.append(path)
                 if os.path.exists(path):
                     with open(path, "rb") as f:
                         return f.read()
-            raise FileNotFoundError(f"ROM not found (tried {list(name_candidates)}): {last_path}")
+            tried_paths_str = ", ".join(tried_paths) if tried_paths else "<no paths constructed>"
+            raise FileNotFoundError(
+                f"ROM not found. Tried candidate names {list(name_candidates)} at paths: {tried_paths_str}"
+            )
 
         try:
             # Load BASIC ROM
@@ -107,8 +110,9 @@ class C64:
             if hasattr(self, "interface") and hasattr(self.interface, "exit"):
                 try:
                     self.interface.exit()
-                except Exception:
-                    pass
+                except Exception as exit_err:
+                    # Best-effort cleanup: log failure to exit interface but do not mask the original error.
+                    sys.stderr.write(f"Failed to cleanly exit interface: {exit_err}\n")
             raise
 
         # Initialize C64 state (sets memory config $01 = 0x37)

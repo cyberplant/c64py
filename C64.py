@@ -91,12 +91,13 @@ def main():
         emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
     # Load ROMs (auto-detect common locations if not provided).
+    # Import ROM helper with support for both package and script execution.
     try:
-        try:
-            from .roms import ensure_roms_available
-        except ImportError:
-            from c64py.roms import ensure_roms_available
+        from .roms import ensure_roms_available
+    except ImportError:
+        from c64py.roms import ensure_roms_available
 
+    try:
         explicit_rom_dir = args.rom_dir
         if explicit_rom_dir and not os.path.isabs(explicit_rom_dir):
             # Backward-compatible: interpret relative paths relative to the repo root
@@ -114,6 +115,7 @@ def main():
             if hasattr(emu, "interface") and hasattr(emu.interface, "exit"):
                 emu.interface.exit()
         except Exception:
+            # Ignore errors during cleanup so we don't mask the original ROM loading failure.
             pass
         print(f"ERROR: {e}")
         sys.exit(1)
