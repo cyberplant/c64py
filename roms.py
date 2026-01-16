@@ -249,18 +249,20 @@ def _extract_archive_to_temp(archive_path: Path) -> Path:
                 for info in zf.infolist():
                     # Directories are represented with trailing slash names.
                     name = info.filename
-                    if not name or name.endswith("/"):
+                    if not name:
                         continue
+                    # Validate the target path before extraction.
                     _safe_extract_path(temp_dir, name)
-                zf.extractall(temp_dir)
+                    zf.extract(info, temp_dir)
             return temp_dir
         if tarfile.is_tarfile(archive_path):
             with tarfile.open(archive_path, "r:*") as tf:
                 for member in tf.getmembers():
                     if not member.name:
                         continue
+                    # Validate the target path before extraction.
                     _safe_extract_path(temp_dir, member.name)
-                tf.extractall(temp_dir)
+                    tf.extract(member, temp_dir)
             return temp_dir
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
