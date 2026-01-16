@@ -66,14 +66,17 @@ class C64:
                 "characters.901225-01.bin": ("characters.901225-01.bin", "chargen-901225-01.bin"),
             }.get(filename, (filename,))
 
-            last_path = None
+            tried_paths = []
             for name in name_candidates:
                 path = os.path.join(rom_dir, name)
-                last_path = path
+                tried_paths.append(path)
                 if os.path.exists(path):
                     with open(path, "rb") as f:
                         return f.read()
-            raise FileNotFoundError(f"ROM not found (tried {list(name_candidates)}): {last_path}")
+            tried_paths_str = ", ".join(tried_paths) if tried_paths else "<no paths constructed>"
+            raise FileNotFoundError(
+                f"ROM not found. Tried candidate names {list(name_candidates)} at paths: {tried_paths_str}"
+            )
 
         try:
             # Load BASIC ROM
