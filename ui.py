@@ -5,6 +5,7 @@ Textual User Interface
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from rich.console import Console
@@ -85,6 +86,10 @@ class TextualInterface(App):
         self.status_bar = None
         # Last committed input line (debug/inspection)
         self.last_committed_line = ""
+        # Cursor blink state (roughly 1Hz like C64)
+        self.cursor_blink_interval = 0.5
+        self.cursor_blink_on = True
+        self.cursor_blink_last_toggle = time.monotonic()
 
     def compose(self) -> ComposeResult:
         if not self.fullscreen:
@@ -208,6 +213,10 @@ class TextualInterface(App):
 
             # Update screen display
             screen_content = self.emulator.render_text_screen(no_colors=False)
+            cursor_row = self.emulator.memory.read(0xD3)
+            cursor_col = self.emulator.memory.read(0xD8)
+            cursor_row = max(0, min(cursor_row, 24))
+            cursor_col = max(0, min(cursor_col, 39))
 
             # Debug: Check if screen has any non-space content
             non_space_count = sum(1 for c in screen_content if c not in (' ', '\n'))
@@ -220,16 +229,24 @@ class TextualInterface(App):
                 self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
                 self._screen_debug_logged = True
 
+            # Update cursor blink state
+            now = time.monotonic()
+            if now - self.cursor_blink_last_toggle >= self.cursor_blink_interval:
+                self.cursor_blink_on = not self.cursor_blink_on
+                self.cursor_blink_last_toggle = now
+
             # For RichLog, clear and write new content
+            screen_text = Text(screen_content)
+            if self.cursor_blink_on:
+                cursor_index = cursor_row * 41 + cursor_col
+                if 0 <= cursor_index < len(screen_content):
+                    screen_text.stylize("reverse", cursor_index, cursor_index + 1)
             self.c64_display.clear()
-            self.c64_display.write(screen_content)
+            self.c64_display.write(screen_text)
 
             # Update status bar with actual cycle count from emulator (only in non-fullscreen mode)
             if not self.fullscreen:
                 emu = self.emulator
-                # Read cursor position from memory
-                cursor_row = emu.memory.read(0xD3)
-                cursor_col = emu.memory.read(0xD8)
                 status_text = f"🎮 C64 | Cycle: {emu.current_cycles:,} | PC: ${emu.cpu.state.pc:04X} | A: ${emu.cpu.state.a:02X} | X: ${emu.cpu.state.x:02X} | Y: ${emu.cpu.state.y:02X} | SP: ${emu.cpu.state.sp:02X} | Cursor: {cursor_row},{cursor_col}"
                 if self.status_bar:
                     self.status_bar.update(status_text)
