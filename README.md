@@ -142,4 +142,4 @@ The emulator consists of several key components:
 
 ## License
 
-See the main project license.
+Licensed under the **BSD 3-Clause License**. See `LICENSE`.
