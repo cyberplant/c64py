@@ -105,8 +105,9 @@ class C64:
             if hasattr(self, "interface") and hasattr(self.interface, "exit"):
                 try:
                     self.interface.exit()
-                except Exception:
-                    pass
+                except Exception as exit_err:
+                    # Best-effort cleanup: log failure to exit interface but do not mask the original error.
+                    sys.stderr.write(f"Failed to cleanly exit interface: {exit_err}\n")
             raise
 
         # Initialize C64 state (sets memory config $01 = 0x37)
