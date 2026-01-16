@@ -21,6 +21,24 @@ from typing import Iterable, Optional, Sequence
 
 @dataclass(frozen=True)
 class RomSpec:
+    """
+    Specification for a required Commodore 64 ROM file.
+
+    This dataclass defines the metadata needed to identify and validate
+    a single ROM file required by the emulator.
+
+    Attributes:
+        key: A unique identifier for the ROM type (e.g., "basic", "kernal",
+            "characters"). This serves as a human-readable label for the ROM
+            and may be used for programmatic identification.
+        filename: The canonical/preferred filename for this ROM
+            (e.g., "basic.901226-01.bin").
+        aliases: Alternative filenames that are acceptable for this ROM.
+            Used to support different naming conventions across ROM sources.
+        expected_size: The expected size in bytes for this ROM file, or None
+            if no size validation is required. Used for basic validation
+            without being overly strict about ROM revisions.
+    """
     key: str
     filename: str
     aliases: Sequence[str] = ()
