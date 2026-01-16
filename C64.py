@@ -34,12 +34,14 @@ except ImportError:
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Default ROM directory is relative to script location
-    default_rom_dir = os.path.join(os.path.dirname(script_dir), "lib", "assets")
 
     ap = argparse.ArgumentParser(description="C64 Emulator (text mode)")
     ap.add_argument("prg_file", nargs="?", help="PRG file to load and run")
-    ap.add_argument("--rom-dir", default=default_rom_dir, help="Directory containing ROM files")
+    ap.add_argument(
+        "--rom-dir",
+        default=None,
+        help="Directory containing ROM files (default: auto-detect common locations)",
+    )
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
@@ -88,15 +90,33 @@ def main():
     if not args.fullscreen:
         emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
-    # Load ROMs - convert to absolute path if relative
-    if not os.path.isabs(args.rom_dir):
-        # If relative, make it relative to the parent of script directory
-        # (script is in c64py/, so parent is project root)
-        parent_dir = os.path.dirname(script_dir)
-        rom_dir = os.path.normpath(os.path.join(parent_dir, args.rom_dir))
-    else:
-        rom_dir = args.rom_dir
-    emu.load_roms(rom_dir)
+    # Load ROMs (auto-detect common locations if not provided).
+    try:
+        try:
+            from .roms import ensure_roms_available
+        except ImportError:
+            from c64py.roms import ensure_roms_available
+
+        explicit_rom_dir = args.rom_dir
+        if explicit_rom_dir and not os.path.isabs(explicit_rom_dir):
+            # Backward-compatible: interpret relative paths relative to the repo root
+            # (this script lives in c64py/, so parent is project root).
+            parent_dir = os.path.dirname(script_dir)
+            explicit_rom_dir = os.path.normpath(os.path.join(parent_dir, explicit_rom_dir))
+
+        rom_dir_path = ensure_roms_available(explicit_rom_dir, allow_prompt=True)
+        emu.load_roms(str(rom_dir_path))
+        if not args.fullscreen:
+            emu.interface.add_debug_log(f"💾 ROM directory: {rom_dir_path}")
+    except Exception as e:
+        # Ensure UI is not left running, then show a clear error.
+        try:
+            if hasattr(emu, "interface") and hasattr(emu.interface, "exit"):
+                emu.interface.exit()
+        except Exception:
+            pass
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
     # Store PRG file path for loading after boot (BASIC boot clears $0801-$0802)
     if args.prg_file:
