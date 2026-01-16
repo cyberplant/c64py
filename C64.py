@@ -115,6 +115,7 @@ def main():
             if hasattr(emu, "interface") and hasattr(emu.interface, "exit"):
                 emu.interface.exit()
         except Exception:
+            # Ignore errors during cleanup so we don't mask the original ROM loading failure.
             pass
         print(f"ERROR: {e}")
         sys.exit(1)
