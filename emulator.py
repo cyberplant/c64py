@@ -9,7 +9,7 @@ import struct
 import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 from .constants import SCREEN_MEM, COLOR_MEM, ROM_KERNAL_START
 from .cpu import CPU6502
@@ -745,6 +745,30 @@ class C64:
                 line = ''.join(self.text_screen[row])
                 lines.append(line)
             return '\n'.join(lines)
+
+    def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
+        """Enqueue a PETSCII code into the KERNAL keyboard buffer."""
+        kb_buf_base = 0x0277
+        kb_buf_len = self.memory.read(0xC6)
+        if kb_buf_len >= 10:
+            return False
+
+        self.memory.write(kb_buf_base + kb_buf_len, petscii_code & 0xFF)
+        kb_buf_len += 1
+        self.memory.write(0xC6, kb_buf_len)
+        return True
+
+    def send_petscii(self, petscii_code: int) -> None:
+        """Send a PETSCII key to the emulator input path."""
+        if self.interface and hasattr(self.interface, "handle_petscii_input"):
+            self.interface.handle_petscii_input(petscii_code & 0xFF)
+            return
+        self._enqueue_keyboard_buffer(petscii_code & 0xFF)
+
+    def send_petscii_sequence(self, codes: List[int]) -> None:
+        """Send multiple PETSCII codes to the emulator input path."""
+        for code in codes:
+            self.send_petscii(code)
 
     def _render_with_rich(self) -> str:
         """Render screen using Rich library for better formatting"""
