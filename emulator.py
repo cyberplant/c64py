@@ -18,6 +18,7 @@ from .constants import SCREEN_MEM, COLOR_MEM, ROM_KERNAL_START
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
 from .memory import MemoryMap
+from .roms import REQUIRED_ROMS
 from .ui import TextualInterface
 
 class C64:
@@ -60,11 +61,12 @@ class C64:
 
             Supports both c64py's canonical dot-names and common VICE dash-names.
             """
-            name_candidates = {
-                "basic.901226-01.bin": ("basic.901226-01.bin", "basic-901226-01.bin"),
-                "kernal.901227-03.bin": ("kernal.901227-03.bin", "kernal-901227-03.bin"),
-                "characters.901225-01.bin": ("characters.901225-01.bin", "chargen-901225-01.bin"),
-            }.get(filename, (filename,))
+            # Build name_candidates from REQUIRED_ROMS to maintain single source of truth
+            name_candidates = (filename,)
+            for spec in REQUIRED_ROMS:
+                if spec.filename == filename:
+                    name_candidates = (spec.filename, *spec.aliases)
+                    break
 
             tried_paths = []
             for name in name_candidates:
