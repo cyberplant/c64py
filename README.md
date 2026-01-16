@@ -21,6 +21,14 @@ A Commodore 64 emulator implemented in Python with a text-based interface. This 
 
 ## Installation
 
+### From PyPI (recommended)
+
+```bash
+pip install c64py
+```
+
+### From source (development)
+
 1. Install dependencies:
 ```bash
 pip install -r requirements.txt
@@ -37,12 +45,12 @@ pip install -r requirements.txt
 
 Run the emulator with a PRG file (auto-runs the program):
 ```bash
-python C64.py program.prg
+c64py program.prg
 ```
 
 Run the emulator without a program (starts at BASIC prompt):
 ```bash
-python C64.py
+c64py
 ```
 
 ### Command Line Options
@@ -66,27 +74,27 @@ python C64.py
 
 Run with debug output:
 ```bash
-python C64.py program.prg --debug
+c64py program.prg --debug
 ```
 
 Run in server mode (TCP):
 ```bash
-python C64.py --tcp-port 1234
+c64py --tcp-port 1234
 ```
 
 Run with UDP debug logging:
 ```bash
-python C64.py program.prg --udp-debug --udp-debug-port 64738
+c64py program.prg --udp-debug --udp-debug-port 64738
 ```
 
 Run with auto-quit after max cycles:
 ```bash
-python C64.py program.prg --max-cycles 5000000 --autoquit
+c64py program.prg --max-cycles 5000000 --autoquit
 ```
 
 Dump memory after execution:
 ```bash
-python C64.py program.prg --dump-memory memory.prg
+c64py program.prg --dump-memory memory.prg
 ```
 
 ### Server Mode Commands

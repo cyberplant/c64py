@@ -2,6 +2,8 @@
 C64 Emulator Package
 """
 
+__version__ = "0.1.0"
+
 from .emulator import C64
 from .cpu import CPU6502
 from .memory import MemoryMap

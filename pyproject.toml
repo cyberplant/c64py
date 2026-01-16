@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c64py"
+version = "0.1.0"
+description = "A Commodore 64 emulator implemented in Python with a text-based interface."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "c64py contributors" }]
+dependencies = [
+  "rich>=13.0.0",
+  "textual>=0.40.0",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/luar/c64py"
+
+[project.scripts]
+c64py = "c64py.C64:main"
+
+[tool.setuptools]
+packages = ["c64py"]
+
+# This repository's root directory is the Python package directory.
+# It allows importing modules as `c64py.*` without moving files.
+package-dir = { c64py = "." }
+
+[tool.setuptools.exclude-package-data]
+c64py = ["__pycache__/*", "*.pyc", "*.pyo", "*.pyd"]
+
