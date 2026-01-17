@@ -8,6 +8,7 @@ A Commodore 64 emulator implemented in Python with a text-based interface. This 
 - **Memory Management**: Complete C64 memory map with ROM/RAM mapping
 - **I/O Devices**: VIC, SID, CIA1, CIA2 emulation
 - **Text Mode Interface**: Beautiful textual UI using Rich and Textual libraries
+- **Graphics Mode**: Optional pygame window for C64 display output
 - **PRG File Loading**: Load and auto-run Commodore 64 programs
 - **Server Mode**: TCP/UDP server for remote control
 - **Debug Support**: UDP debug logging and detailed debug output
@@ -69,6 +70,10 @@ c64py
 - `--screen-update-interval SECONDS`: Screen update interval (default: 0.1)
 - `--video-standard {pal,ntsc}`: Video standard (default: pal)
 - `--no-colors`: Disable ANSI color output
+- `--graphics`: Render output in a pygame graphics window
+- `--graphics-scale N`: Scale factor for graphics window (default: 2)
+- `--graphics-fps N`: Target FPS for graphics window (default: 30)
+- `--graphics-border N`: Border size in pixels for graphics window (default: 32)
 
 ### Examples
 
