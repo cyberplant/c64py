@@ -13,8 +13,10 @@ Set `C64PY_ROM_DIR` to point at that directory.
 
 ### Option A: Build from the provided source repo
 
-1. Install the cc65 toolchain (provides `ca65` and `ld65`).
-2. Ensure `crc32` is available (used by the Makefile checksum step).
+1. Install build prerequisites (Debian/Ubuntu example):
+   - `sudo apt-get update && sudo apt-get install -y git cc65 libarchive-zip-perl`
+2. Clone the ROM sources:
+   - `git clone https://github.com/mist64/c64rom.git /workspace/c64rom`
 3. Build ROMs:
    - `cd /workspace/c64rom`
    - `make`
