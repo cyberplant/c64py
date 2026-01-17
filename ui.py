@@ -15,7 +15,18 @@ from textual.containers import Vertical, VerticalScroll
 from textual.events import Key
 from textual.widgets import Static, Header, Footer, RichLog
 
-from .constants import SCREEN_MEM
+from .constants import (
+    CURSOR_COL_ADDR,
+    CURSOR_PTR_HIGH,
+    CURSOR_PTR_LOW,
+    CURSOR_ROW_ADDR,
+    INPUT_BUFFER_BASE,
+    INPUT_BUFFER_INDEX_ADDR,
+    INPUT_BUFFER_LEN_ADDR,
+    KEYBOARD_BUFFER_BASE,
+    KEYBOARD_BUFFER_LEN_ADDR,
+    SCREEN_MEM,
+)
 
 if TYPE_CHECKING:
     from .emulator import C64
@@ -213,8 +224,8 @@ class TextualInterface(App):
 
             # Update screen display
             screen_content = self.emulator.render_text_screen(no_colors=False)
-            cursor_row = self.emulator.memory.read(0xD3)
-            cursor_col = self.emulator.memory.read(0xD8)
+            cursor_row = self.emulator.memory.read(CURSOR_ROW_ADDR)
+            cursor_col = self.emulator.memory.read(CURSOR_COL_ADDR)
             cursor_row = max(0, min(cursor_row, 24))
             cursor_col = max(0, min(cursor_col, 39))
 
@@ -389,8 +400,8 @@ class TextualInterface(App):
             return
 
         # Get cursor position from zero-page
-        cursor_low = self.emulator.memory.read(0xD1)
-        cursor_high = self.emulator.memory.read(0xD2)
+        cursor_low = self.emulator.memory.read(CURSOR_PTR_LOW)
+        cursor_high = self.emulator.memory.read(CURSOR_PTR_HIGH)
         cursor_addr = cursor_low | (cursor_high << 8)
 
         # If cursor is invalid, start at screen base
@@ -428,14 +439,14 @@ class TextualInterface(App):
                     cursor_addr = SCREEN_MEM + 24 * 40
 
         # Update cursor position
-        self.emulator.memory.write(0xD1, cursor_addr & 0xFF)
-        self.emulator.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
+        self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
+        self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
 
         # Also update row and column variables
         row = (cursor_addr - SCREEN_MEM) // 40
         col = (cursor_addr - SCREEN_MEM) % 40
-        self.emulator.memory.write(0xD3, row)  # Cursor row
-        self.emulator.memory.write(0xD8, col)  # Cursor column
+        self.emulator.memory.write(CURSOR_ROW_ADDR, row)  # Cursor row
+        self.emulator.memory.write(CURSOR_COL_ADDR, col)  # Cursor column
 
         # Update the text screen representation for display
         self.emulator._update_text_screen()
@@ -444,13 +455,7 @@ class TextualInterface(App):
         """Return cursor row, column, and absolute address."""
         if not self.emulator:
             return 0, 0, SCREEN_MEM
-
-        row = self.emulator.memory.read(0xD3)
-        col = self.emulator.memory.read(0xD8)
-        row = max(0, min(row, 24))
-        col = max(0, min(col, 39))
-        cursor_addr = SCREEN_MEM + row * 40 + col
-        return row, col, cursor_addr
+        return self.emulator.get_cursor_position()
 
     def _set_cursor_position(self, row: int, col: int) -> None:
         """Update cursor position in zero-page variables."""
@@ -461,10 +466,10 @@ class TextualInterface(App):
         col = max(0, min(col, 39))
         cursor_addr = SCREEN_MEM + row * 40 + col
 
-        self.emulator.memory.write(0xD1, cursor_addr & 0xFF)
-        self.emulator.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
-        self.emulator.memory.write(0xD3, row)
-        self.emulator.memory.write(0xD8, col)
+        self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
+        self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
+        self.emulator.memory.write(CURSOR_ROW_ADDR, row)
+        self.emulator.memory.write(CURSOR_COL_ADDR, col)
 
     def _move_cursor_left(self) -> None:
         if not self.emulator:
@@ -520,37 +525,29 @@ class TextualInterface(App):
     def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
         if not self.emulator:
             return False
-
-        kb_buf_base = 0x0277
-        kb_buf_len = self.emulator.memory.read(0xC6)
-        if kb_buf_len >= 10:
-            return False
-
-        self.emulator.memory.write(kb_buf_base + kb_buf_len, petscii_code)
-        kb_buf_len += 1
-        self.emulator.memory.write(0xC6, kb_buf_len)
-        return True
+        # Delegate to emulator to keep buffer logic centralized.
+        return self.emulator._enqueue_keyboard_buffer(petscii_code)
 
     def _remove_last_keyboard_buffer_char(self) -> bool:
         if not self.emulator:
             return False
 
-        kb_buf_base = 0x0277
-        kb_buf_len = self.emulator.memory.read(0xC6)
+        kb_buf_base = KEYBOARD_BUFFER_BASE
+        kb_buf_len = self.emulator.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
         if kb_buf_len <= 0:
             return False
 
         kb_buf_len -= 1
         self.emulator.memory.write(kb_buf_base + kb_buf_len, 0)
-        self.emulator.memory.write(0xC6, kb_buf_len)
+        self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
         return True
 
     def _clear_keyboard_buffer(self) -> None:
         if not self.emulator:
             return
 
-        kb_buf_base = 0x0277
-        self.emulator.memory.write(0xC6, 0)
+        kb_buf_base = KEYBOARD_BUFFER_BASE
+        self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, 0)
         for i in range(10):
             self.emulator.memory.write(kb_buf_base + i, 0)
 
@@ -559,6 +556,8 @@ class TextualInterface(App):
             return False
 
         try:
+            # Heuristic: CHRIN is used for keyboard input; this does not
+            # fully represent the C64 screen editor state.
             return self.emulator.cpu.state.pc == 0xFFCF
         except Exception:
             return False
@@ -566,9 +565,7 @@ class TextualInterface(App):
     def _read_screen_line_codes(self, row: int) -> List[int]:
         if not self.emulator:
             return []
-
-        line_start = SCREEN_MEM + row * 40
-        return [self.emulator.memory.read(line_start + col) for col in range(40)]
+        return self.emulator.read_screen_line_codes(row)
 
     def _extract_current_line_codes(self) -> List[int]:
         row, _, _ = self._get_cursor_position()
@@ -603,10 +600,10 @@ class TextualInterface(App):
 
         for i in range(89):
             value = line_codes[i] if i < len(line_codes) else 0
-            self.emulator.memory.write(0x0200 + i, value)
+            self.emulator.memory.write(INPUT_BUFFER_BASE + i, value)
 
-        self.emulator.memory.write(0x029B, 0)  # Input buffer read index
-        self.emulator.memory.write(0x029C, len(line_codes))  # Input buffer length
+        self.emulator.memory.write(INPUT_BUFFER_INDEX_ADDR, 0)  # Input buffer read index
+        self.emulator.memory.write(INPUT_BUFFER_LEN_ADDR, len(line_codes))  # Input buffer length
         self._clear_keyboard_buffer()
 
         self.last_committed_line = self._codes_to_ascii(line_codes[:-1])

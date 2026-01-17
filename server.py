@@ -8,7 +8,7 @@ import socket
 import threading
 from typing import Optional, Tuple
 
-from .constants import SCREEN_MEM
+from .constants import KEYBOARD_BUFFER_BASE, KEYBOARD_BUFFER_LEN_ADDR
 from .emulator import C64
 
 class EmulatorServer:
@@ -182,29 +182,15 @@ HELP/?              - Show this help message"""
             return "OK"
 
         elif cmd == "SHOW_KEYBOARD_BUFFER":
-            kb_buf_base = 0x0277
-            kb_buf_len = self.emu.memory.read(0xC6)
+            kb_buf_base = KEYBOARD_BUFFER_BASE
+            kb_buf_len = self.emu.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
             codes = [self.emu.memory.read(kb_buf_base + i) for i in range(kb_buf_len)]
             hex_codes = ' '.join(f"${code:02X}" for code in codes)
             ascii_codes = ''.join(chr(code) if 0x20 <= code <= 0x7E else '.' for code in codes)
             return f"LEN={kb_buf_len} CODES=[{hex_codes}] ASCII='{ascii_codes}'"
 
         elif cmd == "SHOW_CURRENT_LINE":
-            row = self.emu.memory.read(0xD3)
-            col = self.emu.memory.read(0xD8)
-            row = max(0, min(row, 24))
-            col = max(0, min(col, 39))
-            line_start = SCREEN_MEM + row * 40
-            codes = [self.emu.memory.read(line_start + i) for i in range(40)]
-            last_non_space = -1
-            for i in range(39, -1, -1):
-                if codes[i] != 0x20:
-                    last_non_space = i
-                    break
-            if last_non_space == -1:
-                line_codes = []
-            else:
-                line_codes = codes[:last_non_space + 1]
+            row, col, line_codes = self.emu.get_current_line()
             hex_codes = ' '.join(f"${code:02X}" for code in line_codes)
             ascii_line = ''.join(chr(code) if 0x20 <= code <= 0x7E else '.' for code in line_codes)
             return f"ROW={row} COL={col} LINE='{ascii_line}' CODES=[{hex_codes}]"
