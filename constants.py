@@ -25,6 +25,12 @@ IRQ_VECTOR = 0x0314
 # Screen memory (default)
 SCREEN_MEM = 0x0400
 COLOR_MEM = 0xD800
+SCREEN_COLS = 40
+SCREEN_ROWS = 25
+
+# Renderer border (text-mode UI)
+BORDER_WIDTH = 4
+BORDER_HEIGHT = 4
 
 # Cursor state (zero-page)
 CURSOR_PTR_LOW = 0xD1
@@ -40,3 +46,11 @@ KEYBOARD_BUFFER_LEN_ADDR = 0xC6
 INPUT_BUFFER_BASE = 0x0200
 INPUT_BUFFER_INDEX_ADDR = 0x029B
 INPUT_BUFFER_LEN_ADDR = 0x029C
+
+# Cursor blink (KERNAL zero-page variables; used/updated by IRQ on real C64)
+# We emulate these so the UI can reflect machine-controlled blink state.
+BLNSW = 0x00CC  # Cursor blink enable/state (simplified)
+BLNCT = 0x00CD  # Cursor blink counter (simplified)
+
+# Cursor blink cadence. We treat CIA Timer A interrupt as ~60Hz.
+CURSOR_BLINK_TICKS = 30  # ~0.5s at 60Hz

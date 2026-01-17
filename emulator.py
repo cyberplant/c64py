@@ -9,19 +9,25 @@ import struct
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 from rich.console import Console
 from rich.text import Text
 
 from .constants import (
     COLOR_MEM,
+    BLNSW,
+    BLNCT,
+    BORDER_WIDTH,
+    BORDER_HEIGHT,
     CURSOR_COL_ADDR,
     CURSOR_ROW_ADDR,
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
     ROM_KERNAL_START,
     SCREEN_MEM,
+    SCREEN_COLS,
+    SCREEN_ROWS,
 )
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
@@ -31,6 +37,27 @@ from .ui import TextualInterface
 
 class C64:
     """Main C64 emulator"""
+
+    # C64 16-color palette (RGB), Pepto/VICE-like approximation.
+    # Index matches C64 color codes (0-15) used by BASIC/VIC.
+    _C64_PALETTE_RGB: Tuple[Tuple[int, int, int], ...] = (
+        (0x00, 0x00, 0x00),  # 0  black
+        (0xFF, 0xFF, 0xFF),  # 1  white
+        (0x88, 0x00, 0x00),  # 2  red
+        (0xAA, 0xFF, 0xEE),  # 3  cyan
+        (0xCC, 0x44, 0xCC),  # 4  purple
+        (0x00, 0xCC, 0x55),  # 5  green
+        (0x00, 0x00, 0xAA),  # 6  blue
+        (0xEE, 0xEE, 0x77),  # 7  yellow
+        (0xDD, 0x88, 0x55),  # 8  orange
+        (0x66, 0x44, 0x00),  # 9  brown
+        (0xFF, 0x77, 0x77),  # 10 light red
+        (0x33, 0x33, 0x33),  # 11 dark gray
+        (0x77, 0x77, 0x77),  # 12 gray
+        (0xAA, 0xFF, 0x66),  # 13 light green
+        (0x00, 0x88, 0xFF),  # 14 light blue
+        (0xBB, 0xBB, 0xBB),  # 15 light gray
+    )
 
     def __init__(self):
         self.memory = MemoryMap()
@@ -170,15 +197,21 @@ class C64:
 
         # Initialize color memory (default: light blue = 14, but we'll use white = 1)
         for addr in range(COLOR_MEM, COLOR_MEM + 1000):
-            self.memory.ram[addr] = 1  # White
+            # Default C64 power-on text is light blue on blue.
+            # Color RAM is 4-bit and lives in I/O space; it is handled by MemoryMap.
+            self.memory.ram[addr] = 0x0E  # Light blue
 
         # Initialize VIC registers (simplified)
         # VIC register $D018: Screen and character memory
         # Bit 1-3: Screen memory (default $0400 = %000 = 0)
         # Bit 4-7: Character memory (default $1000 = %010 = 2)
         # So $D018 = %00010000 = $10
-        if hasattr(self.memory, '_vic_regs'):
-            self.memory._vic_regs[0x18] = 0x10  # Screen at $0400, chars at $1000
+        # Seed key VIC state so early frames render like a real C64, even before ROM init.
+        # Use memory-mapped I/O writes so the values land in the VIC register model.
+        # Seed VIC state directly (independent of banking).
+        self.memory.poke_vic(0x18, 0x10)  # Screen at $0400, chars at $1000
+        self.memory.poke_vic(0x20, 0x0E)  # Border: light blue
+        self.memory.poke_vic(0x21, 0x06)  # Background: blue
 
         # Initialize stack pointer
         self.cpu.state.sp = 0xFF
@@ -191,7 +224,11 @@ class C64:
 
         # Initialize some zero-page variables
         self.memory.ram[0x0288] = 0x0E  # Cursor color (light blue)
-        self.memory.ram[0x0286] = 0x0E  # Background color (light blue)
+        self.memory.ram[0x0286] = 0x0E  # Current text color (light blue)
+        # Cursor blink (machine-controlled; UI should follow this)
+        # bit0 = enabled, bit7 = visible
+        self.memory.ram[BLNSW] = 0x81
+        self.memory.ram[BLNCT] = 0
 
         # Initialize cursor position (points to screen start)
         # $D1/$D2 store the cursor address (low/high bytes)
@@ -751,15 +788,64 @@ class C64:
                     self.text_screen[row][col] = char
                     self.text_colors[row][col] = color_code
 
-    def render_text_screen(self, no_colors: bool = False) -> str:
-        """Render text screen as simple white text on blue background"""
-        # Simple rendering: white text on blue background
+    @classmethod
+    def _c64_color_to_rich_rgb(cls, color_code: int) -> str:
+        """Convert a C64 color code (0-15) to a Rich rgb(...) string."""
+        r, g, b = cls._C64_PALETTE_RGB[color_code & 0x0F]
+        return f"rgb({r},{g},{b})"
+
+    def _render_text_screen_rich(self) -> Text:
+        """Render text screen as a Rich Text renderable with C64 colors."""
+        # VIC-II background color (applies to the whole screen in standard text mode)
+        # IMPORTANT: render should reflect VIC state, not CPU-visible banking.
+        background_color = self.memory.peek_vic(0x21) & 0x0F
+        bg_style = self._c64_color_to_rich_rgb(background_color)
+        border_color = self.memory.peek_vic(0x20) & 0x0F
+        border_style = self._c64_color_to_rich_rgb(border_color)
+        border_cell_style = f"{border_style} on {border_style}"
+
         with self.screen_lock:
-            lines = []
-            for row in range(25):
-                line = ''.join(self.text_screen[row])
-                lines.append(line)
-            return '\n'.join(lines)
+            screen_text = Text()
+            # Draw a simple 1-character border around the 40x25 screen.
+            # C64 border is a solid color region; we emulate it with spaces.
+            full_cols = SCREEN_COLS + BORDER_WIDTH * 2
+
+            # Top border
+            for _ in range(BORDER_HEIGHT):
+                screen_text.append(" " * full_cols, style=border_cell_style)
+                screen_text.append("\n")
+
+            for row in range(SCREEN_ROWS):
+                # Left border
+                screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
+                for col in range(SCREEN_COLS):
+                    char = self.text_screen[row][col]
+                    fg = self.text_colors[row][col] & 0x0F
+                    fg_style = self._c64_color_to_rich_rgb(fg)
+                    screen_text.append(char, style=f"{fg_style} on {bg_style}")
+                # Right border
+                screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
+                if row < (SCREEN_ROWS - 1):
+                    screen_text.append("\n")
+
+            # Bottom border
+            screen_text.append("\n")
+            for i in range(BORDER_HEIGHT):
+                screen_text.append(" " * full_cols, style=border_cell_style)
+                if i < BORDER_HEIGHT - 1:
+                    screen_text.append("\n")
+            return screen_text
+
+    def render_text_screen(self, no_colors: bool = False) -> Union[str, Text]:
+        """Render the current text screen.
+
+        - If `no_colors` is True, returns plain text (for server/CLI).
+        - Otherwise returns a Rich `Text` renderable with C64 BASIC/VIC colors.
+        """
+        if no_colors:
+            with self.screen_lock:
+                return "\n".join("".join(self.text_screen[row]) for row in range(25))
+        return self._render_text_screen_rich()
 
     def get_cursor_position(self) -> Tuple[int, int, int]:
         """Return cursor row, column, and absolute address."""
@@ -822,8 +908,8 @@ class C64:
         """Render screen using Rich library for better formatting"""
 
         # Read C64 colors from memory
-        background_color = self.memory.read(0xD021) & 0x0F  # Background color
-        border_color = self.memory.read(0xD020) & 0x0F      # Border color
+        background_color = self.memory.peek_vic(0x21) & 0x0F  # Background color
+        border_color = self.memory.peek_vic(0x20) & 0x0F      # Border color
 
         # C64 color to ANSI 256 color mapping (better color approximation)
         c64_to_ansi256 = {
@@ -898,8 +984,8 @@ class C64:
         """Render text screen with ANSI colors (fallback)"""
 
         # Read C64 colors from memory
-        background_color = self.memory.read(0xD021) & 0x0F  # Background color
-        border_color = self.memory.read(0xD020) & 0x0F      # Border color
+        background_color = self.memory.peek_vic(0x21) & 0x0F  # Background color
+        border_color = self.memory.peek_vic(0x20) & 0x0F      # Border color
 
         # C64 color to ANSI 256 color mapping
         c64_to_ansi256 = {

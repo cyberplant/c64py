@@ -6,7 +6,18 @@ from __future__ import annotations
 
 from typing import Optional, TYPE_CHECKING
 
-from .constants import SCREEN_MEM, IRQ_VECTOR
+from .constants import (
+    SCREEN_MEM,
+    COLOR_MEM,
+    IRQ_VECTOR,
+    BLNSW,
+    BLNCT,
+    CURSOR_BLINK_TICKS,
+    CURSOR_PTR_LOW,
+    CURSOR_PTR_HIGH,
+    CURSOR_ROW_ADDR,
+    CURSOR_COL_ADDR,
+)
 from .cpu_state import CPUState
 from .memory import MemoryMap
 
@@ -51,6 +62,23 @@ class CPU6502:
         self._set_flag(0x02, value == 0)  # Z flag
         self._set_flag(0x80, (value & 0x80) != 0)  # N flag
 
+    def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
+        """Advance timers/video/IRQs even if CPU is 'blocked'."""
+        self.state.cycles += cycles
+
+        # Update CIA timers
+        self._update_cia_timers(cycles)
+
+        # Update VIC-II raster line (simulate video timing)
+        raster_max = 312 if self.memory.video_standard == "pal" else 263
+        # We keep the existing "1 step per instruction" behavior for consistency.
+        self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+
+        # Check for pending IRQ (only if interrupts are enabled)
+        if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
+            if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
+                self._handle_cia_interrupt()
+
     def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0) -> int:
         """Execute one instruction, return cycles"""
         self.current_cycles = current_cycles
@@ -83,12 +111,46 @@ class CPU6502:
         # Special handling for CINT - simulate PAL/NTSC detection
         if pc == 0xFF5B:  # Start of CINT
             if self.interface:
-                self.interface.add_debug_log("🎯 CINT: Simulating PAL/NTSC detection, returning immediately")
+                self.interface.add_debug_log("🎯 CINT: Fast-path init (screen + default colors)")
             # CINT is supposed to:
             # 1. Clear screen memory
             # 2. Detect PAL/NTSC by timing
             # 3. Set up VIC registers
             # For emulator, we skip timing and assume configured standard
+
+            # Restore default C64 look so SYS 64738 behaves like a reboot:
+            # border light blue, background blue, text light blue.
+            # Use VIC register model directly so it works regardless of banking.
+            try:
+                self.memory.poke_vic(0x20, 0x0E)  # border
+                self.memory.poke_vic(0x21, 0x06)  # background
+                self.memory.poke_vic(0x18, 0x10)  # screen/charset layout
+            except Exception:
+                # If VIC helpers aren't available for some reason, fall back to I/O writes.
+                self.memory.write(0xD020, 0x0E)
+                self.memory.write(0xD021, 0x06)
+                self.memory.write(0xD018, 0x10)
+
+            # Current text/cursor color (POKE 646 and cursor color)
+            self.memory.write(0x0286, 0x0E)
+            self.memory.write(0x0288, 0x0E)
+
+            # Clear screen and set color RAM to current text color.
+            for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
+                self.memory.write(addr, 0x20)
+            for addr in range(COLOR_MEM, COLOR_MEM + 1000):
+                self.memory.write(addr, 0x0E)
+
+            # Reset cursor position to top-left.
+            self.memory.write(CURSOR_PTR_LOW, SCREEN_MEM & 0xFF)
+            self.memory.write(CURSOR_PTR_HIGH, (SCREEN_MEM >> 8) & 0xFF)
+            self.memory.write(CURSOR_ROW_ADDR, 0)
+            self.memory.write(CURSOR_COL_ADDR, 0)
+
+            # Reset machine-controlled cursor blink state.
+            # bit0 = enabled, bit7 = visible
+            self.memory.write(BLNSW, 0x81)
+            self.memory.write(BLNCT, 0)
 
             # Simulate CINT completing by setting PC to FCFE, adjust stack
             self.state.pc = 0xFCFE  # Return to CLI instruction
@@ -186,18 +248,22 @@ class CPU6502:
                                 char_ready = True
                             else:
                                 # Still empty after injection (shouldn't happen)
-                                # Block by not advancing PC
-                                return 1  # Return minimal cycles, PC stays at CHRIN
+                                # Block by not advancing PC, but still advance timers/IRQs.
+                                self._advance_time(1, udp_debug=udp_debug)
+                                return 1  # PC stays at CHRIN
                         else:
                             # Already injected, buffer still empty - block
                             # Don't advance PC, return minimal cycles
+                            self._advance_time(1, udp_debug=udp_debug)
                             return 1  # Block: PC stays at $FFCF
                     else:
                         # No program loaded, buffer empty - block
                         # Don't advance PC, return minimal cycles
+                        self._advance_time(1, udp_debug=udp_debug)
                         return 1  # Block: PC stays at $FFCF
 
             if not char_ready:
+                self._advance_time(1, udp_debug=udp_debug)
                 return 1
 
             self.state.a = char
@@ -293,17 +359,28 @@ class CPU6502:
                     # Erase character at cursor position (write space)
                     if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
                         self.memory.write(cursor_addr, 0x20)  # Space
+                        # Update color RAM for the erased cell to current text color.
+                        current_color = self.memory.read(0x0286) & 0x0F
+                        self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
                 # If at start of screen, do nothing (can't backspace further)
                 # Note: cursor_addr is already updated above, so we continue to update cursor position
             elif char == 0x93:  # Clear screen
                 for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
                     self.memory.write(addr, 0x20)  # Space
+                # Clear color RAM to the current text color (C64 behavior).
+                current_color = self.memory.read(0x0286) & 0x0F
+                for addr in range(COLOR_MEM, COLOR_MEM + 1000):
+                    self.memory.write(addr, current_color)
                 cursor_addr = SCREEN_MEM
             else:
                 # Write character to screen (no PETSCII conversion for now)
                 if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
                     # Just write the character as-is (PETSCII)
                     self.memory.write(cursor_addr, char)
+                    # Also write the current text color to color RAM so BASIC output
+                    # reflects POKE 646 (and other color changes).
+                    current_color = self.memory.read(0x0286) & 0x0F
+                    self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
                     cursor_addr += 1
                     # Handle wrapping/scrolling when reaching end of screen
                     if cursor_addr >= SCREEN_MEM + 1000:
@@ -456,14 +533,27 @@ class CPU6502:
             self.memory.write(0xA1, (jiffy >> 8) & 0xFF)
             self.memory.write(0xA2, (jiffy >> 16) & 0xFF)
 
+            # Cursor blink emulation (machine-driven, IRQ-tied).
+            # Use BLNSW bit0 as "enabled" and bit7 as "visible".
+            blnsw = self.memory.read(BLNSW)
+            if blnsw & 0x01:
+                blnct = (self.memory.read(BLNCT) + 1) & 0xFF
+                if blnct >= CURSOR_BLINK_TICKS:  # ~0.5s at 60Hz
+                    # Toggle visible state by flipping bit 7.
+                    self.memory.write(BLNSW, blnsw ^ 0x80)
+                    self.memory.write(BLNCT, 0)
+                else:
+                    self.memory.write(BLNCT, blnct)
+
             # Debug: show jiffy updates occasionally
             if hasattr(self, 'debug') and self.debug and jiffy % 10 == 0:
                 debug_msg = f"⏰ Jiffy clock: {jiffy}"
                 if self.interface:
                     self.interface.add_debug_log(debug_msg)
 
-        # Clear the interrupt by reading ICR (already done in _read_cia1)
-        # The pending_irq flag will be cleared when ICR is read
+        # Clear IRQ state (we're bypassing the real KERNAL handler).
+        self.memory.cia1_icr = 0
+        self.memory.pending_irq = False
 
     def _handle_irq(self, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Handle IRQ interrupt"""
@@ -640,6 +730,21 @@ class CPU6502:
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 6
+        elif opcode == 0xF1:  # SBC indy (SBC ($nn),Y)
+            zp_ptr = self.memory.read(self.state.pc + 1)
+            addr_low = self.memory.read(zp_ptr)
+            addr_high = self.memory.read((zp_ptr + 1) & 0xFF)
+            base = addr_low | (addr_high << 8)
+            addr = (base + self.state.y) & 0xFFFF
+            value = self.memory.read(addr)
+            carry = 1 if self._get_flag(0x01) else 0
+            result = self.state.a - value - (1 - carry)
+            self._set_flag(0x01, result >= 0)
+            self._set_flag(0x40, ((self.state.a ^ value) & 0x80) != 0 and ((self.state.a ^ result) & 0x80) != 0)
+            self.state.a = result & 0xFF
+            self._update_flags(self.state.a)
+            self.state.pc = (self.state.pc + 2) & 0xFFFF
+            return 5  # +1 if page crossed (ignored)
         elif opcode == 0xED:  # SBC abs
             return self._sbc_abs()
         elif opcode == 0xFD:  # SBC absx
@@ -1307,6 +1412,7 @@ class CPU6502:
         carry = 1 if self._get_flag(0x01) else 0
         result = self.state.a - value - (1 - carry)
         self._set_flag(0x01, result >= 0)
+        self._set_flag(0x40, ((self.state.a ^ value) & 0x80) != 0 and ((self.state.a ^ result) & 0x80) != 0)
         self.state.a = result & 0xFF
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
@@ -1331,6 +1437,7 @@ class CPU6502:
         carry = 1 if self._get_flag(0x01) else 0
         result = self.state.a - value - (1 - carry)
         self._set_flag(0x01, result >= 0)
+        self._set_flag(0x40, ((self.state.a ^ value) & 0x80) != 0 and ((self.state.a ^ result) & 0x80) != 0)
         self.state.a = result & 0xFF
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
