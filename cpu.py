@@ -108,8 +108,9 @@ class CPU6502:
                 })
 
 
-        # Special handling for CINT - simulate PAL/NTSC detection
-        if pc == 0xFF5B:  # Start of CINT
+        # Special handling for CINT when no KERNAL ROM is loaded.
+        # If the ROM is present, let the KERNAL initialize its own editor state.
+        if pc == 0xFF5B and self.memory.kernal_rom is None:  # Start of CINT
             if self.interface:
                 self.interface.add_debug_log("🎯 CINT: Fast-path init (screen + default colors)")
             # CINT is supposed to:
@@ -158,9 +159,10 @@ class CPU6502:
             return 1  # Minimal cycles
 
 
-        # Check if we're at a KERNAL vector that needs handling
+        # Check if we're at a KERNAL vector that needs handling.
+        # These fallbacks are only used when the KERNAL ROM is missing.
         # CHRIN ($FFCF) - Input character from keyboard
-        if pc == 0xFFCF:
+        if pc == 0xFFCF and self.memory.kernal_rom is None:
             # CHRIN - return character from input/keyboard buffers
             char_ready = False
             char = 0
@@ -303,7 +305,7 @@ class CPU6502:
             return 20  # Approximate cycles for CHRIN
 
         # CHROUT ($FFD2) - Output character to screen
-        if pc == 0xFFD2:
+        if pc == 0xFFD2 and self.memory.kernal_rom is None:
             # This is CHROUT - character should be in accumulator
             char = self.state.a
 
@@ -534,16 +536,15 @@ class CPU6502:
             self.memory.write(0xA2, (jiffy >> 16) & 0xFF)
 
             # Cursor blink emulation (machine-driven, IRQ-tied).
-            # Use BLNSW bit0 as "enabled" and bit7 as "visible".
+            # We toggle bit 7 as the visible flag for the UI.
             blnsw = self.memory.read(BLNSW)
-            if blnsw & 0x01:
-                blnct = (self.memory.read(BLNCT) + 1) & 0xFF
-                if blnct >= CURSOR_BLINK_TICKS:  # ~0.5s at 60Hz
-                    # Toggle visible state by flipping bit 7.
-                    self.memory.write(BLNSW, blnsw ^ 0x80)
-                    self.memory.write(BLNCT, 0)
-                else:
-                    self.memory.write(BLNCT, blnct)
+            blnct = (self.memory.read(BLNCT) + 1) & 0xFF
+            if blnct >= CURSOR_BLINK_TICKS:  # ~0.5s at 60Hz
+                # Toggle visible state by flipping bit 7.
+                self.memory.write(BLNSW, blnsw ^ 0x80)
+                self.memory.write(BLNCT, 0)
+            else:
+                self.memory.write(BLNCT, blnct)
 
             # Debug: show jiffy updates occasionally
             if hasattr(self, 'debug') and self.debug and jiffy % 10 == 0:

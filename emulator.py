@@ -25,6 +25,7 @@ from .constants import (
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
     ROM_KERNAL_START,
+    ROM_KERNAL_END,
     SCREEN_MEM,
     SCREEN_COLS,
     SCREEN_ROWS,
@@ -544,9 +545,11 @@ class C64:
                         self.rich_interface.add_debug_log(debug_msg)
                 break
             elif self.cpu.state.pc == last_pc:
+                # When the KERNAL ROM is running, input waits can loop inside the ROM.
+                if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
+                    stuck_count = 0
                 # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
-                # Don't count it as stuck
-                if self.cpu.state.pc != 0xFFCF:
+                elif self.cpu.state.pc != 0xFFCF:
                     stuck_count += 1
                     if stuck_count > 1000:
                         if self.debug:
@@ -895,15 +898,12 @@ class C64:
         self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
         return True
 
-    def send_petscii(self, petscii_code: int) -> None:
-        """Send a PETSCII key to the emulator input path."""
-        if self.interface and hasattr(self.interface, "handle_petscii_input"):
-            self.interface.handle_petscii_input(petscii_code & 0xFF)
-            return
-        self._enqueue_keyboard_buffer(petscii_code & 0xFF)
+    def send_petscii(self, petscii_code: int) -> bool:
+        """Send a PETSCII key to the KERNAL keyboard queue."""
+        return self._enqueue_keyboard_buffer(petscii_code & 0xFF)
 
     def send_petscii_sequence(self, codes: List[int]) -> None:
-        """Send multiple PETSCII codes to the emulator input path."""
+        """Send multiple PETSCII codes to the KERNAL keyboard queue."""
         for code in codes:
             self.send_petscii(code)
 
