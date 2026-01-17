@@ -305,7 +305,9 @@ class CPU6502:
             return 20  # Approximate cycles for CHRIN
 
         # CHROUT ($FFD2) - Output character to screen
-        if pc == 0xFFD2 and self.memory.kernal_rom is None:
+        # Keep a compatibility implementation so screen output works even when
+        # the ROM screen editor path is not fully supported by the CPU core.
+        if pc == 0xFFD2:
             # This is CHROUT - character should be in accumulator
             char = self.state.a
 
