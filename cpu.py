@@ -454,8 +454,8 @@ class CPU6502:
             # Also update row and column variables
             row = (cursor_addr - SCREEN_MEM) // 40
             col = (cursor_addr - SCREEN_MEM) % 40
-            self.memory.write(0xD3, row)  # Cursor row
-            self.memory.write(0xD8, col)  # Cursor column
+            self.memory.write(CURSOR_ROW_ADDR, row)  # Cursor row (TBLX)
+            self.memory.write(CURSOR_COL_ADDR, col)  # Cursor column (PNTR)
 
             # CHROUT must return with carry CLEAR (CLC) - this is critical!
             # The KERNAL code at $E10F checks BCS (Branch if Carry Set)

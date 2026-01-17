@@ -254,8 +254,8 @@ class C64:
         self.memory.ram[0xD1] = SCREEN_MEM & 0xFF  # Cursor address low byte
         self.memory.ram[0xD2] = (SCREEN_MEM >> 8) & 0xFF  # Cursor address high byte
         # Also initialize cursor row/col variables
-        self.memory.ram[0xD3] = 0  # Cursor row (0-24)
-        self.memory.ram[0xD8] = 0  # Cursor column (0-39)
+        self.memory.ram[CURSOR_ROW_ADDR] = 0  # Cursor row (0-24)
+        self.memory.ram[CURSOR_COL_ADDR] = 0  # Cursor column (0-39)
 
         # Initialize KERNAL reset vector at $8000-$8001 to point to BASIC cold start
         # The KERNAL does JMP ($8000) to jump to BASIC after initialization

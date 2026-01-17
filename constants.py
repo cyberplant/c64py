@@ -33,11 +33,14 @@ SCREEN_SIZE = SCREEN_COLS * SCREEN_ROWS
 BORDER_WIDTH = 4
 BORDER_HEIGHT = 4
 
-# Cursor state (zero-page)
+# Cursor state (zero-page, KERNAL screen editor)
+# PNT ($D1/$D2) = pointer to current screen line
+# PNTR ($D3) = cursor column
+# TBLX ($D6) = cursor row (line index)
 CURSOR_PTR_LOW = 0xD1
 CURSOR_PTR_HIGH = 0xD2
-CURSOR_ROW_ADDR = 0xD3
-CURSOR_COL_ADDR = 0xD8
+CURSOR_COL_ADDR = 0xD3
+CURSOR_ROW_ADDR = 0xD6
 
 # Keyboard buffer (KERNAL)
 KEYBOARD_BUFFER_BASE = 0x0277
