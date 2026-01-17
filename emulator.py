@@ -16,6 +16,8 @@ from rich.text import Text
 
 from .constants import (
     COLOR_MEM,
+    BLNSW,
+    BLNCT,
     CURSOR_COL_ADDR,
     CURSOR_ROW_ADDR,
     KEYBOARD_BUFFER_BASE,
@@ -219,6 +221,10 @@ class C64:
         # Initialize some zero-page variables
         self.memory.ram[0x0288] = 0x0E  # Cursor color (light blue)
         self.memory.ram[0x0286] = 0x0E  # Current text color (light blue)
+        # Cursor blink (machine-controlled; UI should follow this)
+        # bit0 = enabled, bit7 = visible
+        self.memory.ram[BLNSW] = 0x81
+        self.memory.ram[BLNCT] = 0
 
         # Initialize cursor position (points to screen start)
         # $D1/$D2 store the cursor address (low/high bytes)

@@ -40,3 +40,8 @@ KEYBOARD_BUFFER_LEN_ADDR = 0xC6
 INPUT_BUFFER_BASE = 0x0200
 INPUT_BUFFER_INDEX_ADDR = 0x029B
 INPUT_BUFFER_LEN_ADDR = 0x029C
+
+# Cursor blink (KERNAL zero-page variables; used/updated by IRQ on real C64)
+# We emulate these so the UI can reflect machine-controlled blink state.
+BLNSW = 0x00CC  # Cursor blink enable/state (simplified)
+BLNCT = 0x00CD  # Cursor blink counter (simplified)

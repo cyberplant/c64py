@@ -16,6 +16,8 @@ from textual.events import Key
 from textual.widgets import Static, Header, Footer, RichLog
 
 from .constants import (
+    BLNSW,
+    COLOR_MEM,
     CURSOR_COL_ADDR,
     CURSOR_PTR_HIGH,
     CURSOR_PTR_LOW,
@@ -97,10 +99,8 @@ class TextualInterface(App):
         self.status_bar = None
         # Last committed input line (debug/inspection)
         self.last_committed_line = ""
-        # Cursor blink state (roughly 1Hz like C64)
-        self.cursor_blink_interval = 0.5
+        # Cursor blink is machine-driven (IRQ-tied); UI just displays it.
         self.cursor_blink_on = True
-        self.cursor_blink_last_toggle = time.monotonic()
 
     def compose(self) -> ComposeResult:
         if not self.fullscreen:
@@ -241,17 +241,31 @@ class TextualInterface(App):
                 self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
                 self._screen_debug_logged = True
 
-            # Update cursor blink state
-            now = time.monotonic()
-            if now - self.cursor_blink_last_toggle >= self.cursor_blink_interval:
-                self.cursor_blink_on = not self.cursor_blink_on
-                self.cursor_blink_last_toggle = now
+            # Machine-controlled cursor blink (IRQ-tied emulation).
+            # Only show cursor when the ROM is actually waiting for keyboard input.
+            line_edit_mode = self._is_line_edit_mode()
+            # bit0 = enabled, bit7 = visible
+            self.cursor_blink_on = bool(self.emulator.memory.read(BLNSW) & 0x80)
 
             # For RichLog, clear and write new content
-            screen_text = Text(screen_content)
-            if self.cursor_blink_on:
-                cursor_index = cursor_row * 41 + cursor_col
-                if 0 <= cursor_index < len(screen_content):
+            # `render_text_screen(no_colors=False)` already returns a Rich `Text`.
+            # Avoid wrapping a Text in Text(...), which crashes inside Rich.
+            if isinstance(screen_content, Text):
+                screen_text = screen_content.copy()
+                screen_plain = screen_text.plain
+            else:
+                screen_plain = str(screen_content)
+                screen_text = Text(screen_plain)
+
+            if line_edit_mode and self.cursor_blink_on:
+                # Cursor position is relative to the 40x25 text area.
+                # Our renderer includes a thick border; map cursor into the rendered text.
+                border_width = 4
+                border_height = 4
+                full_cols = 40 + border_width * 2  # must match emulator renderer
+                line_stride = full_cols + 1  # + newline
+                cursor_index = (border_height * line_stride) + (cursor_row * line_stride) + border_width + cursor_col
+                if 0 <= cursor_index < len(screen_plain):
                     screen_text.stylize("reverse", cursor_index, cursor_index + 1)
             self.c64_display.clear()
             self.c64_display.write(screen_text)
@@ -636,6 +650,10 @@ class TextualInterface(App):
         if line_edit_mode is None:
             line_edit_mode = self._is_line_edit_mode()
 
+        # Don't accept input while the machine is running something (not waiting in CHRIN).
+        if not line_edit_mode:
+            return
+
         # Cursor control codes
         if petscii_code == 0x9D:  # Cursor left
             self._move_cursor_left()
@@ -662,10 +680,15 @@ class TextualInterface(App):
         if petscii_code == 0x0D:  # Enter / CR
             if line_edit_mode:
                 self._commit_current_line()
+                # IMPORTANT: Do NOT locally echo CR here.
+                # The edited line already exists on screen (we echoed keystrokes),
+                # and the ROM/BASIC side will advance the line / print the next prompt.
+                # Echoing it here results in a double line break and can confuse
+                # the internal editor state.
             else:
                 if not self._enqueue_keyboard_buffer(petscii_code):
                     self.add_debug_log("⌨️  Keyboard buffer full, ignoring Enter")
-            self._echo_character(0x0D)
+                self._echo_character(0x0D)
             return
 
         if petscii_code == 0x93:  # Clear screen
@@ -674,13 +697,9 @@ class TextualInterface(App):
 
         # Printable characters
         if 0x20 <= petscii_code <= 0xFF:
-            if line_edit_mode:
-                self._echo_character(petscii_code)
-            else:
-                if self._enqueue_keyboard_buffer(petscii_code):
-                    self._echo_character(petscii_code)
-                else:
-                    self.add_debug_log("⌨️  Keyboard buffer full, ignoring key")
+            # While waiting for input, we use local echo as a stand-in for the
+            # full ROM screen editor/keyboard scanning path.
+            self._echo_character(petscii_code)
             return
 
     def _handle_backspace(self) -> None:
@@ -731,8 +750,13 @@ class TextualInterface(App):
             event.prevent_default()
             return
 
-        # Only process printable characters when emulator is running
+        # Only process keys when emulator is running
         if not self.emulator or not self.emulator.running:
+            return
+
+        # Only accept keys when the ROM is actually waiting for keyboard input.
+        # This prevents local echo/cursor movement while programs are running.
+        if not self._is_line_edit_mode():
             return
 
         if event.key == "left":
