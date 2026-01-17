@@ -242,9 +242,10 @@ class PygameInterface:
             return
 
         pygame = self._pygame
+        glyph_count = len(char_rom) // 8
         glyph_surfaces = []
-        for code in range(256):
-            rows = char_rom[code * 8 : (code + 1) * 8]
+        for glyph_index in range(glyph_count):
+            rows = char_rom[glyph_index * 8 : (glyph_index + 1) * 8]
             color_surfaces = []
             for color_index in range(16):
                 surface = pygame.Surface((self.CHAR_WIDTH, self.CHAR_HEIGHT), flags=pygame.SRCALPHA)
@@ -259,6 +260,32 @@ class PygameInterface:
 
         self._glyph_surfaces = glyph_surfaces
         self._glyph_rom_id = id(char_rom)
+
+    def _get_charset_offset(self) -> int:
+        if not hasattr(self.emulator.memory, "_vic_regs"):
+            return 0
+        regs = self.emulator.memory._vic_regs
+        if len(regs) <= 0x18:
+            return 0
+        char_addr = (regs[0x18] & 0x0E) << 10
+        return 0x800 if (char_addr & 0x0800) else 0
+
+    def _petscii_to_screen_code(self, petscii_char: int) -> int:
+        if hasattr(self.emulator, "_petscii_to_screen_code"):
+            return self.emulator._petscii_to_screen_code(petscii_char)
+        if petscii_char < 32:
+            return petscii_char
+        if petscii_char < 64:
+            return petscii_char
+        if petscii_char < 96:
+            return petscii_char - 64
+        if petscii_char < 128:
+            return petscii_char - 32
+        if petscii_char < 160:
+            return petscii_char - 128
+        if petscii_char < 192:
+            return petscii_char - 64
+        return petscii_char - 128
 
     def _render_frame(self) -> None:
         bg_code = self.emulator.memory.read(0xD021) & 0x0F
@@ -279,6 +306,9 @@ class PygameInterface:
         color_base = COLOR_MEM
         screen_left = self._screen_rect.left
         screen_top = self._screen_rect.top
+        charset_offset = self._get_charset_offset()
+        glyph_base = charset_offset >> 3
+        glyph_count = len(self._glyph_surfaces)
 
         now = time.monotonic()
         if now - self.cursor_blink_last_toggle >= self.cursor_blink_interval:
@@ -290,20 +320,23 @@ class PygameInterface:
             y = screen_top + row * self.CHAR_HEIGHT
             for col in range(self.SCREEN_COLS):
                 idx = row_offset + col
-                code = mem[screen_base + idx]
+                raw_code = mem[screen_base + idx]
                 color_code = mem[color_base + idx] & 0x0F
                 reverse = False
-                if code & 0x80:
+                if raw_code & 0x80:
                     reverse = True
-                    code &= 0x7F
+                    raw_code &= 0x7F
+                code = self._petscii_to_screen_code(raw_code)
 
                 x = screen_left + col * self.CHAR_WIDTH
                 if reverse:
                     fg_color = self._palette.get(color_code, (255, 255, 255))
                     self._frame_surface.fill(fg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
-                    glyph = self._glyph_surfaces[code][bg_code]
+                    glyph_index = (glyph_base + code) % glyph_count
+                    glyph = self._glyph_surfaces[glyph_index][bg_code]
                 else:
-                    glyph = self._glyph_surfaces[code][color_code]
+                    glyph_index = (glyph_base + code) % glyph_count
+                    glyph = self._glyph_surfaces[glyph_index][color_code]
                 self._frame_surface.blit(glyph, (x, y))
 
         if self.cursor_blink_on:
@@ -312,13 +345,15 @@ class PygameInterface:
             cursor_row = max(0, min(cursor_row, self.SCREEN_ROWS - 1))
             cursor_col = max(0, min(cursor_col, self.SCREEN_COLS - 1))
             idx = cursor_row * self.SCREEN_COLS + cursor_col
-            code = mem[screen_base + idx] & 0x7F
+            raw_code = mem[screen_base + idx] & 0x7F
+            code = self._petscii_to_screen_code(raw_code)
             color_code = mem[color_base + idx] & 0x0F
             x = screen_left + cursor_col * self.CHAR_WIDTH
             y = screen_top + cursor_row * self.CHAR_HEIGHT
             fg_color = self._palette.get(color_code, (255, 255, 255))
             self._frame_surface.fill(fg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
-            glyph = self._glyph_surfaces[code][bg_code]
+            glyph_index = (glyph_base + code) % glyph_count
+            glyph = self._glyph_surfaces[glyph_index][bg_code]
             self._frame_surface.blit(glyph, (x, y))
 
     def _ascii_to_petscii(self, char: str) -> int:
