@@ -18,12 +18,16 @@ from .constants import (
     COLOR_MEM,
     BLNSW,
     BLNCT,
+    BORDER_WIDTH,
+    BORDER_HEIGHT,
     CURSOR_COL_ADDR,
     CURSOR_ROW_ADDR,
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
     ROM_KERNAL_START,
     SCREEN_MEM,
+    SCREEN_COLS,
+    SCREEN_ROWS,
 )
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
@@ -804,35 +808,31 @@ class C64:
             screen_text = Text()
             # Draw a simple 1-character border around the 40x25 screen.
             # C64 border is a solid color region; we emulate it with spaces.
-            border_width = 4
-            inner_cols = 40
-            inner_rows = 25
-            border_height = 4
-            full_cols = inner_cols + border_width * 2
+            full_cols = SCREEN_COLS + BORDER_WIDTH * 2
 
             # Top border
-            for _ in range(border_height):
+            for _ in range(BORDER_HEIGHT):
                 screen_text.append(" " * full_cols, style=border_cell_style)
                 screen_text.append("\n")
 
-            for row in range(25):
+            for row in range(SCREEN_ROWS):
                 # Left border
-                screen_text.append(" " * border_width, style=border_cell_style)
-                for col in range(40):
+                screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
+                for col in range(SCREEN_COLS):
                     char = self.text_screen[row][col]
                     fg = self.text_colors[row][col] & 0x0F
                     fg_style = self._c64_color_to_rich_rgb(fg)
                     screen_text.append(char, style=f"{fg_style} on {bg_style}")
                 # Right border
-                screen_text.append(" " * border_width, style=border_cell_style)
-                if row < 24:
+                screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
+                if row < (SCREEN_ROWS - 1):
                     screen_text.append("\n")
 
             # Bottom border
             screen_text.append("\n")
-            for i in range(border_height):
+            for i in range(BORDER_HEIGHT):
                 screen_text.append(" " * full_cols, style=border_cell_style)
-                if i < border_height - 1:
+                if i < BORDER_HEIGHT - 1:
                     screen_text.append("\n")
             return screen_text
 

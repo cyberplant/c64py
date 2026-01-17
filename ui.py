@@ -18,6 +18,10 @@ from textual.widgets import Static, Header, Footer, RichLog
 from .constants import (
     BLNSW,
     COLOR_MEM,
+    BORDER_WIDTH,
+    BORDER_HEIGHT,
+    SCREEN_COLS,
+    SCREEN_ROWS,
     CURSOR_COL_ADDR,
     CURSOR_PTR_HIGH,
     CURSOR_PTR_LOW,
@@ -224,13 +228,18 @@ class TextualInterface(App):
 
             # Update screen display
             screen_content = self.emulator.render_text_screen(no_colors=False)
-            cursor_row = self.emulator.memory.read(CURSOR_ROW_ADDR)
-            cursor_col = self.emulator.memory.read(CURSOR_COL_ADDR)
-            cursor_row = max(0, min(cursor_row, 24))
-            cursor_col = max(0, min(cursor_col, 39))
+            cursor_row = max(0, min(self.emulator.memory.read(CURSOR_ROW_ADDR), SCREEN_ROWS - 1))
+            cursor_col = max(0, min(self.emulator.memory.read(CURSOR_COL_ADDR), SCREEN_COLS - 1))
+
+            # Normalize render output once.
+            if isinstance(screen_content, Text):
+                screen_text = screen_content.copy()
+                screen_plain = screen_text.plain
+            else:
+                screen_plain = str(screen_content)
+                screen_text = Text(screen_plain)
 
             # Debug: Check if screen has any non-space content
-            screen_plain = screen_content.plain if hasattr(screen_content, "plain") else str(screen_content)
             non_space_count = sum(1 for c in screen_plain if c not in (' ', '\n'))
             if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
                 # Sample first few characters from screen memory
@@ -247,24 +256,12 @@ class TextualInterface(App):
             # bit0 = enabled, bit7 = visible
             self.cursor_blink_on = bool(self.emulator.memory.read(BLNSW) & 0x80)
 
-            # For RichLog, clear and write new content
-            # `render_text_screen(no_colors=False)` already returns a Rich `Text`.
-            # Avoid wrapping a Text in Text(...), which crashes inside Rich.
-            if isinstance(screen_content, Text):
-                screen_text = screen_content.copy()
-                screen_plain = screen_text.plain
-            else:
-                screen_plain = str(screen_content)
-                screen_text = Text(screen_plain)
-
             if line_edit_mode and self.cursor_blink_on:
                 # Cursor position is relative to the 40x25 text area.
                 # Our renderer includes a thick border; map cursor into the rendered text.
-                border_width = 4
-                border_height = 4
-                full_cols = 40 + border_width * 2  # must match emulator renderer
+                full_cols = SCREEN_COLS + BORDER_WIDTH * 2  # must match emulator renderer
                 line_stride = full_cols + 1  # + newline
-                cursor_index = (border_height * line_stride) + (cursor_row * line_stride) + border_width + cursor_col
+                cursor_index = (BORDER_HEIGHT * line_stride) + (cursor_row * line_stride) + BORDER_WIDTH + cursor_col
                 if 0 <= cursor_index < len(screen_plain):
                     screen_text.stylize("reverse", cursor_index, cursor_index + 1)
             self.c64_display.clear()
@@ -273,9 +270,7 @@ class TextualInterface(App):
             # Update status bar with actual cycle count from emulator (only in non-fullscreen mode)
             if not self.fullscreen:
                 emu = self.emulator
-                # Read cursor position from memory
-                cursor_row = emu.memory.read(0xD3)
-                cursor_col = emu.memory.read(0xD8)
+                # Reuse cursor_row/cursor_col from earlier in this update cycle.
                 port01 = emu.memory.ram[0x01]
                 txt_color = emu.memory.read(0x0286) & 0x0F
                 bg = emu.memory.peek_vic(0x21) & 0x0F
@@ -669,26 +664,16 @@ class TextualInterface(App):
             return
 
         if petscii_code == 0x14:  # Backspace/Delete
-            if line_edit_mode:
-                self._handle_backspace()
-            else:
-                if self._remove_last_keyboard_buffer_char():
-                    self.add_debug_log("⌨️  Backspace (removed from buffer)")
-                self._handle_backspace()
+            self._handle_backspace()
             return
 
         if petscii_code == 0x0D:  # Enter / CR
-            if line_edit_mode:
-                self._commit_current_line()
-                # IMPORTANT: Do NOT locally echo CR here.
-                # The edited line already exists on screen (we echoed keystrokes),
-                # and the ROM/BASIC side will advance the line / print the next prompt.
-                # Echoing it here results in a double line break and can confuse
-                # the internal editor state.
-            else:
-                if not self._enqueue_keyboard_buffer(petscii_code):
-                    self.add_debug_log("⌨️  Keyboard buffer full, ignoring Enter")
-                self._echo_character(0x0D)
+            self._commit_current_line()
+            # IMPORTANT: Do NOT locally echo CR here.
+            # The edited line already exists on screen (we echoed keystrokes),
+            # and the ROM/BASIC side will advance the line / print the next prompt.
+            # Echoing it here results in a double line break and can confuse
+            # the internal editor state.
             return
 
         if petscii_code == 0x93:  # Clear screen

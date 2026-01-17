@@ -38,11 +38,25 @@ class MemoryMap:
     _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))
 
     def peek_vic(self, reg: int) -> int:
-        """Read VIC-II register state regardless of CPU banking."""
+        """Return VIC-II register state, bypassing 6510 banking.
+
+        This reads from the internal VIC-II register array directly and ignores
+        the current CPU memory configuration (e.g. CHAREN / I/O mapping). It is
+        intended for components such as the video renderer or initialization
+        logic that need stable access to VIC state regardless of how memory is
+        currently banked from the CPU's point of view.
+        """
         return self._read_vic(reg & 0x3F)
 
     def poke_vic(self, reg: int, value: int) -> None:
-        """Write VIC-II register state regardless of CPU banking."""
+        """Update VIC-II register state, bypassing 6510 banking.
+
+        This writes to the internal VIC-II register array directly and ignores
+        the current CPU memory configuration. Only the low 6 bits of *reg* are
+        used, matching the VIC-II's 64-register mirroring. This helper is
+        intended for rendering and initialization code that must modify VIC
+        state even when the I/O area is not visible to normal CPU writes.
+        """
         self._write_vic(reg & 0x3F, value & 0xFF)
 
     def read(self, addr: int) -> int:

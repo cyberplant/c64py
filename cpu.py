@@ -12,6 +12,7 @@ from .constants import (
     IRQ_VECTOR,
     BLNSW,
     BLNCT,
+    CURSOR_BLINK_TICKS,
     CURSOR_PTR_LOW,
     CURSOR_PTR_HIGH,
     CURSOR_ROW_ADDR,
@@ -537,7 +538,7 @@ class CPU6502:
             blnsw = self.memory.read(BLNSW)
             if blnsw & 0x01:
                 blnct = (self.memory.read(BLNCT) + 1) & 0xFF
-                if blnct >= 30:  # ~0.5s at 60Hz
+                if blnct >= CURSOR_BLINK_TICKS:  # ~0.5s at 60Hz
                     # Toggle visible state by flipping bit 7.
                     self.memory.write(BLNSW, blnsw ^ 0x80)
                     self.memory.write(BLNCT, 0)
