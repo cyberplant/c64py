@@ -7,6 +7,7 @@ A Commodore 64 emulator implemented in Python with a text-based interface. This 
 - **6502 CPU Emulation**: Full 6502 instruction set implementation
 - **Memory Management**: Complete C64 memory map with ROM/RAM mapping
 - **I/O Devices**: VIC, SID, CIA1, CIA2 emulation
+- **SID Audio Output**: Optional pygame-based SID sound (`--enable-sid`)
 - **Text Mode Interface**: Beautiful textual UI using Rich and Textual libraries
 - **Graphics Mode**: Optional pygame window for C64 display output
 - **PRG File Loading**: Load and auto-run Commodore 64 programs
@@ -74,6 +75,7 @@ c64py
 - `--graphics-scale N`: Scale factor for graphics window (default: 2)
 - `--graphics-fps N`: Target FPS for graphics window (default: 30)
 - `--graphics-border N`: Border size in pixels for graphics window (default: 32)
+- `--enable-sid`: Enable SID audio output via pygame
 
 ### Examples
 
