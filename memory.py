@@ -10,7 +10,7 @@ from .constants import (
     ROM_KERNAL_START, ROM_KERNAL_END,
     ROM_CHAR_START, ROM_CHAR_END,
     VIC_BASE, SID_BASE, CIA1_BASE, CIA2_BASE,
-    SCREEN_MEM
+    SCREEN_MEM, COLOR_MEM
 )
 from .cpu_state import CIATimer
 
@@ -35,32 +35,55 @@ class MemoryMap:
     raster_cycles: int = 0  # Cycle counter for raster timing
     vic_interrupt_state: int = 0  # VIC interrupt state for D019
     jiffy_cycles: int = 0  # Cycle counter for jiffy clock
+    _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))
+
+    def peek_vic(self, reg: int) -> int:
+        """Read VIC-II register state regardless of CPU banking."""
+        return self._read_vic(reg & 0x3F)
+
+    def poke_vic(self, reg: int, value: int) -> None:
+        """Write VIC-II register state regardless of CPU banking."""
+        self._write_vic(reg & 0x3F, value & 0xFF)
 
     def read(self, addr: int) -> int:
         """Read from memory, handling ROM/RAM mapping"""
         addr &= 0xFFFF
 
+        # Color RAM ($D800-$DBE7) is a dedicated 4-bit RAM region.
+        # In practice it should be readable/writable regardless of ROM banking.
+        if COLOR_MEM <= addr < (COLOR_MEM + 1000):
+            return self.ram[addr] & 0x0F
+
+        # 6510 processor port ($0001) controls banking.
+        # Bits (common simplified model):
+        # - bit 0: LORAM
+        # - bit 1: HIRAM
+        # - bit 2: CHAREN (1 = I/O visible at $D000-$DFFF, 0 = CHAR ROM / RAM)
+        port_01 = self.ram[0x01]
+        loram = (port_01 & 0x01) != 0
+        hiram = (port_01 & 0x02) != 0
+        charen = (port_01 & 0x04) != 0
+
         # I/O area (can be ROM or RAM depending on memory config)
         if ROM_CHAR_START <= addr < ROM_CHAR_END:
-            # Check if I/O is enabled (bit 0 of $01)
-            if self.ram[0x01] & 0x03 == 0x03:  # I/O enabled
+            if charen:
                 # I/O registers (VIC, SID, CIA, etc.)
                 return self._read_io(addr)
-            elif self.char_rom:
+            # CHAR ROM is visible when I/O is banked out and HIRAM is set.
+            if self.char_rom and hiram:
                 return self.char_rom[addr - ROM_CHAR_START]
-            else:
-                return self.ram[addr]
+            return self.ram[addr]
 
         # BASIC ROM
         if ROM_BASIC_START <= addr < ROM_BASIC_END:
-            if self.ram[0x01] & 0x07 == 0x07:  # BASIC ROM enabled
+            if loram and hiram:  # BASIC ROM enabled
                 if self.basic_rom:
                     return self.basic_rom[addr - ROM_BASIC_START]
             return self.ram[addr]
 
         # KERNAL ROM
         if ROM_KERNAL_START <= addr < ROM_KERNAL_END:
-            if self.ram[0x01] & 0x07 == 0x07:  # KERNAL ROM enabled
+            if hiram:  # KERNAL ROM enabled
                 if self.kernal_rom:
                     return self.kernal_rom[addr - ROM_KERNAL_START]
             return self.ram[addr]
@@ -72,6 +95,14 @@ class MemoryMap:
         """Write to memory (only RAM, ROM writes are ignored)"""
         addr &= 0xFFFF
         value &= 0xFF
+
+        # Color RAM ($D800-$DBE7): dedicated 4-bit writable RAM.
+        if COLOR_MEM <= addr < (COLOR_MEM + 1000):
+            self.ram[addr] = value & 0x0F
+            return
+
+        port_01 = self.ram[0x01]
+        charen = (port_01 & 0x04) != 0
 
         # Log memory writes if UDP debug is enabled (only screen writes to reduce overhead)
         if self.udp_debug and self.udp_debug.enabled:
@@ -93,7 +124,7 @@ class MemoryMap:
             self.ram[addr] = value
         elif ROM_CHAR_START <= addr < ROM_CHAR_END:
             # I/O area
-            if self.ram[0x01] & 0x03 == 0x03:  # I/O enabled
+            if charen:  # I/O enabled
                 self._write_io(addr, value)
             else:
                 self.ram[addr] = value
@@ -102,6 +133,10 @@ class MemoryMap:
 
     def _read_io(self, addr: int) -> int:
         """Read from I/O registers"""
+        # Color RAM is handled in read(); keep this for safety if called directly.
+        if COLOR_MEM <= addr < (COLOR_MEM + 1000):
+            return self.ram[addr] & 0x0F
+
         # VIC registers
         if VIC_BASE <= addr < VIC_BASE + 0x40:
             return self._read_vic(addr - VIC_BASE)
@@ -122,6 +157,11 @@ class MemoryMap:
 
     def _write_io(self, addr: int, value: int) -> None:
         """Write to I/O registers"""
+        # Color RAM is handled in write(); keep this for safety if called directly.
+        if COLOR_MEM <= addr < (COLOR_MEM + 1000):
+            self.ram[addr] = value & 0x0F
+            return
+
         # VIC registers
         if VIC_BASE <= addr < VIC_BASE + 0x40:
             self._write_vic(addr - VIC_BASE, value)
@@ -163,8 +203,6 @@ class MemoryMap:
     def _write_vic(self, reg: int, value: int) -> None:
         """Write VIC-II register"""
         # Store VIC register state
-        if not hasattr(self, '_vic_regs'):
-            self._vic_regs = bytearray(0x40)
         self._vic_regs[reg] = value
 
         # Handle special register writes
@@ -305,3 +343,14 @@ class MemoryMap:
         # Clear the bottom line (row 24)
         for col in range(40):
             self.ram[SCREEN_MEM + 24 * 40 + col] = 0x20  # Space
+
+        # Also scroll color RAM alongside screen RAM (same geometry).
+        color_src_start = COLOR_MEM + 40
+        color_dst_start = COLOR_MEM
+        for i in range(length):
+            self.ram[color_dst_start + i] = self.ram[color_src_start + i] & 0x0F
+
+        # Clear bottom line colors to current text color (fallback: light blue).
+        current_color = self.ram[0x0286] & 0x0F
+        for col in range(40):
+            self.ram[COLOR_MEM + 24 * 40 + col] = current_color

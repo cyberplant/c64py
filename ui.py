@@ -14,7 +14,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.events import Key
 from textual.widgets import Static, Header, Footer, RichLog
 
-from .constants import SCREEN_MEM
+from .constants import SCREEN_MEM, COLOR_MEM
 
 if TYPE_CHECKING:
     from .emulator import C64
@@ -54,17 +54,17 @@ class TextualInterface(App):
 
     #debug-panel {
         border: solid $secondary;
-        margin: 0 1;
+        margin: 0 0;
         overflow-y: scroll;
-        padding: 0 1;
-        height: 35%;
+        padding: 0 0;
+        height: 25%;
     }
 
     #status-bar {
-        border: solid $primary;
-        margin: 0 1;
-        padding: 0 1;
-        height: 4;
+        border: none;
+        margin: 0 0;
+        padding: 0 0;
+        height: 1;
         background: $primary;
         color: $surface;
     }
@@ -211,7 +211,8 @@ class TextualInterface(App):
             screen_content = self.emulator.render_text_screen(no_colors=False)
 
             # Debug: Check if screen has any non-space content
-            non_space_count = sum(1 for c in screen_content if c not in (' ', '\n'))
+            screen_plain = screen_content.plain if hasattr(screen_content, "plain") else str(screen_content)
+            non_space_count = sum(1 for c in screen_plain if c not in (' ', '\n'))
             if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
                 # Sample first few characters from screen memory
                 sample_chars = []
@@ -231,7 +232,16 @@ class TextualInterface(App):
                 # Read cursor position from memory
                 cursor_row = emu.memory.read(0xD3)
                 cursor_col = emu.memory.read(0xD8)
-                status_text = f"🎮 C64 | Cycle: {emu.current_cycles:,} | PC: ${emu.cpu.state.pc:04X} | A: ${emu.cpu.state.a:02X} | X: ${emu.cpu.state.x:02X} | Y: ${emu.cpu.state.y:02X} | SP: ${emu.cpu.state.sp:02X} | Cursor: {cursor_row},{cursor_col}"
+                port01 = emu.memory.ram[0x01]
+                txt_color = emu.memory.read(0x0286) & 0x0F
+                bg = emu.memory.peek_vic(0x21) & 0x0F
+                border = emu.memory.peek_vic(0x20) & 0x0F
+                status_text = (
+                    f"🎮 C64 | Cycle: {emu.current_cycles:,} | PC: ${emu.cpu.state.pc:04X} | "
+                    f"A: ${emu.cpu.state.a:02X} | X: ${emu.cpu.state.x:02X} | Y: ${emu.cpu.state.y:02X} | "
+                    f"SP: ${emu.cpu.state.sp:02X} | Cursor: {cursor_row},{cursor_col} | "
+                    f"$01=${port01:02X} | BG:{bg} BORDER:{border} TXT:{txt_color}"
+                )
                 if self.status_bar:
                     self.status_bar.update(status_text)
 
@@ -398,11 +408,18 @@ class TextualInterface(App):
         elif petscii_code == 0x93:  # Clear screen
             for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
                 self.emulator.memory.write(addr, 0x20)  # Space
+            # Clear color RAM to current text color as well
+            current_color = self.emulator.memory.read(0x0286) & 0x0F
+            for addr in range(COLOR_MEM, COLOR_MEM + 1000):
+                self.emulator.memory.write(addr, current_color)
             cursor_addr = SCREEN_MEM
         else:
             # Write character to screen
             if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
                 self.emulator.memory.write(cursor_addr, petscii_code)
+                # Also update color RAM so typed characters reflect the active BASIC color.
+                current_color = self.emulator.memory.read(0x0286) & 0x0F
+                self.emulator.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
                 cursor_addr += 1
                 # Handle wrapping/scrolling when reaching end of screen
                 if cursor_addr >= SCREEN_MEM + 1000:
@@ -455,6 +472,9 @@ class TextualInterface(App):
         # Erase character at cursor position (write space)
         if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
             self.emulator.memory.write(cursor_addr, 0x20)  # Space
+            # Erase the color too (set to current text color for consistency)
+            current_color = self.emulator.memory.read(0x0286) & 0x0F
+            self.emulator.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
 
         # Update cursor position
         self.emulator.memory.write(0xD1, cursor_addr & 0xFF)
