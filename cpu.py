@@ -34,6 +34,7 @@ class CPU6502:
         # PC will be set from reset vector after ROMs are loaded
         # Don't read it here as ROMs might not be loaded yet
         self.state.pc = 0x0000
+        self.chrout_count = 0
 
     def _read_word(self, addr: int) -> int:
         """Read 16-bit word (little-endian)"""
@@ -310,6 +311,7 @@ class CPU6502:
         if pc == 0xFFD2:
             # This is CHROUT - character should be in accumulator
             char = self.state.a
+            self.chrout_count += 1
 
             # Debug: log CHROUT entry
             if udp_debug and udp_debug.enabled:

@@ -24,12 +24,14 @@ try:
     from .debug import UdpDebugLogger
     from .emulator import C64
     from .server import EmulatorServer
+    from .constants import BLNCT, BLNSW, CURSOR_COL_ADDR, CURSOR_ROW_ADDR, SCREEN_MEM
 except ImportError:
     # When run directly, add parent directory to path
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from c64py.debug import UdpDebugLogger
     from c64py.emulator import C64
     from c64py.server import EmulatorServer
+    from c64py.constants import BLNCT, BLNSW, CURSOR_COL_ADDR, CURSOR_ROW_ADDR, SCREEN_MEM
 
 
 def main():
@@ -232,6 +234,21 @@ def main():
         emu.running = False
         if server:
             server.running = False
+
+    if args.debug:
+        chrout_count = getattr(emu.cpu, "chrout_count", None)
+        if chrout_count is not None:
+            print(f"DEBUG: CHROUT calls: {chrout_count}")
+        cursor_row = emu.memory.read(CURSOR_ROW_ADDR)
+        cursor_col = emu.memory.read(CURSOR_COL_ADDR)
+        blnsw = emu.memory.read(BLNSW)
+        blnct = emu.memory.read(BLNCT)
+        print(f"DEBUG: Cursor row={cursor_row} col={cursor_col} BLNSW=${blnsw:02X} BLNCT=${blnct:02X}")
+        first_line = [emu.memory.read(SCREEN_MEM + i) for i in range(40)]
+        hex_line = " ".join(f"{code:02X}" for code in first_line)
+        ascii_line = "".join(chr(code) if 0x20 <= code <= 0x7E else "." for code in first_line)
+        print(f"DEBUG: Screen row0 hex: {hex_line}")
+        print(f"DEBUG: Screen row0 ascii: {ascii_line}")
 
     # Dump memory if requested
     if args.dump_memory:
