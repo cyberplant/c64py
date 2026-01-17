@@ -14,13 +14,14 @@ Set `C64PY_ROM_DIR` to point at that directory.
 ### Option A: Build from the provided source repo
 
 1. Install the cc65 toolchain (provides `ca65` and `ld65`).
-2. Build ROMs:
+2. Ensure `crc32` is available (used by the Makefile checksum step).
+3. Build ROMs:
    - `cd /workspace/c64rom`
    - `make`
-3. Copy/rename outputs into your ROM directory:
+4. Copy/rename outputs into your ROM directory:
    - `basic.bin` -> `basic.901226-01.bin`
    - `kernal.bin` -> `kernal.901227-03.bin`
-4. If you plan to run with `--graphics`, you still need `characters.901225-01.bin` (see Option B).
+5. If you plan to run with `--graphics`, you still need `characters.901225-01.bin` (see Option B).
 
 ### Option B: Use ROMs from VICE
 
