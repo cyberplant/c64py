@@ -32,9 +32,12 @@ from .ui import TextualInterface
 class C64:
     """Main C64 emulator"""
 
-    def __init__(self):
+    def __init__(self, interface_factory=None):
         self.memory = MemoryMap()
-        self.interface = TextualInterface(self)
+        if interface_factory is None:
+            self.interface = TextualInterface(self)
+        else:
+            self.interface = interface_factory(self)
 
         # Create CPU with interface reference
         self.cpu = CPU6502(self.memory, self.interface)
