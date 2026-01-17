@@ -8,6 +8,7 @@ import socket
 import threading
 from typing import Optional, Tuple
 
+from .constants import KEYBOARD_BUFFER_BASE, KEYBOARD_BUFFER_LEN_ADDR
 from .emulator import C64
 
 class EmulatorServer:
@@ -86,6 +87,13 @@ class EmulatorServer:
             return "OK"
 
         cmd = parts[0].upper()
+        def parse_keycode(raw: str) -> int:
+            cleaned = raw.strip()
+            if cleaned.startswith('$') or cleaned.lower().startswith('0x'):
+                return int(cleaned.replace('$', '').replace('0x', ''), 16)
+            if any(c in 'ABCDEFabcdef' for c in cleaned):
+                return int(cleaned, 16)
+            return int(cleaned, 10)
 
         if cmd == "HELP" or cmd == "?":
             return """C64 Emulator TCP Server Commands:
@@ -95,6 +103,10 @@ MEMORY <address>    - Read memory at address (hex, e.g. $0400 or 0400)
 WRITE <addr> <val>  - Write value to memory address (hex)
 DUMP [start] [end]  - Dump memory range as hex (default: $0000-$FFFF)
 SCREEN              - Get current screen contents (plain text)
+SEND_KEY <code>     - Inject PETSCII key code (hex or decimal)
+SEND_KEYS <codes..> - Inject multiple PETSCII key codes
+SHOW_KEYBOARD_BUFFER- Show keyboard buffer length and contents
+SHOW_CURRENT_LINE   - Show current screen line at cursor
 LOAD <file>         - Load PRG file
 STOP                - Stop emulator execution
 QUIT/EXIT           - Quit server and emulator
@@ -146,6 +158,42 @@ HELP/?              - Show this help message"""
             self.emu._update_text_screen()
             # For server mode, always return plain text
             return self.emu.render_text_screen(no_colors=True)
+
+        elif cmd == "SEND_KEY":
+            if len(parts) < 2:
+                return "ERROR: Missing key code"
+            try:
+                code = parse_keycode(parts[1]) & 0xFF
+            except ValueError:
+                return f"ERROR: Invalid key code: {parts[1]}"
+            self.emu.send_petscii(code)
+            return "OK"
+
+        elif cmd == "SEND_KEYS":
+            if len(parts) < 2:
+                return "ERROR: Missing key codes"
+            codes = []
+            try:
+                for raw in parts[1:]:
+                    codes.append(parse_keycode(raw) & 0xFF)
+            except ValueError as e:
+                return f"ERROR: Invalid key code: {e}"
+            self.emu.send_petscii_sequence(codes)
+            return "OK"
+
+        elif cmd == "SHOW_KEYBOARD_BUFFER":
+            kb_buf_base = KEYBOARD_BUFFER_BASE
+            kb_buf_len = self.emu.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
+            codes = [self.emu.memory.read(kb_buf_base + i) for i in range(kb_buf_len)]
+            hex_codes = ' '.join(f"${code:02X}" for code in codes)
+            ascii_codes = ''.join(chr(code) if 0x20 <= code <= 0x7E else '.' for code in codes)
+            return f"LEN={kb_buf_len} CODES=[{hex_codes}] ASCII='{ascii_codes}'"
+
+        elif cmd == "SHOW_CURRENT_LINE":
+            row, col, line_codes = self.emu.get_current_line()
+            hex_codes = ' '.join(f"${code:02X}" for code in line_codes)
+            ascii_line = ''.join(chr(code) if 0x20 <= code <= 0x7E else '.' for code in line_codes)
+            return f"ROW={row} COL={col} LINE='{ascii_line}' CODES=[{hex_codes}]"
 
         elif cmd == "LOAD":
             if len(parts) < 2:

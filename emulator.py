@@ -14,7 +14,15 @@ from typing import Dict, Optional, Tuple, Union
 from rich.console import Console
 from rich.text import Text
 
-from .constants import SCREEN_MEM, COLOR_MEM, ROM_KERNAL_START
+from .constants import (
+    COLOR_MEM,
+    CURSOR_COL_ADDR,
+    CURSOR_ROW_ADDR,
+    KEYBOARD_BUFFER_BASE,
+    KEYBOARD_BUFFER_LEN_ADDR,
+    ROM_KERNAL_START,
+    SCREEN_MEM,
+)
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
 from .memory import MemoryMap
@@ -832,6 +840,63 @@ class C64:
             with self.screen_lock:
                 return "\n".join("".join(self.text_screen[row]) for row in range(25))
         return self._render_text_screen_rich()
+
+    def get_cursor_position(self) -> Tuple[int, int, int]:
+        """Return cursor row, column, and absolute address."""
+        row = self.memory.read(CURSOR_ROW_ADDR)
+        col = self.memory.read(CURSOR_COL_ADDR)
+        row = max(0, min(row, 24))
+        col = max(0, min(col, 39))
+        cursor_addr = SCREEN_MEM + row * 40 + col
+        return row, col, cursor_addr
+
+    def read_screen_line_codes(self, row: int) -> List[int]:
+        """Read raw screen codes for a given row."""
+        row = max(0, min(row, 24))
+        line_start = SCREEN_MEM + row * 40
+        return [self.memory.read(line_start + col) for col in range(40)]
+
+    def extract_line_codes(self, row: int) -> List[int]:
+        """Extract a line with trailing spaces removed."""
+        codes = self.read_screen_line_codes(row)
+        last_non_space = -1
+        for i in range(39, -1, -1):
+            if codes[i] != 0x20:
+                last_non_space = i
+                break
+        if last_non_space == -1:
+            return []
+        return codes[:last_non_space + 1]
+
+    def get_current_line(self) -> Tuple[int, int, List[int]]:
+        """Get cursor position and the current screen line codes."""
+        row, col, _ = self.get_cursor_position()
+        line_codes = self.extract_line_codes(row)
+        return row, col, line_codes
+
+    def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
+        """Enqueue a PETSCII code into the KERNAL keyboard buffer."""
+        kb_buf_base = KEYBOARD_BUFFER_BASE
+        kb_buf_len = self.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
+        if kb_buf_len >= 10:
+            return False
+
+        self.memory.write(kb_buf_base + kb_buf_len, petscii_code & 0xFF)
+        kb_buf_len += 1
+        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
+        return True
+
+    def send_petscii(self, petscii_code: int) -> None:
+        """Send a PETSCII key to the emulator input path."""
+        if self.interface and hasattr(self.interface, "handle_petscii_input"):
+            self.interface.handle_petscii_input(petscii_code & 0xFF)
+            return
+        self._enqueue_keyboard_buffer(petscii_code & 0xFF)
+
+    def send_petscii_sequence(self, codes: List[int]) -> None:
+        """Send multiple PETSCII codes to the emulator input path."""
+        for code in codes:
+            self.send_petscii(code)
 
     def _render_with_rich(self) -> str:
         """Render screen using Rich library for better formatting"""
