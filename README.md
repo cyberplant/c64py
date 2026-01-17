@@ -71,6 +71,9 @@ c64py
 - `--video-standard {pal,ntsc}`: Video standard (default: pal)
 - `--no-colors`: Disable ANSI color output
 - `--graphics`: Render output in a pygame graphics window
+- `--graphics-scale N`: Scale factor for graphics window (default: 2)
+- `--graphics-fps N`: Target FPS for graphics window (default: 30)
+- `--graphics-border N`: Border size in pixels for graphics window (default: 32)
 
 ### Examples
 

@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 import time
@@ -56,6 +57,9 @@ def main():
     ap.add_argument("--no-colors", action="store_true", help="Disable ANSI color output")
     ap.add_argument("--fullscreen", action="store_true", help="Show only C64 screen output (no debug panel or status bar)")
     ap.add_argument("--graphics", action="store_true", help="Render output in a pygame graphics window")
+    ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
+    ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
+    ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
 
     args = ap.parse_args()
 
@@ -65,17 +69,23 @@ def main():
             from .graphics import PygameInterface
         except ImportError:
             from c64py.graphics import PygameInterface
-        interface_factory = PygameInterface
+        interface_factory = functools.partial(
+            PygameInterface,
+            max_cycles=args.max_cycles,
+            scale=args.graphics_scale,
+            fps=args.graphics_fps,
+            border_size=args.graphics_border,
+        )
 
     emu = C64(interface_factory=interface_factory)
     emu.debug = args.debug
     emu.autoquit = args.autoquit
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
-    ui_is_textual = hasattr(emu.interface, "fullscreen")
-    if ui_is_textual:
+    supports_ui_logs = hasattr(emu.interface, "fullscreen")
+    if supports_ui_logs:
         emu.interface.fullscreen = args.fullscreen
-    show_ui_logs = (not args.fullscreen) if ui_is_textual else True
+    show_ui_logs = (not args.fullscreen) if supports_ui_logs else True
     if args.debug and show_ui_logs:
         emu.interface.add_debug_log("🐛 Debug mode enabled")
 

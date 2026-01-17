@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from .constants import (
+    BASIC_BOOT_CYCLES,
+    BASIC_INPUT_BUFFER_SIZE,
+    BASIC_MAX_LINE_LENGTH,
     COLOR_MEM,
     CURSOR_COL_ADDR,
     CURSOR_PTR_HIGH,
@@ -19,20 +22,43 @@ from .constants import (
     INPUT_BUFFER_LEN_ADDR,
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
+    KEYBOARD_BUFFER_SIZE,
+    KERNAL_CHRIN_ADDR,
     SCREEN_MEM,
+    SCREEN_COLS as C64_SCREEN_COLS,
+    SCREEN_ROWS as C64_SCREEN_ROWS,
+    SCREEN_SIZE as C64_SCREEN_SIZE,
+    STUCK_PC_THRESHOLD,
+    VIC_MEMORY_CONTROL_REG,
 )
+
+if TYPE_CHECKING:
+    from .emulator import C64
 
 
 class PygameInterface:
-    """Pygame-based graphics output with keyboard input."""
+    """Pygame-based graphics UI for the C64 emulator.
+
+    Owns the pygame window, handles input, and renders the emulator screen.
+    The main event loop runs in the caller thread while CPU execution runs
+    on a background thread started by `run()`.
+    """
 
     CHAR_WIDTH = 8
     CHAR_HEIGHT = 8
-    SCREEN_COLS = 40
-    SCREEN_ROWS = 25
+    SCREEN_COLS = C64_SCREEN_COLS
+    SCREEN_ROWS = C64_SCREEN_ROWS
+    SCREEN_SIZE = C64_SCREEN_SIZE
     DEFAULT_BORDER = 32
 
-    def __init__(self, emulator, max_cycles: Optional[int] = None, scale: int = 2, fps: int = 30, border_size: Optional[int] = None):
+    def __init__(
+        self,
+        emulator: "C64",
+        max_cycles: Optional[int] = None,
+        scale: int = 2,
+        fps: int = 30,
+        border_size: Optional[int] = None,
+    ) -> None:
         self.emulator = emulator
         self.max_cycles = max_cycles
         self.scale = max(1, int(scale))
@@ -92,9 +118,10 @@ class PygameInterface:
         return self._log_messages[-count:] if len(self._log_messages) > count else list(self._log_messages)
 
     def run(self) -> None:
+        """Start the pygame event loop and render C64 output."""
         try:
             import pygame
-        except Exception as exc:
+        except ImportError as exc:
             raise RuntimeError("Pygame is required for --graphics mode") from exc
 
         self._pygame = pygame
@@ -131,7 +158,7 @@ class PygameInterface:
             if self.emulator:
                 self.emulator.running = False
             if self.emulator_thread and self.emulator_thread.is_alive():
-                self.emulator_thread.join(timeout=1.0)
+                self.emulator_thread.join()
             pygame.quit()
 
     def _setup_surfaces(self) -> None:
@@ -184,6 +211,7 @@ class PygameInterface:
             self._process_petscii_code(petscii_code)
 
     def _run_emulator(self) -> None:
+        """Run the emulator CPU loop on a background thread."""
         try:
             self.emulator.running = True
             cycles = 0
@@ -198,7 +226,8 @@ class PygameInterface:
                     break
 
                 if self.emulator.prg_file_path and not hasattr(self.emulator, "_program_loaded_after_boot"):
-                    if cycles > 2020000:
+                    # BASIC init takes roughly this many cycles before the prompt is ready.
+                    if cycles > BASIC_BOOT_CYCLES:
                         try:
                             self.emulator.load_prg(self.emulator.prg_file_path)
                             self.emulator.prg_file_path = None
@@ -214,9 +243,9 @@ class PygameInterface:
 
                 pc = self.emulator.cpu.state.pc
                 if pc == last_pc:
-                    if pc != 0xFFCF:
+                    if pc != KERNAL_CHRIN_ADDR:
                         stuck_count += 1
-                        if stuck_count > 1000:
+                        if stuck_count > STUCK_PC_THRESHOLD:
                             self.add_debug_log(f"PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
                             self.emulator.running = False
                             break
@@ -231,7 +260,7 @@ class PygameInterface:
             else:
                 self.add_debug_log(f"Stopped at cycle {cycles} (stuck_count={stuck_count})")
         except Exception as exc:
-            self.add_debug_log(f"Emulator error: {exc}")
+            self.add_debug_log(f"Emulator error ({type(exc).__name__}): {exc}")
 
     def _build_glyph_surfaces(self) -> None:
         char_rom = self.emulator.memory.char_rom
@@ -265,29 +294,16 @@ class PygameInterface:
         if not hasattr(self.emulator.memory, "_vic_regs"):
             return 0
         regs = self.emulator.memory._vic_regs
-        if len(regs) <= 0x18:
+        if len(regs) <= VIC_MEMORY_CONTROL_REG:
             return 0
-        char_addr = (regs[0x18] & 0x0E) << 10
+        char_addr = (regs[VIC_MEMORY_CONTROL_REG] & 0x0E) << 10
         return 0x800 if (char_addr & 0x0800) else 0
 
     def _petscii_to_screen_code(self, petscii_char: int) -> int:
-        if hasattr(self.emulator, "_petscii_to_screen_code"):
-            return self.emulator._petscii_to_screen_code(petscii_char)
-        if petscii_char < 32:
-            return petscii_char
-        if petscii_char < 64:
-            return petscii_char
-        if petscii_char < 96:
-            return petscii_char - 64
-        if petscii_char < 128:
-            return petscii_char - 32
-        if petscii_char < 160:
-            return petscii_char - 128
-        if petscii_char < 192:
-            return petscii_char - 64
-        return petscii_char - 128
+        return self.emulator._petscii_to_screen_code(petscii_char)
 
     def _render_frame(self) -> None:
+        """Render one frame of the C64 text screen into the back buffer."""
         bg_code = self.emulator.memory.read(0xD021) & 0x0F
         border_code = self.emulator.memory.read(0xD020) & 0x0F
         bg_color = self._palette.get(bg_code, (0, 0, 0))
@@ -309,6 +325,8 @@ class PygameInterface:
         charset_offset = self._get_charset_offset()
         glyph_base = charset_offset >> 3
         glyph_count = len(self._glyph_surfaces)
+        max_row_index = self.SCREEN_ROWS - 1
+        max_col_index = self.SCREEN_COLS - 1
 
         now = time.monotonic()
         if now - self.cursor_blink_last_toggle >= self.cursor_blink_interval:
@@ -342,8 +360,8 @@ class PygameInterface:
         if self.cursor_blink_on:
             cursor_row = mem[CURSOR_ROW_ADDR]
             cursor_col = mem[CURSOR_COL_ADDR]
-            cursor_row = max(0, min(cursor_row, self.SCREEN_ROWS - 1))
-            cursor_col = max(0, min(cursor_col, self.SCREEN_COLS - 1))
+            cursor_row = max(0, min(cursor_row, max_row_index))
+            cursor_col = max(0, min(cursor_col, max_col_index))
             idx = cursor_row * self.SCREEN_COLS + cursor_col
             raw_code = mem[screen_base + idx] & 0x7F
             code = self._petscii_to_screen_code(raw_code)
@@ -363,6 +381,7 @@ class PygameInterface:
         if 0x20 <= ascii_code <= 0x5F:
             return ascii_code
         if 0x61 <= ascii_code <= 0x7A:
+            # C64 keyboard input maps lowercase to uppercase PETSCII.
             return ascii_code - 0x20
         if ascii_code in (0x0D, 0x0A):
             return 0x0D
@@ -372,39 +391,44 @@ class PygameInterface:
         if not self.emulator:
             return
 
+        if not 0 <= petscii_code <= 0xFF:
+            return
+
+        screen_size = self.SCREEN_SIZE
+        max_row_index = self.SCREEN_ROWS - 1
         cursor_low = self.emulator.memory.read(CURSOR_PTR_LOW)
         cursor_high = self.emulator.memory.read(CURSOR_PTR_HIGH)
         cursor_addr = cursor_low | (cursor_high << 8)
 
-        if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + 1000:
+        if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + screen_size:
             cursor_addr = SCREEN_MEM
 
         if petscii_code == 0x0D:
-            row = (cursor_addr - SCREEN_MEM) // 40
-            if row < 24:
-                cursor_addr = SCREEN_MEM + (row + 1) * 40
+            row = (cursor_addr - SCREEN_MEM) // self.SCREEN_COLS
+            if row < max_row_index:
+                cursor_addr = SCREEN_MEM + (row + 1) * self.SCREEN_COLS
             else:
                 self.emulator.memory._scroll_screen_up()
-                cursor_addr = SCREEN_MEM + 24 * 40
+                cursor_addr = SCREEN_MEM + max_row_index * self.SCREEN_COLS
         elif petscii_code == 0x0A:
             return
         elif petscii_code == 0x93:
-            for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
+            for addr in range(SCREEN_MEM, SCREEN_MEM + screen_size):
                 self.emulator.memory.write(addr, 0x20)
             cursor_addr = SCREEN_MEM
         else:
-            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
+            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + screen_size:
                 self.emulator.memory.write(cursor_addr, petscii_code)
                 cursor_addr += 1
-                if cursor_addr >= SCREEN_MEM + 1000:
+                if cursor_addr >= SCREEN_MEM + screen_size:
                     self.emulator.memory._scroll_screen_up()
-                    cursor_addr = SCREEN_MEM + 24 * 40
+                    cursor_addr = SCREEN_MEM + max_row_index * self.SCREEN_COLS
 
         self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
         self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
 
-        row = (cursor_addr - SCREEN_MEM) // 40
-        col = (cursor_addr - SCREEN_MEM) % 40
+        row = (cursor_addr - SCREEN_MEM) // self.SCREEN_COLS
+        col = (cursor_addr - SCREEN_MEM) % self.SCREEN_COLS
         self.emulator.memory.write(CURSOR_ROW_ADDR, row)
         self.emulator.memory.write(CURSOR_COL_ADDR, col)
 
@@ -419,9 +443,11 @@ class PygameInterface:
         if not self.emulator:
             return
 
-        row = max(0, min(row, 24))
-        col = max(0, min(col, 39))
-        cursor_addr = SCREEN_MEM + row * 40 + col
+        max_row_index = self.SCREEN_ROWS - 1
+        max_col_index = self.SCREEN_COLS - 1
+        row = max(0, min(row, max_row_index))
+        col = max(0, min(col, max_col_index))
+        cursor_addr = SCREEN_MEM + row * self.SCREEN_COLS + col
 
         self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
         self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
@@ -437,7 +463,7 @@ class PygameInterface:
             col -= 1
         elif row > 0:
             row -= 1
-            col = 39
+            col = self.SCREEN_COLS - 1
         self._set_cursor_position(row, col)
 
     def _move_cursor_right(self) -> None:
@@ -445,14 +471,16 @@ class PygameInterface:
             return
 
         row, col, _ = self._get_cursor_position()
-        if col < 39:
+        max_row_index = self.SCREEN_ROWS - 1
+        max_col_index = self.SCREEN_COLS - 1
+        if col < max_col_index:
             col += 1
-        elif row < 24:
+        elif row < max_row_index:
             row += 1
             col = 0
         else:
             self.emulator.memory._scroll_screen_up()
-            row = 24
+            row = max_row_index
             col = 0
         self._set_cursor_position(row, col)
 
@@ -470,11 +498,12 @@ class PygameInterface:
             return
 
         row, col, _ = self._get_cursor_position()
-        if row < 24:
+        max_row_index = self.SCREEN_ROWS - 1
+        if row < max_row_index:
             row += 1
         else:
             self.emulator.memory._scroll_screen_up()
-            row = 24
+            row = max_row_index
         self._set_cursor_position(row, col)
 
     def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
@@ -502,7 +531,7 @@ class PygameInterface:
 
         kb_buf_base = KEYBOARD_BUFFER_BASE
         self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, 0)
-        for i in range(10):
+        for i in range(KEYBOARD_BUFFER_SIZE):
             self.emulator.memory.write(kb_buf_base + i, 0)
 
     def _is_line_edit_mode(self) -> bool:
@@ -510,7 +539,7 @@ class PygameInterface:
             return False
 
         try:
-            return self.emulator.cpu.state.pc == 0xFFCF
+            return self.emulator.cpu.state.pc == KERNAL_CHRIN_ADDR
         except Exception:
             return False
 
@@ -523,7 +552,7 @@ class PygameInterface:
         row, _, _ = self._get_cursor_position()
         line_codes = self._read_screen_line_codes(row)
         last_non_space = -1
-        for i in range(39, -1, -1):
+        for i in range(self.SCREEN_COLS - 1, -1, -1):
             if line_codes[i] != 0x20:
                 last_non_space = i
                 break
@@ -545,12 +574,12 @@ class PygameInterface:
             return
 
         line_codes = self._extract_current_line_codes()
-        max_line_len = 88
+        max_line_len = BASIC_MAX_LINE_LENGTH
         if len(line_codes) > max_line_len:
             line_codes = line_codes[:max_line_len]
         line_codes.append(0x0D)
 
-        for i in range(89):
+        for i in range(BASIC_INPUT_BUFFER_SIZE):
             value = line_codes[i] if i < len(line_codes) else 0
             self.emulator.memory.write(INPUT_BUFFER_BASE + i, value)
 
@@ -563,6 +592,9 @@ class PygameInterface:
 
     def _process_petscii_code(self, petscii_code: int, line_edit_mode: Optional[bool] = None) -> None:
         if not self.emulator:
+            return
+
+        if not 0 <= petscii_code <= 0xFF:
             return
 
         if line_edit_mode is None:
@@ -625,15 +657,16 @@ class PygameInterface:
             col -= 1
         else:
             row -= 1
-            col = 39
+            col = self.SCREEN_COLS - 1
 
         self._set_cursor_position(row, col)
-        cursor_addr = SCREEN_MEM + row * 40 + col
+        cursor_addr = SCREEN_MEM + row * self.SCREEN_COLS + col
 
-        if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
+        if SCREEN_MEM <= cursor_addr < SCREEN_MEM + self.SCREEN_SIZE:
             self.emulator.memory.write(cursor_addr, 0x20)
 
         self.emulator._update_text_screen()
 
     def handle_petscii_input(self, petscii_code: int) -> None:
+        """Handle a single PETSCII input code (0-255)."""
         self._process_petscii_code(petscii_code)
