@@ -107,6 +107,15 @@ class CPU6502:
         self._set_flag(0x02, value == 0)  # Z flag
         self._set_flag(0x80, (value & 0x80) != 0)  # N flag
 
+    def _advance_raster(self, cycles: int) -> None:
+        raster_max = 312 if self.memory.video_standard == "pal" else 263
+        cycles_per_line = 63 if self.memory.video_standard == "pal" else 65
+        step_cycles = max(1, cycles)
+        self.memory.raster_cycles += step_cycles
+        while self.memory.raster_cycles >= cycles_per_line:
+            self.memory.raster_cycles -= cycles_per_line
+            self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+
     def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Advance timers/video/IRQs even if CPU is 'blocked'."""
         self.state.cycles += cycles
@@ -115,9 +124,7 @@ class CPU6502:
         self._update_cia_timers(cycles)
 
         # Update VIC-II raster line (simulate video timing)
-        raster_max = 312 if self.memory.video_standard == "pal" else 263
-        # We keep the existing "1 step per instruction" behavior for consistency.
-        self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+        self._advance_raster(cycles)
 
         # Check for pending IRQ (only if interrupts are enabled)
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
@@ -518,9 +525,7 @@ class CPU6502:
         self._update_cia_timers(cycles)
 
         # Update VIC-II raster line (simulate video timing)
-        # Increment every cycle for fast CINT timing
-        raster_max = 312 if self.memory.video_standard == "pal" else 263
-        self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+        self._advance_raster(cycles)
 
         # Jiffy clock is now handled by CIA timer interrupts
 
