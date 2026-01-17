@@ -35,6 +35,50 @@ class CPU6502:
         # Don't read it here as ROMs might not be loaded yet
         self.state.pc = 0x0000
         self.chrout_count = 0
+        self.trace_enabled = False
+        self.trace_size = 0
+        self.trace_buffer = []
+        self.trace_index = 0
+        self.trace_count = 0
+
+    def enable_trace(self, size: int = 1024) -> None:
+        self.trace_enabled = True
+        self.trace_size = max(1, size)
+        self.trace_buffer = [None] * self.trace_size
+        self.trace_index = 0
+        self.trace_count = 0
+
+    def _record_trace(self, pc: int, opcode: int) -> None:
+        if not self.trace_enabled:
+            return
+        op1 = self.memory.read((pc + 1) & 0xFFFF)
+        op2 = self.memory.read((pc + 2) & 0xFFFF)
+        self.trace_buffer[self.trace_index] = {
+            "pc": pc,
+            "opcode": opcode,
+            "op1": op1,
+            "op2": op2,
+            "a": self.state.a,
+            "x": self.state.x,
+            "y": self.state.y,
+            "sp": self.state.sp,
+            "p": self.state.p,
+            "cycles": self.state.cycles,
+        }
+        self.trace_index = (self.trace_index + 1) % self.trace_size
+        self.trace_count = min(self.trace_count + 1, self.trace_size)
+
+    def get_trace(self) -> list[dict]:
+        if not self.trace_count:
+            return []
+        start = (self.trace_index - self.trace_count) % self.trace_size
+        entries = []
+        for i in range(self.trace_count):
+            idx = (start + i) % self.trace_size
+            entry = self.trace_buffer[idx]
+            if entry is not None:
+                entries.append(entry)
+        return entries
 
     def _read_word(self, addr: int) -> int:
         """Read 16-bit word (little-endian)"""
@@ -90,6 +134,7 @@ class CPU6502:
 
         pc = self.state.pc
         opcode = self.memory.read(pc)
+        self._record_trace(pc, opcode)
 
         # Log instruction execution if UDP debug is enabled
         # Note: cycles haven't been incremented yet, so we log the current cycle count

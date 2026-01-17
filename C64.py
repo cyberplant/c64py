@@ -24,14 +24,34 @@ try:
     from .debug import UdpDebugLogger
     from .emulator import C64
     from .server import EmulatorServer
-    from .constants import BLNCT, BLNSW, CURSOR_COL_ADDR, CURSOR_ROW_ADDR, SCREEN_MEM
+    from .constants import (
+        BLNCT,
+        BLNSW,
+        CURSOR_COL_ADDR,
+        CURSOR_ROW_ADDR,
+        INPUT_BUFFER_INDEX_ADDR,
+        INPUT_BUFFER_LEN_ADDR,
+        KEYBOARD_BUFFER_BASE,
+        KEYBOARD_BUFFER_LEN_ADDR,
+        SCREEN_MEM,
+    )
 except ImportError:
     # When run directly, add parent directory to path
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from c64py.debug import UdpDebugLogger
     from c64py.emulator import C64
     from c64py.server import EmulatorServer
-    from c64py.constants import BLNCT, BLNSW, CURSOR_COL_ADDR, CURSOR_ROW_ADDR, SCREEN_MEM
+    from c64py.constants import (
+        BLNCT,
+        BLNSW,
+        CURSOR_COL_ADDR,
+        CURSOR_ROW_ADDR,
+        INPUT_BUFFER_INDEX_ADDR,
+        INPUT_BUFFER_LEN_ADDR,
+        KEYBOARD_BUFFER_BASE,
+        KEYBOARD_BUFFER_LEN_ADDR,
+        SCREEN_MEM,
+    )
 
 
 def main():
@@ -84,6 +104,8 @@ def main():
     emu.autoquit = args.autoquit
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
+    if args.debug:
+        emu.cpu.enable_trace(1024)
     supports_ui_logs = hasattr(emu.interface, "fullscreen")
     if supports_ui_logs:
         emu.interface.fullscreen = args.fullscreen
@@ -249,6 +271,26 @@ def main():
         ascii_line = "".join(chr(code) if 0x20 <= code <= 0x7E else "." for code in first_line)
         print(f"DEBUG: Screen row0 hex: {hex_line}")
         print(f"DEBUG: Screen row0 ascii: {ascii_line}")
+        kb_len = emu.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
+        kb_codes = [emu.memory.read(KEYBOARD_BUFFER_BASE + i) for i in range(kb_len)]
+        kb_hex = " ".join(f"{code:02X}" for code in kb_codes)
+        kb_ascii = "".join(chr(code) if 0x20 <= code <= 0x7E else "." for code in kb_codes)
+        print(f"DEBUG: Keyboard buffer len={kb_len} hex: {kb_hex}")
+        print(f"DEBUG: Keyboard buffer ascii: {kb_ascii}")
+        input_idx = emu.memory.read(INPUT_BUFFER_INDEX_ADDR)
+        input_len = emu.memory.read(INPUT_BUFFER_LEN_ADDR)
+        print(f"DEBUG: Input buffer idx={input_idx} len={input_len}")
+        trace_entries = emu.cpu.get_trace()
+        if trace_entries:
+            print(f"DEBUG: Last {len(trace_entries)} instructions:")
+            for entry in trace_entries:
+                print(
+                    "DEBUG: "
+                    f"CYC={entry['cycles']} PC=${entry['pc']:04X} OP=${entry['opcode']:02X} "
+                    f"OP1=${entry['op1']:02X} OP2=${entry['op2']:02X} "
+                    f"A=${entry['a']:02X} X=${entry['x']:02X} Y=${entry['y']:02X} "
+                    f"SP=${entry['sp']:02X} P=${entry['p']:02X}"
+                )
 
     # Dump memory if requested
     if args.dump_memory:
