@@ -6,7 +6,8 @@ The emulator needs these ROM files in a single directory:
 
 - `basic.901226-01.bin`
 - `kernal.901227-03.bin`
-- `characters.901225-01.bin`
+
+`characters.901225-01.bin` is only required for `--graphics`.
 
 Set `C64PY_ROM_DIR` to point at that directory.
 
@@ -30,7 +31,7 @@ the three required files). Point `C64PY_ROM_DIR` to that directory.
 
 Run:
 
-- `python C64.py --no-color --max-cycles 3000000 --autoquit`
+- `timeout 30 python C64.py --no-color --max-cycles 3000000 --autoquit`
 
 If `--no-color` is not recognized, use `--no-colors`.
 

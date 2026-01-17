@@ -129,8 +129,12 @@ def main():
             parent_dir = os.path.dirname(script_dir)
             explicit_rom_dir = os.path.normpath(os.path.join(parent_dir, explicit_rom_dir))
 
-        rom_dir_path = ensure_roms_available(explicit_rom_dir, allow_prompt=True)
-        emu.load_roms(str(rom_dir_path))
+        rom_dir_path = ensure_roms_available(
+            explicit_rom_dir,
+            allow_prompt=True,
+            require_char_rom=args.graphics,
+        )
+        emu.load_roms(str(rom_dir_path), require_char_rom=args.graphics)
         if show_ui_logs:
             emu.interface.add_debug_log(f"💾 ROM directory: {rom_dir_path}")
     except Exception as e:

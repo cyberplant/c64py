@@ -86,11 +86,12 @@ class C64:
         # Backward compatibility
         self.rich_interface = self.interface
 
-    def load_roms(self, rom_dir: str) -> None:
+    def load_roms(self, rom_dir: str, *, require_char_rom: bool = True) -> None:
         """Load C64 ROM files
 
         Args:
             rom_dir: Absolute path to directory containing ROM files
+            require_char_rom: Whether the character ROM must be present
         """
         import os
 
@@ -140,10 +141,24 @@ class C64:
                 if self.rich_interface:
                     self.rich_interface.add_debug_log(f"🔄 Reset vector: ${reset_high:02X}{reset_low:02X}")
 
-            # Load Character ROM
-            self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
-            if self.rich_interface:
-                self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+            # Load Character ROM (optional for text-only mode)
+            if require_char_rom:
+                self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
+                if self.rich_interface:
+                    self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+            else:
+                try:
+                    self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
+                    if self.rich_interface:
+                        self.rich_interface.add_debug_log(
+                            f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes"
+                        )
+                except FileNotFoundError:
+                    self.memory.char_rom = None
+                    if self.rich_interface:
+                        self.rich_interface.add_debug_log(
+                            "⚠️ Character ROM not found; text-only mode will still run"
+                        )
         except Exception:
             # Stop textual UI if it exists so error is visible to user.
             if hasattr(self, "interface") and hasattr(self.interface, "exit"):
