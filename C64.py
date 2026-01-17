@@ -271,6 +271,19 @@ def main():
         ascii_line = "".join(chr(code) if 0x20 <= code <= 0x7E else "." for code in first_line)
         print(f"DEBUG: Screen row0 hex: {hex_line}")
         print(f"DEBUG: Screen row0 ascii: {ascii_line}")
+        vic_d018 = emu.memory.peek_vic(0x18) & 0xFF
+        screen_base = ((vic_d018 >> 4) & 0x0F) * 0x0400
+        non_space = 0
+        for i in range(1000):
+            if emu.memory.read(screen_base + i) != 0x20:
+                non_space += 1
+        print(f"DEBUG: VIC $D018=${vic_d018:02X} screen_base=${screen_base:04X} non_space={non_space}")
+        if screen_base != SCREEN_MEM:
+            base_line = [emu.memory.read(screen_base + i) for i in range(40)]
+            base_hex = " ".join(f"{code:02X}" for code in base_line)
+            base_ascii = "".join(chr(code) if 0x20 <= code <= 0x7E else "." for code in base_line)
+            print(f"DEBUG: Screen base row0 hex: {base_hex}")
+            print(f"DEBUG: Screen base row0 ascii: {base_ascii}")
         kb_len = emu.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
         kb_codes = [emu.memory.read(KEYBOARD_BUFFER_BASE + i) for i in range(kb_len)]
         kb_hex = " ".join(f"{code:02X}" for code in kb_codes)
