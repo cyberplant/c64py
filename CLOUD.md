@@ -20,7 +20,7 @@ Set `C64PY_ROM_DIR` to point at that directory.
 3. Copy/rename outputs into your ROM directory:
    - `basic.bin` -> `basic.901226-01.bin`
    - `kernal.bin` -> `kernal.901227-03.bin`
-4. You still need `characters.901225-01.bin` (see Option B).
+4. If you plan to run with `--graphics`, you still need `characters.901225-01.bin` (see Option B).
 
 ### Option B: Use ROMs from VICE
 
