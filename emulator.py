@@ -25,6 +25,7 @@ from .constants import (
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
     ROM_KERNAL_START,
+    ROM_KERNAL_END,
     SCREEN_MEM,
     SCREEN_COLS,
     SCREEN_ROWS,
@@ -85,11 +86,12 @@ class C64:
         # Backward compatibility
         self.rich_interface = self.interface
 
-    def load_roms(self, rom_dir: str) -> None:
+    def load_roms(self, rom_dir: str, *, require_char_rom: bool = True) -> None:
         """Load C64 ROM files
 
         Args:
             rom_dir: Absolute path to directory containing ROM files
+            require_char_rom: Whether the character ROM must be present
         """
         import os
 
@@ -139,10 +141,24 @@ class C64:
                 if self.rich_interface:
                     self.rich_interface.add_debug_log(f"🔄 Reset vector: ${reset_high:02X}{reset_low:02X}")
 
-            # Load Character ROM
-            self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
-            if self.rich_interface:
-                self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+            # Load Character ROM (optional for text-only mode)
+            if require_char_rom:
+                self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
+                if self.rich_interface:
+                    self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+            else:
+                try:
+                    self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
+                    if self.rich_interface:
+                        self.rich_interface.add_debug_log(
+                            f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes"
+                        )
+                except FileNotFoundError:
+                    self.memory.char_rom = None
+                    if self.rich_interface:
+                        self.rich_interface.add_debug_log(
+                            "⚠️ Character ROM not found; text-only mode will still run"
+                        )
         except Exception:
             # Stop textual UI if it exists so error is visible to user.
             if hasattr(self, "interface") and hasattr(self.interface, "exit"):
@@ -238,8 +254,8 @@ class C64:
         self.memory.ram[0xD1] = SCREEN_MEM & 0xFF  # Cursor address low byte
         self.memory.ram[0xD2] = (SCREEN_MEM >> 8) & 0xFF  # Cursor address high byte
         # Also initialize cursor row/col variables
-        self.memory.ram[0xD3] = 0  # Cursor row (0-24)
-        self.memory.ram[0xD8] = 0  # Cursor column (0-39)
+        self.memory.ram[CURSOR_ROW_ADDR] = 0  # Cursor row (0-24)
+        self.memory.ram[CURSOR_COL_ADDR] = 0  # Cursor column (0-39)
 
         # Initialize KERNAL reset vector at $8000-$8001 to point to BASIC cold start
         # The KERNAL does JMP ($8000) to jump to BASIC after initialization
@@ -544,9 +560,11 @@ class C64:
                         self.rich_interface.add_debug_log(debug_msg)
                 break
             elif self.cpu.state.pc == last_pc:
+                # When the KERNAL ROM is running, input waits can loop inside the ROM.
+                if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
+                    stuck_count = 0
                 # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
-                # Don't count it as stuck
-                if self.cpu.state.pc != 0xFFCF:
+                elif self.cpu.state.pc != 0xFFCF:
                     stuck_count += 1
                     if stuck_count > 1000:
                         if self.debug:
@@ -895,15 +913,12 @@ class C64:
         self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
         return True
 
-    def send_petscii(self, petscii_code: int) -> None:
-        """Send a PETSCII key to the emulator input path."""
-        if self.interface and hasattr(self.interface, "handle_petscii_input"):
-            self.interface.handle_petscii_input(petscii_code & 0xFF)
-            return
-        self._enqueue_keyboard_buffer(petscii_code & 0xFF)
+    def send_petscii(self, petscii_code: int) -> bool:
+        """Send a PETSCII key to the KERNAL keyboard queue."""
+        return self._enqueue_keyboard_buffer(petscii_code & 0xFF)
 
     def send_petscii_sequence(self, codes: List[int]) -> None:
-        """Send multiple PETSCII codes to the emulator input path."""
+        """Send multiple PETSCII codes to the KERNAL keyboard queue."""
         for code in codes:
             self.send_petscii(code)
 
