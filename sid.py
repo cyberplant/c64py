@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 from typing import List, Optional
 
 
@@ -43,7 +44,10 @@ class SidEmulator:
 
     @staticmethod
     def _clock_for_standard(video_standard: str) -> int:
-        return 1022727 if video_standard == "pal" else 985248
+        # C64 master clock (approx):
+        # - PAL:  985_248 Hz
+        # - NTSC: 1_022_727 Hz
+        return 985248 if video_standard == "pal" else 1022727
 
     def set_video_standard(self, video_standard: str) -> None:
         self._clock_hz = self._clock_for_standard(video_standard)
@@ -76,6 +80,26 @@ class SidEmulator:
             import pygame
         except ImportError as exc:
             raise RuntimeError("pygame is required for SID audio output") from exc
+
+        # Some Python/pygame builds ship without the mixer submodule (e.g. unsupported
+        # interpreter versions or a build without SDL_mixer). In that case, keep the
+        # emulator running but disable audio output.
+        try:
+            import pygame.mixer  # noqa: F401
+        except Exception as exc:
+            warnings.warn(
+                "SID audio disabled: 'pygame.mixer' is unavailable in this environment. "
+                f"(python={__import__('sys').version.split()[0]} "
+                f"pygame={getattr(pygame, '__version__', 'unknown')} "
+                f"path={getattr(pygame, '__file__', 'unknown')}) "
+                "Try using Python 3.12/3.13 or installing a pygame build that includes mixer.",
+                RuntimeWarning,
+            )
+            self._pygame = None
+            self._channel = None
+            self._running = False
+            self._thread = None
+            return
 
         self._pygame = pygame
         if not pygame.mixer.get_init():
