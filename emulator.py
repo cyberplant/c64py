@@ -84,6 +84,7 @@ class C64:
         self.current_cycles = 0  # Track current cycle count
         self.program_loaded = False  # Track if a program was loaded via command line
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
+        self.screen_update_callback = None  # Callback for screen updates (set by interface)
 
         # Backward compatibility
         self.rich_interface = self.interface
@@ -473,8 +474,15 @@ class C64:
             now = time.time()
             if now - last_time >= frame_time:
                 last_time = now
+                # Call graphics update if available
                 if hasattr(self, 'graphics') and self.graphics:
                     self.graphics.update()
+                # Call generic screen update callback (used by Textual UI)
+                if self.screen_update_callback:
+                    try:
+                        self.screen_update_callback()
+                    except Exception:
+                        pass  # Ignore errors during callback (UI might be shutting down)
             time.sleep(0.001)  # Yield to other threads
 
     def run(self, max_cycles: Optional[int] = None) -> None:
