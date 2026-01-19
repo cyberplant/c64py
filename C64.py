@@ -54,6 +54,18 @@ except ImportError:
     )
 
 
+def _show_speed(start_time: float, cycles: int) -> None:
+    """Display emulation speed statistics."""
+    import time
+    elapsed = time.perf_counter() - start_time
+    if elapsed > 0 and cycles > 0:
+        mhz = cycles / elapsed / 1e6
+        print(f"\n=== Emulation Speed ===")
+        print(f"Cycles: {cycles:,}")
+        print(f"Time:   {elapsed:.2f}s")
+        print(f"Speed:  {mhz:.2f} MHz ({mhz/1.0:.0%} of C64)")
+
+
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -244,6 +256,8 @@ def main():
                         print(line)
         if server:
             server.running = False
+        # Show emulation speed
+        _show_speed(start_time, emu.current_cycles)
         return
 
     # Start Textual interface (unless explicitly disabled with --no-colors)
@@ -266,6 +280,8 @@ def main():
         # After UI closes, stop server if running
         if server:
             server.running = False
+        # Show emulation speed
+        _show_speed(start_time, emu.current_cycles)
         return  # Exit after Textual interface closes
 
     # This code should never be reached since Textual blocks
@@ -351,14 +367,7 @@ def main():
         emu.screen_update_thread.join(timeout=1.0)
 
     # Show emulation speed
-    elapsed = time.perf_counter() - start_time
-    cycles = emu.current_cycles
-    if elapsed > 0 and cycles > 0:
-        mhz = cycles / elapsed / 1e6
-        print(f"\n=== Emulation Speed ===")
-        print(f"Cycles: {cycles:,}")
-        print(f"Time:   {elapsed:.2f}s")
-        print(f"Speed:  {mhz:.2f} MHz ({mhz/1.0:.0%} of C64)")
+    _show_speed(start_time, emu.current_cycles)
 
     # Close UDP debug logger (flush all pending messages)
     if emu.udp_debug:
