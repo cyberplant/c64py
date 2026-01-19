@@ -139,11 +139,31 @@ This tests:
 
 ## Limitations
 
-- No actual serial bus emulation (LOAD won't transfer data to C64 memory)
+- ~~No actual serial bus emulation (LOAD won't transfer data to C64 memory)~~ **FIXED**: KERNAL LOAD hook now implemented!
 - No SAVE support (would require write operations to D64)
 - No error channel handling
 - No support for other file types (SEQ, REL, etc.)
-- Directory is formatted but cannot be displayed via BASIC LIST
+- ~~Directory is formatted but cannot be displayed via BASIC LIST~~ **FIXED**: Directory can now be loaded and listed!
+
+## KERNAL LOAD Hook Implementation
+
+**UPDATE**: As of the latest commit, LOAD operations now work via KERNAL interception!
+
+The emulator now intercepts KERNAL LOAD calls at $FFD5 and handles them directly:
+
+1. **Detection**: When PC = $FFD5, check if device is 8-11 (disk drive)
+2. **Parameters**: Read LOAD params from zero page ($BA, $B9, $B7, $BB-$BC)
+3. **File Loading**: Load file from attached virtual disk drive
+4. **Memory Write**: Write data to memory at specified address
+5. **BASIC Pointers**: Update BASIC pointers for directory listing
+6. **Return**: Set carry flag based on success/failure and return to caller
+
+**Now Functional:**
+- ✅ `LOAD"$",8` - Lists directory (can use LIST after loading)
+- ✅ `LOAD"FILENAME",8` - Loads files from disk
+- ✅ `LOAD"FILENAME",8,1` - Loads to file's own address
+- ✅ VERIFY operations
+- ✅ Error handling (carry flag set on file not found)
 
 ## Implementation Notes
 

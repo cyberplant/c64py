@@ -124,28 +124,48 @@ RESULTS: 4 passed, 0 failed
 
 ## Known Limitations
 
-The current implementation provides the disk attachment and command injection infrastructure, but **does not implement the IEC serial bus** required for actual data transfer between the C64 and the drive. This means:
+~~The current implementation provides the disk attachment and command injection infrastructure, but **does not implement the IEC serial bus** required for actual data transfer between the C64 and the drive.~~
+
+**UPDATE**: KERNAL LOAD hook has been implemented! The limitations have been significantly reduced:
 
 - ✅ Disk can be attached programmatically
 - ✅ Directory can be read via drive.load_file("$")
 - ✅ LOAD"$",8 command is injected into keyboard buffer
-- ❌ BASIC will try to execute the command but I/O will fail (no serial bus)
+- ✅ **LOAD operations now work via KERNAL interception at $FFD5**
+- ✅ **Files can be loaded from disk images**
+- ✅ **Directory can be listed in BASIC with LIST command**
 
-### Why IEC Bus Emulation is Complex
+Remaining limitations:
+- ❌ SAVE operations not supported (would require D64 write support)
+- ❌ Error channel not emulated
+- ❌ Only basic file types supported (PRG files work, SEQ/REL not tested)
 
-The IEC serial bus requires:
+### KERNAL Hook Implementation
+
+Instead of full IEC serial bus emulation, the implementation uses a simpler and more efficient approach:
+
+**KERNAL LOAD Interception** (IMPLEMENTED ✅):
+- Intercepts CPU when PC = $FFD5 (KERNAL LOAD entry point)
+- Reads LOAD parameters from zero page
+- Loads file directly from virtual disk drive
+- Writes data to memory and updates BASIC pointers
+- Returns with appropriate flags set
+
+This approach provides full LOAD functionality without the complexity of IEC bus timing and protocol implementation.
+
+### Why Full IEC Bus Was Not Needed
+
+The IEC serial bus would have required:
 1. CIA2 port emulation for bus control (ATN, DATA, CLOCK lines)
 2. Protocol implementation (TALK, LISTEN, UNLISTEN commands)
 3. Timing-accurate serial communication
 4. Drive-side protocol handling
 
-This is a significant undertaking beyond the scope of this initial implementation.
-
-### Workarounds for Future Work
-
-1. **KERNAL Hook Interception**: Intercept LOAD ($FFD5) and bypass normal I/O
-2. **Fast Loader**: Implement a simplified fast loader that bypasses KERNAL
-3. **Full IEC Emulation**: Complete serial bus implementation (most accurate)
+The KERNAL hook approach is:
+- ✅ Simpler to implement and maintain
+- ✅ More efficient (no timing overhead)
+- ✅ Functionally equivalent for most use cases
+- ✅ Compatible with standard BASIC programs
 
 ## Files Changed Summary
 
