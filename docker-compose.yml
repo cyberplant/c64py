@@ -6,17 +6,11 @@ services:
       context: .
       dockerfile: Dockerfile.cpython
     volumes:
-      - type: bind
-        source: ./roms
-        target: /usr/share/c64py/roms
-        read_only: true
+      - ${C64PY_ROM_DIR:-./roms}:/roms:ro
 
   pypy:
     build:
       context: .
       dockerfile: Dockerfile.pypy
     volumes:
-      - type: bind
-        source: ./roms
-        target: /usr/share/c64py/roms
-        read_only: true
+      - ${C64PY_ROM_DIR:-./roms}:/roms:ro

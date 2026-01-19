@@ -2,7 +2,7 @@ name: Docker Build
 
 on:
   push:
-    branches: ["main", "speed-optimization"]
+    branches: ["main"]
   pull_request:
     branches: ["main"]
 
@@ -12,21 +12,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ROM build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cc65
+
+      - name: Build ROMs from source
+        run: |
+          git clone --depth 1 https://github.com/mist64/c64rom.git /tmp/c64rom
+          cd /tmp/c64rom && make
+          mkdir -p $HOME/roms
+          cp /tmp/c64rom/basic.bin $HOME/roms/basic.901226-01.bin
+          cp /tmp/c64rom/kernal.bin $HOME/roms/kernal.901227-03.bin
+
       - name: Build CPython image
         run: docker build -f Dockerfile.cpython -t c64py-cpython .
 
       - name: Test CPython image (smoke test)
         run: |
-          docker run --rm c64py-cpython --benchmark
+          docker run --rm -v $HOME/roms:/roms:ro c64py-cpython --benchmark
 
   build-pypy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ROM build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cc65
+
+      - name: Build ROMs from source
+        run: |
+          git clone --depth 1 https://github.com/mist64/c64rom.git /tmp/c64rom
+          cd /tmp/c64rom && make
+          mkdir -p $HOME/roms
+          cp /tmp/c64rom/basic.bin $HOME/roms/basic.901226-01.bin
+          cp /tmp/c64rom/kernal.bin $HOME/roms/kernal.901227-03.bin
+
       - name: Build PyPy image
         run: docker build -f Dockerfile.pypy -t c64py-pypy .
 
       - name: Test PyPy image (smoke test)
         run: |
-          docker run --rm c64py-pypy --benchmark
+          docker run --rm -v $HOME/roms:/roms:ro c64py-pypy --benchmark

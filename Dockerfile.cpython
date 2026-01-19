@@ -1,5 +1,4 @@
 # Dockerfile for C64py with CPython (latest stable)
-# Note: Python 3.14 is not yet released, using 3.13
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -14,5 +13,8 @@ COPY . .
 # Install the package in development mode
 RUN pip install -e .
 
-# Default command: run emulator
+# ROMs must be mounted at /roms or set via C64PY_ROM_DIR
+ENV C64PY_ROM_DIR=/roms
+
 ENTRYPOINT ["python", "C64.py"]
+CMD ["--benchmark"]
