@@ -21,7 +21,5 @@ COPY . .
 # Install the package in development mode
 RUN pip install -e .
 
-# Default command: run emulator (speed shown by default)
-CMD ["--benchmark"]
-
+# Default command: run emulator
 ENTRYPOINT ["pypy3", "C64.py"]
