@@ -12,8 +12,8 @@ This script shows:
 import sys
 import os
 
-# Add parent directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'c64py'))
+# Change to parent directory for proper package import
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from c64py.d64 import load_d64
 from c64py.drive import DiskDrive
