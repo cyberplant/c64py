@@ -555,6 +555,127 @@ class C64:
         """
         return self.drives.get(device)
 
+    def _handle_kernal_load(self) -> bool:
+        """Handle KERNAL LOAD operation for virtual disk drives.
+        
+        This intercepts LOAD calls when PC is at $FFD5 and device is 8-11.
+        Returns True if LOAD was handled, False otherwise.
+        
+        KERNAL LOAD calling convention:
+        - A: 0 = LOAD, 1 = VERIFY
+        - X: Load address low byte (if secondary address = 0)
+        - Y: Load address high byte (if secondary address = 0)
+        - $B7: Filename length
+        - $BB-$BC: Filename pointer
+        - $BA: Device number
+        - $B9: Secondary address (0 = use address in X/Y, 1 = use address from file)
+        """
+        # Check if we're at the LOAD entry point
+        if self.cpu.state.pc != 0xFFD5:
+            return False
+        
+        # Get device number from zero page
+        device = self.memory.read(0xBA)
+        
+        # Only handle disk devices (8-11)
+        if device < 8 or device > 11:
+            return False
+        
+        # Check if we have a drive attached for this device
+        drive = self.get_drive(device)
+        if not drive or not drive.has_disk():
+            return False
+        
+        # Get LOAD parameters
+        verify = self.cpu.state.a != 0  # A=0 for LOAD, A=1 for VERIFY
+        secondary_addr = self.memory.read(0xB9)
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        
+        # Read filename from memory
+        filename_bytes = []
+        for i in range(filename_len):
+            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
+        
+        if self.interface:
+            self.interface.add_debug_log(f"🔧 KERNAL LOAD intercepted: device={device}, file='{filename}', verify={verify}")
+        
+        # Load file from virtual disk
+        file_data = drive.load_file(filename, secondary_addr)
+        
+        if file_data is None:
+            if self.interface:
+                self.interface.add_debug_log(f"❌ File not found: '{filename}'")
+            # Set error: FILE NOT FOUND
+            self.memory.write(0x90, 0x40)  # Status byte: error
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+            # Return from JSR (pop return address and continue)
+            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            return True
+        
+        # Get load address
+        if secondary_addr == 0:
+            # Use address from X/Y registers
+            load_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+        else:
+            # Use address from file (first 2 bytes)
+            if len(file_data) >= 2:
+                load_addr = file_data[0] | (file_data[1] << 8)
+                file_data = file_data[2:]  # Skip load address bytes
+            else:
+                load_addr = 0x0801  # Default to BASIC start
+        
+        # Write file data to memory (skip if VERIFY)
+        if not verify:
+            for i, byte_val in enumerate(file_data):
+                addr = (load_addr + i) & 0xFFFF
+                self.memory.write(addr, byte_val)
+        
+        end_addr = (load_addr + len(file_data)) & 0xFFFF
+        
+        if self.interface:
+            self.interface.add_debug_log(
+                f"✅ {'Verified' if verify else 'Loaded'} {len(file_data)} bytes "
+                f"at ${load_addr:04X}-${end_addr:04X}"
+            )
+        
+        # Set end address in X/Y registers
+        self.cpu.state.x = end_addr & 0xFF
+        self.cpu.state.y = (end_addr >> 8) & 0xFF
+        
+        # Clear carry flag to indicate success
+        self.cpu.state.p &= ~0x01
+        
+        # Clear status byte
+        self.memory.write(0x90, 0x00)
+        
+        # If loading directory, update BASIC pointers
+        if filename == "$" and load_addr == 0x0801:
+            # Update BASIC end pointer ($2D/$2E)
+            self.memory.write(0x002D, end_addr & 0xFF)
+            self.memory.write(0x002E, (end_addr >> 8) & 0xFF)
+            # Update variable pointers
+            self.memory.write(0x002F, end_addr & 0xFF)
+            self.memory.write(0x0030, (end_addr >> 8) & 0xFF)
+            self.memory.write(0x0031, end_addr & 0xFF)
+            self.memory.write(0x0032, (end_addr >> 8) & 0xFF)
+        
+        # Return from JSR (pop return address and continue)
+        # The JSR to $FFD5 pushed the return address on the stack
+        # We need to pop it and continue from there
+        sp = self.cpu.state.sp
+        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
+        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
+        ret_addr = ret_addr_low | (ret_addr_high << 8)
+        # JSR pushes PC+2 (where PC points to last byte of JSR instruction)
+        # RTS adds 1 to get to next instruction
+        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
+        self.cpu.state.sp = (sp + 2) & 0xFF
+        
+        return True
+
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
         import time
@@ -638,6 +759,11 @@ class C64:
                         if self.interface:
                             self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
                         self.disk_image_path = None  # Clear path even on error
+
+            # Check for KERNAL LOAD hook (before executing instruction)
+            if self._handle_kernal_load():
+                # LOAD was handled, skip this CPU instruction
+                continue
 
             step_cycles = self.cpu.step(self.udp_debug, cycles)
             cycles += step_cycles
