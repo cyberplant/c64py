@@ -284,14 +284,14 @@ class TextualInterface(App):
                     screen_text = Text(str(screen_content))
 
                 # Debug: Check if screen has any non-space content (once)
-                non_space_count = sum(1 for row in self.emulator.text_screen for char in row if char != ' ')
-                if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
-                    sample_chars = []
-                    for addr in range(SCREEN_MEM, SCREEN_MEM + 20):
-                        char_code = self.emulator.memory.read(addr)
-                        sample_chars.append(f"${char_code:02X}")
-                    self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
-                    self._screen_debug_logged = True
+#                non_space_count = sum(1 for row in self.emulator.text_screen for char in row if char != ' ')
+#                if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
+#                    sample_chars = []
+#                    for addr in range(SCREEN_MEM, SCREEN_MEM + 20):
+#                        char_code = self.emulator.memory.read(addr)
+#                        sample_chars.append(f"${char_code:02X}")
+#                    self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
+#                    self._screen_debug_logged = True
 
                 # Update display widget using reactive pattern
                 t4 = time.perf_counter()
