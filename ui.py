@@ -13,6 +13,8 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Key
+from textual.reactive import reactive
+from textual.widget import Widget
 from textual.widgets import Static, Header, Footer, RichLog
 
 from .constants import (
@@ -31,6 +33,36 @@ from .constants import (
 
 if TYPE_CHECKING:
     from .emulator import C64
+
+
+class C64Display(Widget):
+    """Reactive widget for C64 screen display.
+
+    Uses Textual's reactive pattern - when screen_content changes,
+    render() is automatically called.
+    """
+
+    # Reactive attribute - changing this triggers automatic render()
+    screen_version = reactive(0)
+
+    def __init__(self, emulator: "C64", **kwargs):
+        super().__init__(**kwargs)
+        self.emulator = emulator
+        self._cached_content: Text | None = None
+
+    def render(self) -> Text:
+        """Called automatically by Textual when screen_version changes."""
+        if self._cached_content is not None:
+            return self._cached_content
+        # Fallback - should not happen normally
+        return Text("Loading C64...")
+
+    def update_screen(self, content: Text) -> None:
+        """Update the screen content and trigger a reactive refresh."""
+        self._cached_content = content
+        # Increment version to trigger reactive refresh
+        self.screen_version += 1
+
 
 class TextualInterface(App):
     """Textual-based interface with TCSS styling"""
@@ -104,7 +136,7 @@ class TextualInterface(App):
     def compose(self) -> ComposeResult:
         if not self.fullscreen:
             yield Header()
-        yield Static("Loading C64...", id="c64-display")
+        yield C64Display(self.emulator, id="c64-display")
         if not self.fullscreen:
             yield RichLog(id="debug-panel", auto_scroll=True)
             yield Static("Initializing...", id="status-bar")
@@ -117,7 +149,7 @@ class TextualInterface(App):
             # In fullscreen mode, add the fullscreen class to the screen
             self.screen.add_class("fullscreen")
 
-        self.c64_display = self.query_one("#c64-display", Static)
+        self.c64_display = self.query_one("#c64-display", C64Display)
 
         if not self.fullscreen:
             self.debug_logs = self.query_one("#debug-panel", RichLog)
@@ -208,7 +240,7 @@ class TextualInterface(App):
         """Update the UI periodically"""
         import time
         t_start = time.perf_counter()
-        
+
         if self.emulator:
             if not self.emulator.running:
                 # Emulator has stopped (e.g., due to autoquit), exit the app
@@ -236,7 +268,7 @@ class TextualInterface(App):
             screen_changed = self.emulator._update_text_screen()
             t2 = time.perf_counter()
             self._timing_dirty += (t2 - t1)
-            
+
             # Only do expensive rendering if screen actually changed
             if screen_changed:
                 self._timing_renders += 1
@@ -261,28 +293,28 @@ class TextualInterface(App):
                     self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
                     self._screen_debug_logged = True
 
-                # Update display widget using Static.update() - much faster than clear+write
+                # Update display widget using reactive pattern
                 t4 = time.perf_counter()
-                self.c64_display.update(screen_text)
+                self.c64_display.update_screen(screen_text)
                 t5 = time.perf_counter()
                 self._timing_widget += (t5 - t4)
 
             self.count += 1
             t_end = time.perf_counter()
             self._timing_total += (t_end - t_start)
-            
-            # Log timing every 60 updates
-            if self.count % 60 != 0:
+
+            # Log timing every 20 updates
+            if self.count % 20 != 0:
                 return
-            
+
             # Report accumulated timing
-            self.add_debug_log(
-                f"⏱️ 60 updates: total={self._timing_total*1000:.0f}ms "
-                f"dirty={self._timing_dirty*1000:.0f}ms "
-                f"render={self._timing_render*1000:.0f}ms "
-                f"widget={self._timing_widget*1000:.0f}ms "
-                f"renders={self._timing_renders}"
-            )
+#            self.add_debug_log(
+#                f"⏱️ 60 updates: total={self._timing_total*1000:.0f}ms "
+#                f"dirty={self._timing_dirty*1000:.0f}ms "
+#                f"render={self._timing_render*1000:.0f}ms "
+#                f"widget={self._timing_widget*1000:.0f}ms "
+#                f"renders={self._timing_renders}"
+#            )
             # Reset accumulators
             self._timing_dirty = 0.0
             self._timing_render = 0.0
