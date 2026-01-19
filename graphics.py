@@ -5,25 +5,17 @@ Pygame graphics interface for the C64 emulator.
 from __future__ import annotations
 
 import threading
-import time
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from .constants import (
     BASIC_BOOT_CYCLES,
-    BASIC_INPUT_BUFFER_SIZE,
-    BASIC_MAX_LINE_LENGTH,
+    BLNSW,
     COLOR_MEM,
     CURSOR_COL_ADDR,
-    CURSOR_PTR_HIGH,
-    CURSOR_PTR_LOW,
     CURSOR_ROW_ADDR,
-    INPUT_BUFFER_BASE,
-    INPUT_BUFFER_INDEX_ADDR,
-    INPUT_BUFFER_LEN_ADDR,
-    KEYBOARD_BUFFER_BASE,
-    KEYBOARD_BUFFER_LEN_ADDR,
-    KEYBOARD_BUFFER_SIZE,
     KERNAL_CHRIN_ADDR,
+    ROM_KERNAL_START,
+    ROM_KERNAL_END,
     SCREEN_MEM,
     SCREEN_COLS as C64_SCREEN_COLS,
     SCREEN_ROWS as C64_SCREEN_ROWS,
@@ -67,10 +59,6 @@ class PygameInterface:
 
         self.running = False
         self.emulator_thread = None
-        self.cursor_blink_interval = 0.5
-        self.cursor_blink_on = True
-        self.cursor_blink_last_toggle = time.monotonic()
-        self.last_committed_line = ""
         self.max_logs = 1000
         self._log_messages: List[str] = []
 
@@ -188,27 +176,27 @@ class PygameInterface:
             return
 
         if event.key == pygame.K_LEFT:
-            self._process_petscii_code(0x9D)
+            self._queue_petscii(0x9D)
             return
         if event.key == pygame.K_RIGHT:
-            self._process_petscii_code(0x1D)
+            self._queue_petscii(0x1D)
             return
         if event.key == pygame.K_UP:
-            self._process_petscii_code(0x91)
+            self._queue_petscii(0x91)
             return
         if event.key == pygame.K_DOWN:
-            self._process_petscii_code(0x11)
+            self._queue_petscii(0x11)
             return
         if event.key == pygame.K_BACKSPACE:
-            self._process_petscii_code(0x14)
+            self._queue_petscii(0x14)
             return
         if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-            self._process_petscii_code(0x0D)
+            self._queue_petscii(0x0D)
             return
 
         if event.unicode and event.unicode.isprintable():
             petscii_code = self._ascii_to_petscii(event.unicode)
-            self._process_petscii_code(petscii_code)
+            self._queue_petscii(petscii_code)
 
     def _run_emulator(self) -> None:
         """Run the emulator CPU loop on a background thread."""
@@ -233,6 +221,8 @@ class PygameInterface:
                             self.emulator.prg_file_path = None
                             self.emulator._program_loaded_after_boot = True
                             self.add_debug_log("Program loaded after BASIC boot completed")
+                            # Inject "RUN" command into keyboard buffer for autorun
+                            self.emulator._inject_run_command()
                         except Exception as exc:
                             self.add_debug_log(f"Failed to load program: {exc}")
                             self.emulator.prg_file_path = None
@@ -243,7 +233,9 @@ class PygameInterface:
 
                 pc = self.emulator.cpu.state.pc
                 if pc == last_pc:
-                    if pc != KERNAL_CHRIN_ADDR:
+                    if self.emulator.memory.kernal_rom and ROM_KERNAL_START <= pc < ROM_KERNAL_END:
+                        stuck_count = 0
+                    elif pc != KERNAL_CHRIN_ADDR:
                         stuck_count += 1
                         if stuck_count > STUCK_PC_THRESHOLD:
                             self.add_debug_log(f"PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
@@ -328,10 +320,10 @@ class PygameInterface:
         max_row_index = self.SCREEN_ROWS - 1
         max_col_index = self.SCREEN_COLS - 1
 
-        now = time.monotonic()
-        if now - self.cursor_blink_last_toggle >= self.cursor_blink_interval:
-            self.cursor_blink_on = not self.cursor_blink_on
-            self.cursor_blink_last_toggle = now
+        # Cursor blinking is now handled by KERNAL IRQ at $EA31, which modifies
+        # screen memory directly (XORs character with $80 to reverse it).
+        # When reversed (cursor visible), use current text color ($0286) as background.
+        cursor_color = mem[0x0286] & 0x0F  # Current text color for cursor
 
         for row in range(self.SCREEN_ROWS):
             row_offset = row * self.SCREEN_COLS
@@ -348,31 +340,16 @@ class PygameInterface:
 
                 x = screen_left + col * self.CHAR_WIDTH
                 if reverse:
-                    fg_color = self._palette.get(color_code, (255, 255, 255))
-                    self._frame_surface.fill(fg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
+                    # Reversed character (cursor): background is current text color,
+                    # foreground (glyph) is screen background color
+                    cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                    self._frame_surface.fill(cursor_bg, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
                     glyph_index = (glyph_base + code) % glyph_count
                     glyph = self._glyph_surfaces[glyph_index][bg_code]
                 else:
                     glyph_index = (glyph_base + code) % glyph_count
                     glyph = self._glyph_surfaces[glyph_index][color_code]
                 self._frame_surface.blit(glyph, (x, y))
-
-        if self.cursor_blink_on:
-            cursor_row = mem[CURSOR_ROW_ADDR]
-            cursor_col = mem[CURSOR_COL_ADDR]
-            cursor_row = max(0, min(cursor_row, max_row_index))
-            cursor_col = max(0, min(cursor_col, max_col_index))
-            idx = cursor_row * self.SCREEN_COLS + cursor_col
-            raw_code = mem[screen_base + idx] & 0x7F
-            code = self._petscii_to_screen_code(raw_code)
-            color_code = mem[color_base + idx] & 0x0F
-            x = screen_left + cursor_col * self.CHAR_WIDTH
-            y = screen_top + cursor_row * self.CHAR_HEIGHT
-            fg_color = self._palette.get(color_code, (255, 255, 255))
-            self._frame_surface.fill(fg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
-            glyph_index = (glyph_base + code) % glyph_count
-            glyph = self._glyph_surfaces[glyph_index][bg_code]
-            self._frame_surface.blit(glyph, (x, y))
 
     def _ascii_to_petscii(self, char: str) -> int:
         if not char:
@@ -387,286 +364,8 @@ class PygameInterface:
             return 0x0D
         return ascii_code & 0xFF
 
-    def _echo_character(self, petscii_code: int) -> None:
+    def _queue_petscii(self, petscii_code: int) -> None:
         if not self.emulator:
             return
-
-        if not 0 <= petscii_code <= 0xFF:
-            return
-
-        screen_size = self.SCREEN_SIZE
-        max_row_index = self.SCREEN_ROWS - 1
-        cursor_low = self.emulator.memory.read(CURSOR_PTR_LOW)
-        cursor_high = self.emulator.memory.read(CURSOR_PTR_HIGH)
-        cursor_addr = cursor_low | (cursor_high << 8)
-
-        if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + screen_size:
-            cursor_addr = SCREEN_MEM
-
-        if petscii_code == 0x0D:
-            row = (cursor_addr - SCREEN_MEM) // self.SCREEN_COLS
-            if row < max_row_index:
-                cursor_addr = SCREEN_MEM + (row + 1) * self.SCREEN_COLS
-            else:
-                self.emulator.memory._scroll_screen_up()
-                cursor_addr = SCREEN_MEM + max_row_index * self.SCREEN_COLS
-        elif petscii_code == 0x0A:
-            return
-        elif petscii_code == 0x93:
-            for addr in range(SCREEN_MEM, SCREEN_MEM + screen_size):
-                self.emulator.memory.write(addr, 0x20)
-            cursor_addr = SCREEN_MEM
-        else:
-            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + screen_size:
-                self.emulator.memory.write(cursor_addr, petscii_code)
-                cursor_addr += 1
-                if cursor_addr >= SCREEN_MEM + screen_size:
-                    self.emulator.memory._scroll_screen_up()
-                    cursor_addr = SCREEN_MEM + max_row_index * self.SCREEN_COLS
-
-        self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
-        self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
-
-        row = (cursor_addr - SCREEN_MEM) // self.SCREEN_COLS
-        col = (cursor_addr - SCREEN_MEM) % self.SCREEN_COLS
-        self.emulator.memory.write(CURSOR_ROW_ADDR, row)
-        self.emulator.memory.write(CURSOR_COL_ADDR, col)
-
-        self.emulator._update_text_screen()
-
-    def _get_cursor_position(self) -> Tuple[int, int, int]:
-        if not self.emulator:
-            return 0, 0, SCREEN_MEM
-        return self.emulator.get_cursor_position()
-
-    def _set_cursor_position(self, row: int, col: int) -> None:
-        if not self.emulator:
-            return
-
-        max_row_index = self.SCREEN_ROWS - 1
-        max_col_index = self.SCREEN_COLS - 1
-        row = max(0, min(row, max_row_index))
-        col = max(0, min(col, max_col_index))
-        cursor_addr = SCREEN_MEM + row * self.SCREEN_COLS + col
-
-        self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
-        self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
-        self.emulator.memory.write(CURSOR_ROW_ADDR, row)
-        self.emulator.memory.write(CURSOR_COL_ADDR, col)
-
-    def _move_cursor_left(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if col > 0:
-            col -= 1
-        elif row > 0:
-            row -= 1
-            col = self.SCREEN_COLS - 1
-        self._set_cursor_position(row, col)
-
-    def _move_cursor_right(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        max_row_index = self.SCREEN_ROWS - 1
-        max_col_index = self.SCREEN_COLS - 1
-        if col < max_col_index:
-            col += 1
-        elif row < max_row_index:
-            row += 1
-            col = 0
-        else:
-            self.emulator.memory._scroll_screen_up()
-            row = max_row_index
-            col = 0
-        self._set_cursor_position(row, col)
-
-    def _move_cursor_up(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if row > 0:
-            row -= 1
-        self._set_cursor_position(row, col)
-
-    def _move_cursor_down(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        max_row_index = self.SCREEN_ROWS - 1
-        if row < max_row_index:
-            row += 1
-        else:
-            self.emulator.memory._scroll_screen_up()
-            row = max_row_index
-        self._set_cursor_position(row, col)
-
-    def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
-        if not self.emulator:
-            return False
-        return self.emulator._enqueue_keyboard_buffer(petscii_code)
-
-    def _remove_last_keyboard_buffer_char(self) -> bool:
-        if not self.emulator:
-            return False
-
-        kb_buf_base = KEYBOARD_BUFFER_BASE
-        kb_buf_len = self.emulator.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
-        if kb_buf_len <= 0:
-            return False
-
-        kb_buf_len -= 1
-        self.emulator.memory.write(kb_buf_base + kb_buf_len, 0)
-        self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
-        return True
-
-    def _clear_keyboard_buffer(self) -> None:
-        if not self.emulator:
-            return
-
-        kb_buf_base = KEYBOARD_BUFFER_BASE
-        self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, 0)
-        for i in range(KEYBOARD_BUFFER_SIZE):
-            self.emulator.memory.write(kb_buf_base + i, 0)
-
-    def _is_line_edit_mode(self) -> bool:
-        if not self.emulator:
-            return False
-
-        try:
-            return self.emulator.cpu.state.pc == KERNAL_CHRIN_ADDR
-        except Exception:
-            return False
-
-    def _read_screen_line_codes(self, row: int) -> List[int]:
-        if not self.emulator:
-            return []
-        return self.emulator.read_screen_line_codes(row)
-
-    def _extract_current_line_codes(self) -> List[int]:
-        row, _, _ = self._get_cursor_position()
-        line_codes = self._read_screen_line_codes(row)
-        last_non_space = -1
-        for i in range(self.SCREEN_COLS - 1, -1, -1):
-            if line_codes[i] != 0x20:
-                last_non_space = i
-                break
-        if last_non_space == -1:
-            return []
-        return line_codes[: last_non_space + 1]
-
-    def _codes_to_ascii(self, codes: List[int]) -> str:
-        chars = []
-        for code in codes:
-            if 0x20 <= code <= 0x7E:
-                chars.append(chr(code))
-            else:
-                chars.append(".")
-        return "".join(chars)
-
-    def _commit_current_line(self) -> None:
-        if not self.emulator:
-            return
-
-        line_codes = self._extract_current_line_codes()
-        max_line_len = BASIC_MAX_LINE_LENGTH
-        if len(line_codes) > max_line_len:
-            line_codes = line_codes[:max_line_len]
-        line_codes.append(0x0D)
-
-        for i in range(BASIC_INPUT_BUFFER_SIZE):
-            value = line_codes[i] if i < len(line_codes) else 0
-            self.emulator.memory.write(INPUT_BUFFER_BASE + i, value)
-
-        self.emulator.memory.write(INPUT_BUFFER_INDEX_ADDR, 0)
-        self.emulator.memory.write(INPUT_BUFFER_LEN_ADDR, len(line_codes))
-        self._clear_keyboard_buffer()
-
-        self.last_committed_line = self._codes_to_ascii(line_codes[:-1])
-        self.add_debug_log(f"Committed line: '{self.last_committed_line}' (len={len(line_codes)})")
-
-    def _process_petscii_code(self, petscii_code: int, line_edit_mode: Optional[bool] = None) -> None:
-        if not self.emulator:
-            return
-
-        if not 0 <= petscii_code <= 0xFF:
-            return
-
-        if line_edit_mode is None:
-            line_edit_mode = self._is_line_edit_mode()
-
-        if petscii_code == 0x9D:
-            self._move_cursor_left()
-            return
-        if petscii_code == 0x1D:
-            self._move_cursor_right()
-            return
-        if petscii_code == 0x91:
-            self._move_cursor_up()
-            return
-        if petscii_code == 0x11:
-            self._move_cursor_down()
-            return
-
-        if petscii_code == 0x14:
-            if line_edit_mode:
-                self._handle_backspace()
-            else:
-                if self._remove_last_keyboard_buffer_char():
-                    self.add_debug_log("Backspace (removed from buffer)")
-                self._handle_backspace()
-            return
-
-        if petscii_code == 0x0D:
-            if line_edit_mode:
-                self._commit_current_line()
-            else:
-                if not self._enqueue_keyboard_buffer(petscii_code):
-                    self.add_debug_log("Keyboard buffer full, ignoring Enter")
-            self._echo_character(0x0D)
-            return
-
-        if petscii_code == 0x93:
-            self._echo_character(0x93)
-            return
-
-        if 0x20 <= petscii_code <= 0xFF:
-            if line_edit_mode:
-                self._echo_character(petscii_code)
-            else:
-                if self._enqueue_keyboard_buffer(petscii_code):
-                    self._echo_character(petscii_code)
-                else:
-                    self.add_debug_log("Keyboard buffer full, ignoring key")
-            return
-
-    def _handle_backspace(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if row == 0 and col == 0:
-            return
-
-        if col > 0:
-            col -= 1
-        else:
-            row -= 1
-            col = self.SCREEN_COLS - 1
-
-        self._set_cursor_position(row, col)
-        cursor_addr = SCREEN_MEM + row * self.SCREEN_COLS + col
-
-        if SCREEN_MEM <= cursor_addr < SCREEN_MEM + self.SCREEN_SIZE:
-            self.emulator.memory.write(cursor_addr, 0x20)
-
-        self.emulator._update_text_screen()
-
-    def handle_petscii_input(self, petscii_code: int) -> None:
-        """Handle a single PETSCII input code (0-255)."""
-        self._process_petscii_code(petscii_code)
+        if not self.emulator.send_petscii(petscii_code & 0xFF):
+            self.add_debug_log("Keyboard buffer full, ignoring key")

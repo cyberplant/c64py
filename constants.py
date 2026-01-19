@@ -19,8 +19,9 @@ SID_BASE = 0xD400
 CIA1_BASE = 0xDC00
 CIA2_BASE = 0xDD00
 
-# IRQ vector
-IRQ_VECTOR = 0x0314
+# IRQ vectors
+IRQ_VECTOR_HW = 0xFFFE  # Hardware IRQ vector (6502 reads this on IRQ)
+IRQ_VECTOR_SW = 0x0314  # Software IRQ vector (KERNAL jumps through this)
 
 # Screen memory (default)
 SCREEN_MEM = 0x0400
@@ -33,11 +34,14 @@ SCREEN_SIZE = SCREEN_COLS * SCREEN_ROWS
 BORDER_WIDTH = 4
 BORDER_HEIGHT = 4
 
-# Cursor state (zero-page)
+# Cursor state (zero-page, KERNAL screen editor)
+# PNT ($D1/$D2) = pointer to current screen line
+# PNTR ($D3) = cursor column
+# TBLX ($D6) = cursor row (line index)
 CURSOR_PTR_LOW = 0xD1
 CURSOR_PTR_HIGH = 0xD2
-CURSOR_ROW_ADDR = 0xD3
-CURSOR_COL_ADDR = 0xD8
+CURSOR_COL_ADDR = 0xD3
+CURSOR_ROW_ADDR = 0xD6
 
 # Keyboard buffer (KERNAL)
 KEYBOARD_BUFFER_BASE = 0x0277
@@ -62,7 +66,7 @@ CURSOR_BLINK_TICKS = 30  # ~0.5s at 60Hz
 
 # KERNAL addresses and bootstrap heuristics
 KERNAL_CHRIN_ADDR = 0xFFCF
-BASIC_BOOT_CYCLES = 2020000
+BASIC_BOOT_CYCLES = 2100000  # Must be AFTER BASIC cold start (~2045000) completes
 STUCK_PC_THRESHOLD = 1000
 
 # VIC-II registers
