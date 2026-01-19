@@ -234,7 +234,7 @@ class TextualInterface(App):
                 screen_text = Text(screen_plain)
 
             # Debug: Check if screen has any non-space content
-            non_space_count = sum(1 for c in screen_plain if c not in (' ', '\n'))
+            non_space_count = sum(1 for row in self.emulator.text_screen for char in row if char != ' ')
             if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
                 # Sample first few characters from screen memory
                 sample_chars = []
@@ -244,18 +244,9 @@ class TextualInterface(App):
                 self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
                 self._screen_debug_logged = True
 
-            # Machine-controlled cursor blink (IRQ-tied emulation).
-            # bit7 = visible (emulator-managed).
-            self.cursor_blink_on = bool(self.emulator.memory.read(BLNSW) & 0x80)
-
-            if self.cursor_blink_on:
-                # Cursor position is relative to the 40x25 text area.
-                # Our renderer includes a thick border; map cursor into the rendered text.
-                full_cols = SCREEN_COLS + BORDER_WIDTH * 2  # must match emulator renderer
-                line_stride = full_cols + 1  # + newline
-                cursor_index = (BORDER_HEIGHT * line_stride) + (cursor_row * line_stride) + BORDER_WIDTH + cursor_col
-                if 0 <= cursor_index < len(screen_plain):
-                    screen_text.stylize("reverse", cursor_index, cursor_index + 1)
+            # Cursor blinking is now handled by KERNAL IRQ at $EA31, which modifies
+            # screen memory directly (XORs character with $80 to reverse it).
+            # No special cursor handling needed here - just render screen memory as-is.
             self.c64_display.clear()
             self.c64_display.write(screen_text)
 
@@ -469,5 +460,3 @@ class TextualInterface(App):
             petscii_code = self._ascii_to_petscii(char)
             self._queue_petscii(petscii_code)
             event.prevent_default()
-
-

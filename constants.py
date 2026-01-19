@@ -19,8 +19,9 @@ SID_BASE = 0xD400
 CIA1_BASE = 0xDC00
 CIA2_BASE = 0xDD00
 
-# IRQ vector
-IRQ_VECTOR = 0x0314
+# IRQ vectors
+IRQ_VECTOR_HW = 0xFFFE  # Hardware IRQ vector (6502 reads this on IRQ)
+IRQ_VECTOR_SW = 0x0314  # Software IRQ vector (KERNAL jumps through this)
 
 # Screen memory (default)
 SCREEN_MEM = 0x0400

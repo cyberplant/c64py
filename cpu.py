@@ -9,7 +9,8 @@ from typing import Optional, TYPE_CHECKING
 from .constants import (
     SCREEN_MEM,
     COLOR_MEM,
-    IRQ_VECTOR,
+    IRQ_VECTOR_HW,
+    IRQ_VECTOR_SW,
     BLNSW,
     BLNCT,
     CURSOR_BLINK_TICKS,
@@ -40,6 +41,7 @@ class CPU6502:
         self.trace_buffer = []
         self.trace_index = 0
         self.trace_count = 0
+        self.jiffy_clock = 0  # Initialize jiffy_clock as an attribute of CPU6502
 
     def enable_trace(self, size: int = 1024) -> None:
         self.trace_enabled = True
@@ -129,7 +131,7 @@ class CPU6502:
         # Check for pending IRQ (only if interrupts are enabled)
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
             if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
-                self._handle_cia_interrupt()
+                self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
     def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0) -> int:
         """Execute one instruction, return cycles"""
@@ -203,7 +205,7 @@ class CPU6502:
 
             # Reset machine-controlled cursor blink state.
             # bit0 = enabled, bit7 = visible
-            self.memory.write(BLNSW, 0x81)
+            self.memory.write(BLNSW, 0x01)
             self.memory.write(BLNCT, 0)
 
             # Simulate CINT completing by setting PC to FCFE, adjust stack
@@ -533,8 +535,7 @@ class CPU6502:
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
             # Only handle CIA interrupts for now, skip VIC
             if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
-                self._handle_cia_interrupt()
-            # Don't call general IRQ handler yet
+                self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
         return cycles
 
@@ -570,14 +571,14 @@ class CPU6502:
     def _handle_cia_interrupt(self) -> None:
         """Handle CIA interrupts directly (bypass KERNAL for stability)"""
         # This is a simplified handler - the real C64 uses KERNAL IRQ handler at $EA31
-        # which includes keyboard scanning (SCNKEY). For now, we just update jiffy clock.
-        # The real IRQ handler should be called via _handle_irq() which jumps to $EA31
+        # which includes keyboard scanning (SCNKEY). For now, we just update jiffy clock
+        # and handle cursor blinking.
 
         # Check what CIA interrupt occurred
         icr = self.memory.cia1_icr
 
         if icr & 0x01:  # Timer A interrupt
-            # Increment jiffy clock (C64 standard locations)
+            # Increment jiffy clock (C64 standard locations $A0-$A2)
             jiffy_low = self.memory.read(0xA0)
             jiffy_mid = self.memory.read(0xA1)
             jiffy_high = self.memory.read(0xA2)
@@ -589,46 +590,48 @@ class CPU6502:
             self.memory.write(0xA1, (jiffy >> 8) & 0xFF)
             self.memory.write(0xA2, (jiffy >> 16) & 0xFF)
 
-            # Cursor blink emulation (machine-driven, IRQ-tied).
-            # We toggle bit 7 as the visible flag for the UI.
+            # Cursor blink emulation (like KERNAL at $EA31).
+            # BLNSW ($CC): 0 = blinking enabled, non-zero = blinking disabled.
+            # BLNCT ($CD): countdown timer, when reaches 0, toggle cursor.
             blnsw = self.memory.read(BLNSW)
-            blnct = (self.memory.read(BLNCT) + 1) & 0xFF
-            if blnct >= CURSOR_BLINK_TICKS:  # ~0.5s at 60Hz
-                # Toggle visible state by flipping bit 7.
-                self.memory.write(BLNSW, blnsw ^ 0x80)
-                self.memory.write(BLNCT, 0)
-            else:
-                self.memory.write(BLNCT, blnct)
-
-            # Debug: show jiffy updates occasionally
-            if hasattr(self, 'debug') and self.debug and jiffy % 10 == 0:
-                debug_msg = f"⏰ Jiffy clock: {jiffy}"
-                if self.interface:
-                    self.interface.add_debug_log(debug_msg)
+            if blnsw == 0:  # Blinking is enabled
+                blnct = self.memory.read(BLNCT)
+                if blnct == 0:
+                    # Reset counter and toggle cursor in screen memory
+                    self.memory.write(BLNCT, 20)  # KERNAL uses 20 (about 1/3 second at 60Hz)
+                    # Toggle cursor character in screen memory by XORing with $80
+                    cursor_row = self.memory.read(CURSOR_ROW_ADDR)
+                    cursor_col = self.memory.read(CURSOR_COL_ADDR)
+                    cursor_pos = SCREEN_MEM + cursor_row * 40 + cursor_col
+                    char_under_cursor = self.memory.read(cursor_pos)
+                    self.memory.write(cursor_pos, char_under_cursor ^ 0x80)
+                else:
+                    self.memory.write(BLNCT, blnct - 1)
 
         # Clear IRQ state (we're bypassing the real KERNAL handler).
         self.memory.cia1_icr = 0
         self.memory.pending_irq = False
 
     def _handle_irq(self, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
-        """Handle IRQ interrupt"""
-        # Clear pending IRQ flag before handling
+        """Handle IRQ interrupt - let KERNAL handle everything including cursor blink"""
+        # Clear pending IRQ flag but NOT cia1_icr - KERNAL reads $DC0D to acknowledge
         self.memory.pending_irq = False
 
-        # Push PC and P to stack
+        # Push PC and P to stack (6502 pushes high byte first, then low byte, then status)
         pc = self.state.pc
         self.memory.write(0x100 + self.state.sp, (pc >> 8) & 0xFF)
         self.state.sp = (self.state.sp - 1) & 0xFF
         self.memory.write(0x100 + self.state.sp, pc & 0xFF)
         self.state.sp = (self.state.sp - 1) & 0xFF
-        self.memory.write(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
+        # Push status with B flag clear (IRQ, not BRK) and bit 5 always set
+        self.memory.write(0x100 + self.state.sp, (self.state.p | 0x20) & ~0x10)
         self.state.sp = (self.state.sp - 1) & 0xFF
 
         # Set interrupt disable flag
         self._set_flag(0x04, True)
 
-        # Jump to IRQ vector
-        irq_addr = self._read_word(IRQ_VECTOR)
+        # Jump to HARDWARE IRQ vector at $FFFE/$FFFF (points to KERNAL $FF48)
+        irq_addr = self._read_word(IRQ_VECTOR_HW)
         self.state.pc = irq_addr
 
         if udp_debug and udp_debug.enabled:
@@ -1998,5 +2001,3 @@ class CPU6502:
         self._set_flag(0x02, (self.state.a & value) == 0)  # Z flag
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
-
-

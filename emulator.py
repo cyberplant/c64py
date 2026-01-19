@@ -73,11 +73,12 @@ class C64:
         self.running = False
         self.text_screen = [[' '] * 40 for _ in range(25)]
         self.text_colors = [[7] * 40 for _ in range(25)]  # Default: yellow on blue
+        self.text_reversed = [[False] * 40 for _ in range(25)]  # Track reversed chars (cursor)
         self.debug = False
         self.no_colors = False  # ANSI color output enabled by default
         self.udp_debug = None  # Will be set if UDP debugging is enabled
         self.screen_update_thread = None
-        self.screen_update_interval = 0.1  # Update screen every 100ms
+        self.screen_update_interval = 0.0167  # Update screen every 16.7ms (60Hz)
         self.screen_lock = threading.Lock()
         self.current_cycles = 0  # Track current cycle count
         self.program_loaded = False  # Track if a program was loaded via command line
@@ -246,7 +247,7 @@ class C64:
         self.memory.ram[0x0286] = 0x0E  # Current text color (light blue)
         # Cursor blink (machine-controlled; UI should follow this)
         # bit0 = enabled, bit7 = visible
-        self.memory.ram[BLNSW] = 0x81
+        self.memory.ram[BLNSW] = 0x81  # Set bit 7 for initial visibility and bit 0 for enabled
         self.memory.ram[BLNCT] = 0
 
         # Initialize cursor position (points to screen start)
@@ -436,53 +437,18 @@ class C64:
                 self.interface.add_debug_log(f"📝 First bytes at $0801: {', '.join(first_bytes)}")
 
     def _screen_update_worker(self) -> None:
-        """Worker thread that periodically updates the screen"""
-        update_count = 0
+        """Worker to update screen at ~60Hz (NTSC C64 rate)."""
+        import time
+
+        frame_time = 1.0 / 60.0  # Target 60Hz
+        last_time = time.time()
         while self.running:
-            try:
-                self._update_text_screen()
-                update_count += 1
-
-                # Textual interface updates screen automatically, no manual updates needed
-
-                # Show screen summary periodically when debug is enabled
-                if hasattr(self, 'debug') and self.debug and update_count % 10 == 0:
-                    # Count non-space characters to see if there's content
-                    non_spaces = 0
-                    for row in self.text_screen:
-                        for char in row:
-                            if char != ' ':
-                                non_spaces += 1
-
-                    debug_msg = f"📺 Screen update #{update_count}: {non_spaces} non-space characters"
-                    if self.interface:
-                        self.interface.add_debug_log(debug_msg)
-
-                    # Show first line if there's content
-                    if non_spaces > 0:
-                        first_line = ''.join(self.text_screen[0]).rstrip()
-                        if first_line:
-                            line_msg = f"📝 First line: '{first_line}'"
-                            if self.interface:
-                                self.interface.add_debug_log(line_msg)
-
-                    # Show raw screen memory sample
-                    screen_sample = []
-                    for i in range(16):
-                        screen_sample.append(f"{self.memory.read(0x0400 + i):02X}")
-                    mem_msg = f"💾 Screen mem ($0400): {' '.join(screen_sample)}"
-                    if self.interface:
-                        self.interface.add_debug_log(mem_msg)
-
-                # Update Textual debug panel (updates happen automatically in Textual)
-
-                time.sleep(self.screen_update_interval)
-            except Exception as e:
-                error_msg = f"❌ Screen update error: {e}"
-                if self.interface:
-                    self.interface.add_debug_log(error_msg)
-                else:
-                    print(error_msg)
+            now = time.time()
+            if now - last_time >= frame_time:
+                last_time = now
+                if hasattr(self, 'graphics') and self.graphics:
+                    self.graphics.update()
+            time.sleep(0.001)  # Yield to other threads
 
     def run(self, max_cycles: Optional[int] = None) -> None:
         """Run the emulator"""
@@ -761,6 +727,7 @@ class C64:
         """Update text screen from screen memory (thread-safe)"""
         screen_base = SCREEN_MEM
         color_base = COLOR_MEM
+        cursor_color = self.memory.read(0x0286) & 0x0F  # Current text color for cursor
 
         # Debug: screen update
         #if hasattr(self, 'interface') and self.interface:
@@ -771,8 +738,18 @@ class C64:
             for row in range(25):
                 for col in range(40):
                     addr = screen_base + row * 40 + col
-                    char_code = self.memory.read(addr)
+                    raw_code = self.memory.read(addr)
                     color_code = self.memory.read(color_base + row * 40 + col) & 0x0F
+
+                    # Check for reversed character (bit 7 set by KERNAL for cursor)
+                    reversed_char = bool(raw_code & 0x80)
+                    char_code = raw_code & 0x7F  # Strip bit 7 to get actual character
+
+                    # Store reverse state for rendering
+                    self.text_reversed[row][col] = reversed_char
+                    # For reversed chars (cursor), use current text color from $0286
+                    if reversed_char:
+                        color_code = cursor_color
 
                     # Convert C64 screen codes to ASCII
                     # C64 screen codes: PETSCII screen codes
@@ -843,7 +820,12 @@ class C64:
                     char = self.text_screen[row][col]
                     fg = self.text_colors[row][col] & 0x0F
                     fg_style = self._c64_color_to_rich_rgb(fg)
-                    screen_text.append(char, style=f"{fg_style} on {bg_style}")
+                    # Check if this cell is reversed (cursor)
+                    if self.text_reversed[row][col]:
+                        # Reversed: swap fg and bg - cursor color becomes background
+                        screen_text.append(char, style=f"{bg_style} on {fg_style}")
+                    else:
+                        screen_text.append(char, style=f"{fg_style} on {bg_style}")
                 # Right border
                 screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
                 if row < (SCREEN_ROWS - 1):
@@ -1108,5 +1090,3 @@ class C64:
             self.cpu.state.sp = state['sp'] & 0xFF
         if 'p' in state:
             self.cpu.state.p = state['p'] & 0xFF
-
-

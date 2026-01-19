@@ -318,8 +318,10 @@ class PygameInterface:
         max_row_index = self.SCREEN_ROWS - 1
         max_col_index = self.SCREEN_COLS - 1
 
-        blnsw = self.emulator.memory.read(BLNSW)
-        cursor_visible = bool(blnsw & 0x80)
+        # Cursor blinking is now handled by KERNAL IRQ at $EA31, which modifies
+        # screen memory directly (XORs character with $80 to reverse it).
+        # When reversed (cursor visible), use current text color ($0286) as background.
+        cursor_color = mem[0x0286] & 0x0F  # Current text color for cursor
 
         for row in range(self.SCREEN_ROWS):
             row_offset = row * self.SCREEN_COLS
@@ -336,31 +338,16 @@ class PygameInterface:
 
                 x = screen_left + col * self.CHAR_WIDTH
                 if reverse:
-                    fg_color = self._palette.get(color_code, (255, 255, 255))
-                    self._frame_surface.fill(fg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
+                    # Reversed character (cursor): background is current text color,
+                    # foreground (glyph) is screen background color
+                    cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                    self._frame_surface.fill(cursor_bg, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
                     glyph_index = (glyph_base + code) % glyph_count
                     glyph = self._glyph_surfaces[glyph_index][bg_code]
                 else:
                     glyph_index = (glyph_base + code) % glyph_count
                     glyph = self._glyph_surfaces[glyph_index][color_code]
                 self._frame_surface.blit(glyph, (x, y))
-
-        if cursor_visible:
-            cursor_row = mem[CURSOR_ROW_ADDR]
-            cursor_col = mem[CURSOR_COL_ADDR]
-            cursor_row = max(0, min(cursor_row, max_row_index))
-            cursor_col = max(0, min(cursor_col, max_col_index))
-            idx = cursor_row * self.SCREEN_COLS + cursor_col
-            raw_code = mem[screen_base + idx] & 0x7F
-            code = self._petscii_to_screen_code(raw_code)
-            color_code = mem[color_base + idx] & 0x0F
-            x = screen_left + cursor_col * self.CHAR_WIDTH
-            y = screen_top + cursor_row * self.CHAR_HEIGHT
-            fg_color = self._palette.get(color_code, (255, 255, 255))
-            self._frame_surface.fill(fg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
-            glyph_index = (glyph_base + code) % glyph_count
-            glyph = self._glyph_surfaces[glyph_index][bg_code]
-            self._frame_surface.blit(glyph, (x, y))
 
     def _ascii_to_petscii(self, char: str) -> int:
         if not char:
@@ -374,6 +361,7 @@ class PygameInterface:
         if ascii_code in (0x0D, 0x0A):
             return 0x0D
         return ascii_code & 0xFF
+
     def _queue_petscii(self, petscii_code: int) -> None:
         if not self.emulator:
             return
