@@ -205,7 +205,7 @@ class CPU6502:
 
             # Reset machine-controlled cursor blink state.
             # bit0 = enabled, bit7 = visible
-            self.memory.write(BLNSW, 0x01)
+            self.memory.write(BLNSW, 0x81)
             self.memory.write(BLNCT, 0)
 
             # Simulate CINT completing by setting PC to FCFE, adjust stack
@@ -571,8 +571,7 @@ class CPU6502:
     def _handle_cia_interrupt(self) -> None:
         """Handle CIA interrupts directly (bypass KERNAL for stability)"""
         # This is a simplified handler - the real C64 uses KERNAL IRQ handler at $EA31
-        # which includes keyboard scanning (SCNKEY). For now, we just update jiffy clock
-        # and handle cursor blinking.
+        # which includes keyboard scanning (SCNKEY). For now, we just update jiffy clock.
 
         # Check what CIA interrupt occurred
         icr = self.memory.cia1_icr
@@ -589,24 +588,6 @@ class CPU6502:
             self.memory.write(0xA0, jiffy & 0xFF)
             self.memory.write(0xA1, (jiffy >> 8) & 0xFF)
             self.memory.write(0xA2, (jiffy >> 16) & 0xFF)
-
-            # Cursor blink emulation (like KERNAL at $EA31).
-            # BLNSW ($CC): 0 = blinking enabled, non-zero = blinking disabled.
-            # BLNCT ($CD): countdown timer, when reaches 0, toggle cursor.
-            blnsw = self.memory.read(BLNSW)
-            if blnsw == 0:  # Blinking is enabled
-                blnct = self.memory.read(BLNCT)
-                if blnct == 0:
-                    # Reset counter and toggle cursor in screen memory
-                    self.memory.write(BLNCT, 20)  # KERNAL uses 20 (about 1/3 second at 60Hz)
-                    # Toggle cursor character in screen memory by XORing with $80
-                    cursor_row = self.memory.read(CURSOR_ROW_ADDR)
-                    cursor_col = self.memory.read(CURSOR_COL_ADDR)
-                    cursor_pos = SCREEN_MEM + cursor_row * 40 + cursor_col
-                    char_under_cursor = self.memory.read(cursor_pos)
-                    self.memory.write(cursor_pos, char_under_cursor ^ 0x80)
-                else:
-                    self.memory.write(BLNCT, blnct - 1)
 
         # Clear IRQ state (we're bypassing the real KERNAL handler).
         self.memory.cia1_icr = 0
