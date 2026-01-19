@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from rich.console import Console
 from rich.text import Text
@@ -48,7 +48,7 @@ class C64Display(Widget):
     def __init__(self, emulator: "C64", **kwargs):
         super().__init__(**kwargs)
         self.emulator = emulator
-        self._cached_content: Text | None = None
+        self._cached_content: Optional[Text] = None
 
     def render(self) -> Text:
         """Called automatically by Textual when screen_version changes."""
