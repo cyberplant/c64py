@@ -31,15 +31,16 @@ This is a Commodore 64 emulator implemented in Python with a text-based interfac
 ### Python Version and Dependencies
 - **Minimum Python version**: 3.9
 - **Core dependencies**: `rich>=13.0.0`, `textual>=0.40.0`, `pygame>=2.6.1`
-- Use type hints with `from __future__ import annotations` for all modules
+- Use type hints with `from __future__ import annotations` for modules with complex type annotations
 
 ### Code Style
 
 #### Imports
-- Always use `from __future__ import annotations` at the top of modules
+- Use `from __future__ import annotations` for modules with complex type annotations (e.g., modules with classes, methods with return types)
 - Use `TYPE_CHECKING` for import-time circular dependency resolution
 - Group imports: standard library, third-party, then local modules
 - Use explicit imports from local modules (e.g., `from .cpu import CPU6502`)
+- Simple modules with just constants or data classes may omit `from __future__ import annotations`
 
 Example:
 ```python
