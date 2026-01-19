@@ -133,19 +133,24 @@ class TextualInterface(App):
         self.emulator_thread = threading.Thread(target=self._run_emulator, daemon=True)
         self.emulator_thread.start()
 
-        # Update UI periodically
-        self.set_interval(0.1, self._update_ui)
+        # Set up screen update callback to be called from emulator's screen update worker
+        # Use call_from_thread to safely update Textual widgets from background thread
+        self.emulator.screen_update_callback = lambda: self.call_from_thread(self._update_ui)
 
     def _run_emulator(self):
         """Run the emulator in background thread"""
         try:
-            # For Textual interface, run without the screen update worker
-            # since UI updates are handled by _update_ui
             self.emulator.running = True
             cycles = 0
             max_cycles = self.max_cycles
             last_pc = None
             stuck_count = 0
+
+            # Start screen update worker for 60Hz UI updates
+            self.emulator.screen_update_thread = threading.Thread(
+                target=self.emulator._screen_update_worker, daemon=True
+            )
+            self.emulator.screen_update_thread.start()
 
             while self.emulator.running:
                 if max_cycles is not None and cycles >= max_cycles:
@@ -163,6 +168,8 @@ class TextualInterface(App):
                             self.emulator.prg_file_path = None  # Clear path after loading
                             self.emulator._program_loaded_after_boot = True
                             self.add_debug_log("💾 Program loaded after BASIC boot completed")
+                            # Inject "RUN" command into keyboard buffer for autorun
+                            self.emulator._inject_run_command()
                         except Exception as e:
                             self.add_debug_log(f"❌ Failed to load program: {e}")
                             self.emulator.prg_file_path = None  # Clear path even on error
