@@ -62,6 +62,12 @@ REQUIRED_ROMS: Sequence[RomSpec] = (
 )
 
 
+def _required_rom_specs(*, require_char_rom: bool = True) -> Sequence[RomSpec]:
+    if require_char_rom:
+        return REQUIRED_ROMS
+    return tuple(spec for spec in REQUIRED_ROMS if spec.key != "characters")
+
+
 def _is_tty() -> bool:
     try:
         return sys.stdin.isatty()
@@ -177,10 +183,10 @@ def iter_candidate_rom_dirs(extra: Optional[Sequence[Path]] = None) -> Iterable[
             yield p
 
 
-def roms_present_in_dir(rom_dir: Path) -> bool:
+def roms_present_in_dir(rom_dir: Path, *, required_specs: Sequence[RomSpec] = REQUIRED_ROMS) -> bool:
     """Return True if all required ROM filenames exist in rom_dir."""
     try:
-        for spec in REQUIRED_ROMS:
+        for spec in required_specs:
             found = False
             for name in (spec.filename, *spec.aliases):
                 if (rom_dir / name).is_file():
@@ -193,7 +199,11 @@ def roms_present_in_dir(rom_dir: Path) -> bool:
         return False
 
 
-def find_rom_dir(explicit_rom_dir: Optional[str] = None) -> Optional[Path]:
+def find_rom_dir(
+    explicit_rom_dir: Optional[str] = None,
+    *,
+    required_specs: Sequence[RomSpec] = REQUIRED_ROMS,
+) -> Optional[Path]:
     """
     Find a directory containing all required ROMs.
 
@@ -202,19 +212,19 @@ def find_rom_dir(explicit_rom_dir: Optional[str] = None) -> Optional[Path]:
     """
     if explicit_rom_dir:
         p = Path(explicit_rom_dir).expanduser()
-        if roms_present_in_dir(p):
+        if roms_present_in_dir(p, required_specs=required_specs):
             return p
         return None
 
     for candidate in iter_candidate_rom_dirs():
-        if roms_present_in_dir(candidate):
+        if roms_present_in_dir(candidate, required_specs=required_specs):
             return candidate
     return None
 
 
-def _copy_roms(src_dir: Path, dst_dir: Path) -> None:
+def _copy_roms(src_dir: Path, dst_dir: Path, *, required_specs: Sequence[RomSpec] = REQUIRED_ROMS) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for spec in REQUIRED_ROMS:
+    for spec in required_specs:
         src: Optional[Path] = None
         for name in (spec.filename, *spec.aliases):
             candidate = src_dir / name
@@ -272,11 +282,15 @@ def _extract_archive_to_temp(archive_path: Path) -> Path:
     raise ValueError(f"Unsupported archive format: {archive_path}")
 
 
-def _find_rom_dir_within_tree(root: Path) -> Optional[Path]:
+def _find_rom_dir_within_tree(
+    root: Path,
+    *,
+    required_specs: Sequence[RomSpec] = REQUIRED_ROMS,
+) -> Optional[Path]:
     """
     Search for a directory under root that contains all required ROMs.
     """
-    if roms_present_in_dir(root):
+    if roms_present_in_dir(root, required_specs=required_specs):
         return root
 
     # Limit recursion depth when walking large or deeply nested trees to avoid
@@ -292,7 +306,7 @@ def _find_rom_dir_within_tree(root: Path) -> Optional[Path]:
                 # Prevent os.walk from descending further under this directory.
                 dirnames[:] = []
                 continue
-            if roms_present_in_dir(dp):
+            if roms_present_in_dir(dp, required_specs=required_specs):
                 return dp
     except Exception:
         return None
@@ -303,6 +317,7 @@ def ensure_roms_available(
     explicit_rom_dir: Optional[str] = None,
     *,
     allow_prompt: bool = True,
+    require_char_rom: bool = True,
 ) -> Path:
     """
     Ensure ROMs are available and return a directory containing them.
@@ -310,21 +325,22 @@ def ensure_roms_available(
     If not found and prompting is allowed + stdin is a TTY, the user can
     provide a local directory or local archive to install into the user ROM dir.
     """
-    found = find_rom_dir(explicit_rom_dir=explicit_rom_dir)
+    required_specs = _required_rom_specs(require_char_rom=require_char_rom)
+    found = find_rom_dir(explicit_rom_dir=explicit_rom_dir, required_specs=required_specs)
     if found is not None:
         return found
 
     if explicit_rom_dir:
         raise FileNotFoundError(
             f"ROMs not found in --rom-dir {explicit_rom_dir!r}. "
-            f"Expected: {[s.filename for s in REQUIRED_ROMS]}"
+            f"Expected: {[s.filename for s in required_specs]}"
         )
 
     if not (allow_prompt and _is_tty()):
         tried = [str(p) for p in iter_candidate_rom_dirs()]
         raise FileNotFoundError(
             "C64 ROM files were not found. "
-            f"Expected: {[s.filename for s in REQUIRED_ROMS]}. "
+            f"Expected: {[s.filename for s in required_specs]}. "
             f"Searched: {tried}. "
             f"Provide --rom-dir or copy ROMs into {str(user_rom_dir())!r}."
         )
@@ -355,18 +371,18 @@ def ensure_roms_available(
     try:
         if src_path.is_file():
             temp_root = _extract_archive_to_temp(src_path)
-            candidate = _find_rom_dir_within_tree(temp_root)
+            candidate = _find_rom_dir_within_tree(temp_root, required_specs=required_specs)
         else:
-            candidate = _find_rom_dir_within_tree(src_path)
+            candidate = _find_rom_dir_within_tree(src_path, required_specs=required_specs)
 
         if candidate is None:
             raise FileNotFoundError(
                 "Could not find required ROM files in the provided source. "
-                f"Expected: {[s.filename for s in REQUIRED_ROMS]}"
+                f"Expected: {[s.filename for s in required_specs]}"
             )
 
         dst = user_rom_dir()
-        _copy_roms(candidate, dst)
+        _copy_roms(candidate, dst, required_specs=required_specs)
         print(f"Installed ROMs into: {dst}")
         return dst
     finally:

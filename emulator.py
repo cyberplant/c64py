@@ -11,10 +11,18 @@ import threading
 import time
 from typing import Dict, Optional, Tuple, Union
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
+
 from rich.console import Console
 from rich.text import Text
 
 from .constants import (
+    BASIC_BOOT_CYCLES,
     COLOR_MEM,
     BLNSW,
     BLNCT,
@@ -25,6 +33,7 @@ from .constants import (
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
     ROM_KERNAL_START,
+    ROM_KERNAL_END,
     SCREEN_MEM,
     SCREEN_COLS,
     SCREEN_ROWS,
@@ -71,37 +80,39 @@ class C64:
         self.sid = None
 
         self.running = False
-        self.text_screen = [[' '] * 40 for _ in range(25)]
-        self.text_colors = [[7] * 40 for _ in range(25)]  # Default: yellow on blue
+        # Use NumPy arrays for faster screen operations (fallback to lists if unavailable)
+        if HAS_NUMPY:
+            self.text_screen = np.full((25, 40), ' ', dtype='U1')  # Unicode chars
+            self.text_colors = np.full((25, 40), 7, dtype=np.uint8)  # Default: yellow
+            self.text_reversed = np.zeros((25, 40), dtype=np.bool_)  # Track reversed chars
+        else:
+            self.text_screen = [[' '] * 40 for _ in range(25)]
+            self.text_colors = [[7] * 40 for _ in range(25)]
+            self.text_reversed = [[False] * 40 for _ in range(25)]
         self.debug = False
         self.no_colors = False  # ANSI color output enabled by default
         self.udp_debug = None  # Will be set if UDP debugging is enabled
         self.screen_update_thread = None
-        self.screen_update_interval = 0.1  # Update screen every 100ms
+        self.screen_update_interval = 0.0167  # Update screen every 16.7ms (60Hz)
         self.screen_lock = threading.Lock()
         self.current_cycles = 0  # Track current cycle count
         self.program_loaded = False  # Track if a program was loaded via command line
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
+        self.screen_update_callback = None  # Callback for screen updates (set by interface)
+        # Dirty-checking for screen updates - use bytes for fast comparison
+        self._prev_screen_data = b''
+        self._prev_color_data = b''
+        self._screen_dirty = True  # Force initial render
 
         # Backward compatibility
         self.rich_interface = self.interface
 
-        if enable_sid:
-            try:
-                from .sid import SidEmulator
-                self.sid = SidEmulator(video_standard=self.memory.video_standard)
-                self.memory.sid = self.sid
-                if self.interface:
-                    self.interface.add_debug_log("🔊 SID audio enabled")
-            except Exception as exc:
-                if self.interface:
-                    self.interface.add_debug_log(f"⚠️ SID audio unavailable: {exc}")
-
-    def load_roms(self, rom_dir: str) -> None:
+    def load_roms(self, rom_dir: str, *, require_char_rom: bool = True) -> None:
         """Load C64 ROM files
 
         Args:
             rom_dir: Absolute path to directory containing ROM files
+            require_char_rom: Whether the character ROM must be present
         """
         import os
 
@@ -151,10 +162,24 @@ class C64:
                 if self.rich_interface:
                     self.rich_interface.add_debug_log(f"🔄 Reset vector: ${reset_high:02X}{reset_low:02X}")
 
-            # Load Character ROM
-            self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
-            if self.rich_interface:
-                self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+            # Load Character ROM (optional for text-only mode)
+            if require_char_rom:
+                self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
+                if self.rich_interface:
+                    self.rich_interface.add_debug_log(f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes")
+            else:
+                try:
+                    self.memory.char_rom = _read_rom_file("characters.901225-01.bin")
+                    if self.rich_interface:
+                        self.rich_interface.add_debug_log(
+                            f"💾 Loaded Character ROM: {len(self.memory.char_rom)} bytes"
+                        )
+                except FileNotFoundError:
+                    self.memory.char_rom = None
+                    if self.rich_interface:
+                        self.rich_interface.add_debug_log(
+                            "⚠️ Character ROM not found; text-only mode will still run"
+                        )
         except Exception:
             # Stop textual UI if it exists so error is visible to user.
             if hasattr(self, "interface") and hasattr(self.interface, "exit"):
@@ -242,7 +267,7 @@ class C64:
         self.memory.ram[0x0286] = 0x0E  # Current text color (light blue)
         # Cursor blink (machine-controlled; UI should follow this)
         # bit0 = enabled, bit7 = visible
-        self.memory.ram[BLNSW] = 0x81
+        self.memory.ram[BLNSW] = 0x81  # Set bit 7 for initial visibility and bit 0 for enabled
         self.memory.ram[BLNCT] = 0
 
         # Initialize cursor position (points to screen start)
@@ -250,8 +275,8 @@ class C64:
         self.memory.ram[0xD1] = SCREEN_MEM & 0xFF  # Cursor address low byte
         self.memory.ram[0xD2] = (SCREEN_MEM >> 8) & 0xFF  # Cursor address high byte
         # Also initialize cursor row/col variables
-        self.memory.ram[0xD3] = 0  # Cursor row (0-24)
-        self.memory.ram[0xD8] = 0  # Cursor column (0-39)
+        self.memory.ram[CURSOR_ROW_ADDR] = 0  # Cursor row (0-24)
+        self.memory.ram[CURSOR_COL_ADDR] = 0  # Cursor column (0-39)
 
         # Initialize KERNAL reset vector at $8000-$8001 to point to BASIC cold start
         # The KERNAL does JMP ($8000) to jump to BASIC after initialization
@@ -426,6 +451,14 @@ class C64:
             self.memory.ram[0x002D] = end_addr & 0xFF
             self.memory.ram[0x002E] = (end_addr >> 8) & 0xFF
 
+            # Set variable/array pointers ($2F-$32) - same as end, no variables yet
+            # ARYTAB ($2F/$30) - start of arrays
+            self.memory.ram[0x002F] = end_addr & 0xFF
+            self.memory.ram[0x0030] = (end_addr >> 8) & 0xFF
+            # STREND ($31/$32) - end of arrays/start of free RAM
+            self.memory.ram[0x0031] = end_addr & 0xFF
+            self.memory.ram[0x0032] = (end_addr >> 8) & 0xFF
+
             # Debug: Log the BASIC pointers
             if self.interface:
                 self.interface.add_debug_log(f"📝 BASIC start: ${self.memory.ram[0x002B] | (self.memory.ram[0x002C] << 8):04X}")
@@ -442,54 +475,45 @@ class C64:
                 first_bytes = [f"${self.memory.read(0x0801 + i):02X}" for i in range(min(16, len(prg_data)))]
                 self.interface.add_debug_log(f"📝 First bytes at $0801: {', '.join(first_bytes)}")
 
+    def _inject_run_command(self) -> None:
+        """Inject 'RUN' command into keyboard buffer for autorun."""
+        
+        # Put in keyboard buffer (raw keypresses)
+        # Clear buffer first
+        for i in range(10):
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, 0)
+
+        # Write "RUN" + RETURN
+        full_command = b"RUN\x0D"
+        for i, char in enumerate(full_command):
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, char)
+
+        # Set buffer length
+        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, len(full_command))
+        
+        if self.interface:
+            self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
+
     def _screen_update_worker(self) -> None:
-        """Worker thread that periodically updates the screen"""
-        update_count = 0
+        """Worker to update screen at ~60Hz (NTSC C64 rate)."""
+        import time
+
+        frame_time = 1.0 / 60.0  # Target 60Hz
+        last_time = time.time()
         while self.running:
-            try:
-                self._update_text_screen()
-                update_count += 1
-
-                # Textual interface updates screen automatically, no manual updates needed
-
-                # Show screen summary periodically when debug is enabled
-                if hasattr(self, 'debug') and self.debug and update_count % 10 == 0:
-                    # Count non-space characters to see if there's content
-                    non_spaces = 0
-                    for row in self.text_screen:
-                        for char in row:
-                            if char != ' ':
-                                non_spaces += 1
-
-                    debug_msg = f"📺 Screen update #{update_count}: {non_spaces} non-space characters"
-                    if self.interface:
-                        self.interface.add_debug_log(debug_msg)
-
-                    # Show first line if there's content
-                    if non_spaces > 0:
-                        first_line = ''.join(self.text_screen[0]).rstrip()
-                        if first_line:
-                            line_msg = f"📝 First line: '{first_line}'"
-                            if self.interface:
-                                self.interface.add_debug_log(line_msg)
-
-                    # Show raw screen memory sample
-                    screen_sample = []
-                    for i in range(16):
-                        screen_sample.append(f"{self.memory.read(0x0400 + i):02X}")
-                    mem_msg = f"💾 Screen mem ($0400): {' '.join(screen_sample)}"
-                    if self.interface:
-                        self.interface.add_debug_log(mem_msg)
-
-                # Update Textual debug panel (updates happen automatically in Textual)
-
-                time.sleep(self.screen_update_interval)
-            except Exception as e:
-                error_msg = f"❌ Screen update error: {e}"
-                if self.interface:
-                    self.interface.add_debug_log(error_msg)
-                else:
-                    print(error_msg)
+            now = time.time()
+            if now - last_time >= frame_time:
+                last_time = now
+                # Call graphics update if available
+                if hasattr(self, 'graphics') and self.graphics:
+                    self.graphics.update()
+                # Call generic screen update callback (used by Textual UI)
+                if self.screen_update_callback:
+                    try:
+                        self.screen_update_callback()
+                    except Exception:
+                        pass  # Ignore errors during callback (UI might be shutting down)
+            time.sleep(0.001)  # Yield to other threads
 
     def run(self, max_cycles: Optional[int] = None) -> None:
         """Run the emulator"""
@@ -521,14 +545,16 @@ class C64:
             # Load program if pending (after BASIC boot completes)
             if self.prg_file_path and not hasattr(self, '_program_loaded_after_boot'):
                 # BASIC is ready - load the program now (after boot has completed)
-                # Wait until we're past boot sequence (cycles > 2020000)
-                if cycles > 2020000:
+                # Wait until we're past boot sequence
+                if cycles > BASIC_BOOT_CYCLES:
                     try:
                         self.load_prg(self.prg_file_path)
                         self.prg_file_path = None  # Clear path after loading
                         self._program_loaded_after_boot = True
                         if self.interface:
                             self.interface.add_debug_log("💾 Program loaded after BASIC boot completed")
+                        # Inject "RUN" command into keyboard buffer for autorun
+                        self._inject_run_command()
                     except Exception as e:
                         if self.interface:
                             self.interface.add_debug_log(f"❌ Failed to load program: {e}")
@@ -567,9 +593,11 @@ class C64:
                         self.rich_interface.add_debug_log(debug_msg)
                 break
             elif self.cpu.state.pc == last_pc:
+                # When the KERNAL ROM is running, input waits can loop inside the ROM.
+                if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
+                    stuck_count = 0
                 # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
-                # Don't count it as stuck
-                if self.cpu.state.pc != 0xFFCF:
+                elif self.cpu.state.pc != 0xFFCF:
                     stuck_count += 1
                     if stuck_count > 1000:
                         if self.debug:
@@ -670,49 +698,18 @@ class C64:
                     self.rich_interface.add_debug_log(f"✅ COMPLETED {routine_name}")
                 print(f"✅ COMPLETED {routine_name} at cycle {cycles}")
 
-            # Debug: Log post-boot sequence
-            if pc == 0xFCFE:  # CLI
-                print(f"🔓 CLI (enable interrupts) at cycle {cycles}")
-                print(f"   Next PC should be FCFF, I flag was {self.cpu.state.p & 0x04}")
-            elif pc == 0xFCFF:  # JMP ($A000)
-                a000_low = self.memory.read(0xA000)
-                a000_high = self.memory.read(0xA001)
-                jump_target = a000_low | (a000_high << 8)
-                print(f"🏃 JMP (\\$A000) -> \\${jump_target:04X} at cycle {cycles}")
-                if jump_target == 0xFCF8:
-                    print(f"   🚨 DANGER: Jump target is boot start! Infinite loop!")
-                elif jump_target == 0:
-                    print(f"   🚨 ERROR: Jump target is 0! Invalid BASIC entry point!")
-                # Log that we're about to jump
-                print(f"   About to set PC to \\${jump_target:04X}")
-                print(f"   A000 content: \\${a000_low:02X} \\${a000_high:02X}")
-            elif pc >= 0xFCFE and pc <= 0xFD02:  # Log all instructions in boot cleanup
-                if not self.rich_interface:  # Only print if Rich interface is not active
-                    print(f"📍 Boot cleanup: PC=\\${pc:04X}, opcode=\\${self.memory.read(pc):02X}, cycle {cycles}")
-
-            # Debug: Track entry to BASIC
-            if pc == 0xE394:  # BASIC cold start entry point
-                print(f"📚 Entered BASIC cold start at \\${pc:04X} (cycle {cycles})")
-
-            # Debug: Track execution in BASIC ROM
-            if 0xA000 <= pc <= 0xBFFF and cycles > 2020000:  # In BASIC ROM
-                if cycles % 50000 == 0:  # Log occasionally
-                    print(f"📖 BASIC executing at \\${pc:04X} (cycle {cycles})")
-
-            # Debug: Why is RESTOR called repeatedly?
-            if pc == 0xFD15 and cycles > 2010000:  # RESTOR called after boot should be done
-                print(f"🔄 RESTOR called again at cycle {cycles} - investigating...")
-                # Check stack to see who called it
-                sp = self.cpu.state.sp
-                if sp < 0xFF:
-                    ret_low = self.memory.read(0x100 + ((sp + 1) & 0xFF))
-                    ret_high = self.memory.read(0x100 + ((sp + 2) & 0xFF))
-                    return_addr = ret_low | (ret_high << 8)
-                    print(f"   Return address on stack: \\${return_addr:04X}")
-                    if return_addr == 0xFCFB:
-                        print(f"   ✅ Called from boot sequence (FCFB)")
-                    else:
-                        print(f"   ❓ Called from unexpected address \\${return_addr:04X}")
+            # Debug: Log post-boot sequence (only if debug enabled)
+            if self.debug:
+                if pc == 0xFCFE:  # CLI
+                    print(f"🔓 CLI (enable interrupts) at cycle {cycles}")
+                    print(f"   Next PC should be FCFF, I flag was {self.cpu.state.p & 0x04}")
+                elif pc == 0xFCFF:  # JMP ($A000)
+                    a000_low = self.memory.read(0xA000)
+                    a000_high = self.memory.read(0xA001)
+                    jump_target = a000_low | (a000_high << 8)
+                    print(f"🏃 JMP ($A000) -> ${jump_target:04X} at cycle {cycles}")
+                elif pc == 0xE394:  # BASIC cold start entry point
+                    print(f"📚 Entered BASIC cold start at ${pc:04X} (cycle {cycles})")
 
         # Determine stop reason
         stop_reason = "unknown"
@@ -762,57 +759,107 @@ class C64:
             # Uppercase graphics
             return petscii_char - 128
 
-    def _update_text_screen(self) -> None:
-        """Update text screen from screen memory (thread-safe)"""
+    # Precomputed screen code to ASCII lookup table (0-127)
+    _SCREEN_CODE_TO_ASCII = None
+    _SCREEN_CODE_TABLE_LOCK = threading.Lock()
+    
+    @classmethod
+    def _init_screen_code_table(cls):
+        """Initialize the screen code to ASCII lookup table (thread-safe)."""
+        # Double-checked locking pattern for thread-safe lazy initialization
+        if cls._SCREEN_CODE_TO_ASCII is not None:
+            return
+        
+        with cls._SCREEN_CODE_TABLE_LOCK:
+            # Check again inside the lock in case another thread initialized it
+            if cls._SCREEN_CODE_TO_ASCII is not None:
+                return
+            
+            table = [' '] * 128
+            table[0] = '@'
+            for i in range(1, 27):  # 0x01-0x1A -> A-Z
+                table[i] = chr(ord('A') + i - 1)
+            for i in range(0x1B, 0x20):  # [\]^_
+                table[i] = chr(ord('[') + i - 0x1B)
+            table[0x20] = ' '
+            punct = '!"#$%&\'()*+,-./'
+            for i, ch in enumerate(punct):
+                table[0x21 + i] = ch
+            for i in range(0x30, 0x3A):  # 0-9
+                table[i] = chr(ord('0') + i - 0x30)
+            for i in range(0x3A, 0x41):  # : ; < = > ? @
+                table[i] = chr(i)
+            for i in range(0x41, 0x5B):  # A-Z
+                table[i] = chr(i)
+            for i in range(0x5B, 0x60):  # [\]^_
+                table[i] = chr(ord('[') + i - 0x5B)
+            for i in range(0x60, 0x7F):
+                table[i] = chr(i - 0x60) if i - 0x60 <= 0x1F else chr(i)
+            table[0x7F] = chr(0x7F)
+            cls._SCREEN_CODE_TO_ASCII = table
+
+    def _update_text_screen(self) -> bool:
+        """Update text screen from screen memory (thread-safe).
+        
+        Returns True if screen was updated, False if unchanged (dirty-check optimization).
+        Uses NumPy for fast operations when available, falls back to pure Python.
+        """
+        # Ensure lookup table is initialized
+        self._init_screen_code_table()
+        
         screen_base = SCREEN_MEM
         color_base = COLOR_MEM
+        
+        # Fast dirty-check using bytes comparison
+        current_screen_bytes = bytes(self.memory.ram[screen_base:screen_base + 1000])
+        current_color_bytes = bytes(self.memory.ram[color_base:color_base + 1000])
+        cursor_color = self.memory.ram[0x0286] & 0x0F
+        
+        # Fast comparison using bytes
+        if (current_screen_bytes == self._prev_screen_data and 
+            current_color_bytes == self._prev_color_data and
+            not self._screen_dirty):
+            return False  # Nothing changed, skip expensive update
+        
+        # Update cache
+        self._prev_screen_data = current_screen_bytes
+        self._prev_color_data = current_color_bytes
+        self._screen_dirty = False
 
-        # Debug: screen update
-        #if hasattr(self, 'interface') and self.interface:
-            #self.interface.add_debug_log("🎨 Updating text screen from memory")
-
-        # Use lock to ensure thread-safe access
+        lookup = self._SCREEN_CODE_TO_ASCII
+        
         with self.screen_lock:
-            for row in range(25):
-                for col in range(40):
-                    addr = screen_base + row * 40 + col
-                    char_code = self.memory.read(addr)
-                    color_code = self.memory.read(color_base + row * 40 + col) & 0x0F
-
-                    # Convert C64 screen codes to ASCII
-                    # C64 screen codes: PETSCII screen codes
-                    if char_code == 0x00:
-                        char = '@'
-                    elif 0x01 <= char_code <= 0x1A:
-                        char = chr(ord('A') + char_code - 1)
-                    elif 0x1B <= char_code <= 0x1F:
-                        char = chr(ord('[') + char_code - 0x1B)  # [\]^_
-                    elif char_code == 0x20:
-                        char = ' '
-                    elif 0x21 <= char_code <= 0x2F:
-                        # Punctuation: ! " # $ % & ' ( ) * + , - . /
-                        punct = '!\"#$%&\'()*+,-./'
-                        if char_code <= 0x20 + len(punct) - 1:
-                            char = punct[char_code - 0x21]
-                        else:
-                            char = chr(char_code)
-                    elif 0x30 <= char_code <= 0x39:
-                        char = chr(ord('0') + char_code - 0x30)
-                    elif 0x3A <= char_code <= 0x40:
-                        char = chr(char_code)  # : ; < = > ? @
-                    elif 0x41 <= char_code <= 0x5A:
-                        char = chr(char_code)  # A-Z
-                    elif 0x5B <= char_code <= 0x5F:
-                        char = chr(ord('[') + char_code - 0x5B)  # [\]^_
-                    elif char_code >= 0x60 and char_code <= 0x7E:
-                        char = chr(char_code - 0x60) if char_code - 0x60 <= 0x1F else chr(char_code)
-                    elif char_code == 0x7F:
-                        char = chr(0x7F)  # DEL
-                    else:
-                        char = ' '
-
-                    self.text_screen[row][col] = char
-                    self.text_colors[row][col] = color_code
+            if HAS_NUMPY:
+                # NumPy vectorized path
+                current_screen = np.frombuffer(current_screen_bytes, dtype=np.uint8)
+                current_color = np.frombuffer(current_color_bytes, dtype=np.uint8)
+                screen_2d = current_screen.reshape(25, 40)
+                color_2d = current_color.reshape(25, 40)
+                
+                self.text_reversed[:] = (screen_2d & 0x80) != 0
+                char_codes = screen_2d & 0x7F
+                self.text_colors[:] = color_2d & 0x0F
+                self.text_colors[self.text_reversed] = cursor_color
+                
+                for row in range(25):
+                    for col in range(40):
+                        self.text_screen[row, col] = lookup[char_codes[row, col]]
+            else:
+                # Pure Python fallback path
+                for row in range(25):
+                    for col in range(40):
+                        idx = row * 40 + col
+                        raw_code = current_screen_bytes[idx]
+                        color_code = current_color_bytes[idx] & 0x0F
+                        
+                        reversed_char = bool(raw_code & 0x80)
+                        char_code = raw_code & 0x7F
+                        
+                        self.text_reversed[row][col] = reversed_char
+                        self.text_colors[row][col] = cursor_color if reversed_char else color_code
+                        self.text_screen[row][col] = lookup[char_code]
+        
+        return True  # Screen was updated
 
     @classmethod
     def _c64_color_to_rich_rgb(cls, color_code: int) -> str:
@@ -821,9 +868,11 @@ class C64:
         return f"rgb({r},{g},{b})"
 
     def _render_text_screen_rich(self) -> Text:
-        """Render text screen as a Rich Text renderable with C64 colors."""
+        """Render text screen as a Rich Text renderable with C64 colors.
+        
+        Optimized to batch consecutive characters with same style.
+        """
         # VIC-II background color (applies to the whole screen in standard text mode)
-        # IMPORTANT: render should reflect VIC state, not CPU-visible banking.
         background_color = self.memory.peek_vic(0x21) & 0x0F
         bg_style = self._c64_color_to_rich_rgb(background_color)
         border_color = self.memory.peek_vic(0x20) & 0x0F
@@ -832,34 +881,56 @@ class C64:
 
         with self.screen_lock:
             screen_text = Text()
-            # Draw a simple 1-character border around the 40x25 screen.
-            # C64 border is a solid color region; we emulate it with spaces.
             full_cols = SCREEN_COLS + BORDER_WIDTH * 2
 
-            # Top border
-            for _ in range(BORDER_HEIGHT):
-                screen_text.append(" " * full_cols, style=border_cell_style)
-                screen_text.append("\n")
+            # Top border (single append per line)
+            top_border = (" " * full_cols + "\n") * BORDER_HEIGHT
+            if top_border:
+                screen_text.append(top_border, style=border_cell_style)
 
             for row in range(SCREEN_ROWS):
                 # Left border
                 screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
+                
+                # Batch consecutive characters with same style
+                batch_chars = []
+                batch_style = None
+                
                 for col in range(SCREEN_COLS):
                     char = self.text_screen[row][col]
                     fg = self.text_colors[row][col] & 0x0F
-                    fg_style = self._c64_color_to_rich_rgb(fg)
-                    screen_text.append(char, style=f"{fg_style} on {bg_style}")
+                    reversed_char = self.text_reversed[row][col]
+                    
+                    # Compute style for this character
+                    fg_rgb = self._c64_color_to_rich_rgb(fg)
+                    if reversed_char:
+                        cell_style = f"{bg_style} on {fg_rgb}"
+                    else:
+                        cell_style = f"{fg_rgb} on {bg_style}"
+                    
+                    # If style changed, flush batch
+                    if cell_style != batch_style:
+                        if batch_chars:
+                            screen_text.append("".join(batch_chars), style=batch_style)
+                        batch_chars = [char]
+                        batch_style = cell_style
+                    else:
+                        batch_chars.append(char)
+                
+                # Flush remaining batch
+                if batch_chars:
+                    screen_text.append("".join(batch_chars), style=batch_style)
+                
                 # Right border
                 screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
                 if row < (SCREEN_ROWS - 1):
                     screen_text.append("\n")
 
-            # Bottom border
+            # Bottom border (single append)
             screen_text.append("\n")
-            for i in range(BORDER_HEIGHT):
-                screen_text.append(" " * full_cols, style=border_cell_style)
-                if i < BORDER_HEIGHT - 1:
-                    screen_text.append("\n")
+            bottom_border = (" " * full_cols + "\n") * (BORDER_HEIGHT - 1) + " " * full_cols
+            if bottom_border:
+                screen_text.append(bottom_border, style=border_cell_style)
             return screen_text
 
     def render_text_screen(self, no_colors: bool = False) -> Union[str, Text]:
@@ -918,15 +989,12 @@ class C64:
         self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
         return True
 
-    def send_petscii(self, petscii_code: int) -> None:
-        """Send a PETSCII key to the emulator input path."""
-        if self.interface and hasattr(self.interface, "handle_petscii_input"):
-            self.interface.handle_petscii_input(petscii_code & 0xFF)
-            return
-        self._enqueue_keyboard_buffer(petscii_code & 0xFF)
+    def send_petscii(self, petscii_code: int) -> bool:
+        """Send a PETSCII key to the KERNAL keyboard queue."""
+        return self._enqueue_keyboard_buffer(petscii_code & 0xFF)
 
     def send_petscii_sequence(self, codes: List[int]) -> None:
-        """Send multiple PETSCII codes to the emulator input path."""
+        """Send multiple PETSCII codes to the KERNAL keyboard queue."""
         for code in codes:
             self.send_petscii(code)
 
@@ -1116,5 +1184,3 @@ class C64:
             self.cpu.state.sp = state['sp'] & 0xFF
         if 'p' in state:
             self.cpu.state.p = state['p'] & 0xFF
-
-

@@ -6,36 +6,63 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 from rich.console import Console
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Key
+from textual.reactive import reactive
+from textual.widget import Widget
 from textual.widgets import Static, Header, Footer, RichLog
 
 from .constants import (
+    BASIC_BOOT_CYCLES,
     BLNSW,
-    COLOR_MEM,
     BORDER_WIDTH,
     BORDER_HEIGHT,
     SCREEN_COLS,
     SCREEN_ROWS,
     CURSOR_COL_ADDR,
-    CURSOR_PTR_HIGH,
-    CURSOR_PTR_LOW,
     CURSOR_ROW_ADDR,
-    INPUT_BUFFER_BASE,
-    INPUT_BUFFER_INDEX_ADDR,
-    INPUT_BUFFER_LEN_ADDR,
-    KEYBOARD_BUFFER_BASE,
-    KEYBOARD_BUFFER_LEN_ADDR,
+    ROM_KERNAL_START,
+    ROM_KERNAL_END,
     SCREEN_MEM,
 )
 
 if TYPE_CHECKING:
     from .emulator import C64
+
+
+class C64Display(Widget):
+    """Reactive widget for C64 screen display.
+
+    Uses Textual's reactive pattern - when the reactive attribute
+    screen_version changes, render() is automatically called.
+    """
+
+    # Reactive attribute - changing this triggers automatic render()
+    screen_version = reactive(0)
+
+    def __init__(self, emulator: "C64", **kwargs):
+        super().__init__(**kwargs)
+        self.emulator = emulator
+        self._cached_content: Optional[Text] = None
+
+    def render(self) -> Text:
+        """Called automatically by Textual when screen_version changes."""
+        if self._cached_content is not None:
+            return self._cached_content
+        # Fallback - should not happen normally
+        return Text("Loading C64...")
+
+    def update_screen(self, content: Text) -> None:
+        """Update the screen content and trigger a reactive refresh."""
+        self._cached_content = content
+        # Increment version to trigger reactive refresh
+        self.screen_version += 1
+
 
 class TextualInterface(App):
     """Textual-based interface with TCSS styling"""
@@ -94,6 +121,7 @@ class TextualInterface(App):
         self.max_cycles = max_cycles
         self.max_logs = 1000
         self.current_cycle = 0
+        self.ui_refresh_iteration = 0
         self.emulator_thread = None
         self.running = False
         self.fullscreen = fullscreen
@@ -101,15 +129,13 @@ class TextualInterface(App):
         self.c64_display = None
         self.debug_logs = None
         self.status_bar = None
-        # Last committed input line (debug/inspection)
-        self.last_committed_line = ""
         # Cursor blink is machine-driven (IRQ-tied); UI just displays it.
         self.cursor_blink_on = True
 
     def compose(self) -> ComposeResult:
         if not self.fullscreen:
             yield Header()
-        yield RichLog(id="c64-display", auto_scroll=False)
+        yield C64Display(self.emulator, id="c64-display")
         if not self.fullscreen:
             yield RichLog(id="debug-panel", auto_scroll=True)
             yield Static("Initializing...", id="status-bar")
@@ -122,8 +148,7 @@ class TextualInterface(App):
             # In fullscreen mode, add the fullscreen class to the screen
             self.screen.add_class("fullscreen")
 
-        self.c64_display = self.query_one("#c64-display", RichLog)
-        self.c64_display.write("Loading C64...")
+        self.c64_display = self.query_one("#c64-display", C64Display)
 
         if not self.fullscreen:
             self.debug_logs = self.query_one("#debug-panel", RichLog)
@@ -140,14 +165,13 @@ class TextualInterface(App):
         self.emulator_thread = threading.Thread(target=self._run_emulator, daemon=True)
         self.emulator_thread.start()
 
-        # Update UI periodically
-        self.set_interval(0.1, self._update_ui)
+        # Update UI at 60Hz using Textual's native interval timer
+        # (call_from_thread doesn't guarantee 60Hz - Textual event loop throttles it)
+        self.set_interval(1/60, self._update_ui)
 
     def _run_emulator(self):
         """Run the emulator in background thread"""
         try:
-            # For Textual interface, run without the screen update worker
-            # since UI updates are handled by _update_ui
             self.emulator.running = True
             cycles = 0
             max_cycles = self.max_cycles
@@ -163,13 +187,15 @@ class TextualInterface(App):
                 # Load program if pending (after BASIC boot completes)
                 if self.emulator.prg_file_path and not hasattr(self.emulator, '_program_loaded_after_boot'):
                     # BASIC is ready - load the program now (after boot has completed)
-                    # Wait until we're past boot sequence (cycles > 2020000)
-                    if cycles > 2020000:
+                    # Wait until we're past boot sequence
+                    if cycles > BASIC_BOOT_CYCLES:
                         try:
                             self.emulator.load_prg(self.emulator.prg_file_path)
                             self.emulator.prg_file_path = None  # Clear path after loading
                             self.emulator._program_loaded_after_boot = True
                             self.add_debug_log("💾 Program loaded after BASIC boot completed")
+                            # Inject "RUN" command into keyboard buffer for autorun
+                            self.emulator._inject_run_command()
                         except Exception as e:
                             self.add_debug_log(f"❌ Failed to load program: {e}")
                             self.emulator.prg_file_path = None  # Clear path even on error
@@ -181,9 +207,11 @@ class TextualInterface(App):
                 # Stuck detection
                 pc = self.emulator.cpu.state.pc
                 if pc == last_pc:
+                    # When the KERNAL ROM is running, input waits can loop inside the ROM.
+                    if self.emulator.memory.kernal_rom and ROM_KERNAL_START <= pc < ROM_KERNAL_END:
+                        stuck_count = 0
                     # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
-                    # Don't count it as stuck
-                    if pc != 0xFFCF:
+                    elif pc != 0xFFCF:
                         stuck_count += 1
                         if stuck_count > 1000:
                             self.add_debug_log(f"⚠️ PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
@@ -209,77 +237,61 @@ class TextualInterface(App):
 
     def _update_ui(self):
         """Update the UI periodically"""
-        if self.emulator and not self.emulator.running:
-            # Emulator has stopped (e.g., due to autoquit), exit the app
-            self.add_debug_log("🛑 Emulator stopped, exiting...")
-            # Capture last lines of log before exiting
-            last_lines = self._get_last_log_lines(20)
-            self.exit()
-            # Print captured logs to console after UI shutdown
-            if last_lines:
-                print("\n=== Last log messages ===")
-                for line in last_lines:
-                    print(line)
-            return
 
         if self.emulator:
-            # Update text screen from memory
-            self.emulator._update_text_screen()
+            if not self.emulator.running:
+                # Emulator has stopped (e.g., due to autoquit), exit the app
+                self.add_debug_log("🛑 Emulator stopped, exiting...")
+                # Capture last lines of log before exiting
+                last_lines = self._get_last_log_lines(20)
+                self.exit()
+                # Print captured logs to console after UI shutdown
+                if last_lines:
+                    print("\n=== Last log messages ===")
+                    for line in last_lines:
+                        print(line)
+                return
 
-            # Update screen display
-            screen_content = self.emulator.render_text_screen(no_colors=False)
-            cursor_row = max(0, min(self.emulator.memory.read(CURSOR_ROW_ADDR), SCREEN_ROWS - 1))
-            cursor_col = max(0, min(self.emulator.memory.read(CURSOR_COL_ADDR), SCREEN_COLS - 1))
+            # Update text screen from memory (returns True if changed)
+            screen_changed = self.emulator._update_text_screen()
 
-            # Normalize render output once.
-            if isinstance(screen_content, Text):
-                screen_text = screen_content.copy()
-                screen_plain = screen_text.plain
-            else:
-                screen_plain = str(screen_content)
-                screen_text = Text(screen_plain)
+            # Only do expensive rendering if screen actually changed
+            if screen_changed:
+                # Update screen display
+                screen_content = self.emulator.render_text_screen(no_colors=False)
 
-            # Debug: Check if screen has any non-space content
-            non_space_count = sum(1 for c in screen_plain if c not in (' ', '\n'))
-            if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
-                # Sample first few characters from screen memory
-                sample_chars = []
-                for addr in range(SCREEN_MEM, SCREEN_MEM + 20):
-                    char_code = self.emulator.memory.read(addr)
-                    sample_chars.append(f"${char_code:02X}")
-                self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
-                self._screen_debug_logged = True
+                # Normalize render output once.
+                if isinstance(screen_content, Text):
+                    screen_text = screen_content.copy()
+                else:
+                    screen_text = Text(str(screen_content))
 
-            # Machine-controlled cursor blink (IRQ-tied emulation).
-            # Only show cursor when the ROM is actually waiting for keyboard input.
-            line_edit_mode = self._is_line_edit_mode()
-            # bit0 = enabled, bit7 = visible
-            self.cursor_blink_on = bool(self.emulator.memory.read(BLNSW) & 0x80)
+                # Debug: Screen content is available in `screen_text` for optional diagnostics.
 
-            if line_edit_mode and self.cursor_blink_on:
-                # Cursor position is relative to the 40x25 text area.
-                # Our renderer includes a thick border; map cursor into the rendered text.
-                full_cols = SCREEN_COLS + BORDER_WIDTH * 2  # must match emulator renderer
-                line_stride = full_cols + 1  # + newline
-                cursor_index = (BORDER_HEIGHT * line_stride) + (cursor_row * line_stride) + BORDER_WIDTH + cursor_col
-                if 0 <= cursor_index < len(screen_plain):
-                    screen_text.stylize("reverse", cursor_index, cursor_index + 1)
-            self.c64_display.clear()
-            self.c64_display.write(screen_text)
+                # Update display widget using reactive pattern
+                self.c64_display.update_screen(screen_text)
+
+            self.ui_refresh_iteration += 1
+
+            # Update UI extra components every 20 screen updates
+            if self.ui_refresh_iteration % 20 != 0:
+                return
 
             # Update status bar with actual cycle count from emulator (only in non-fullscreen mode)
             if not self.fullscreen:
                 emu = self.emulator
-                # Reuse cursor_row/cursor_col from earlier in this update cycle.
+                cursor_row = max(0, min(emu.memory.read(CURSOR_ROW_ADDR), SCREEN_ROWS - 1))
+                cursor_col = max(0, min(emu.memory.read(CURSOR_COL_ADDR), SCREEN_COLS - 1))
                 port01 = emu.memory.ram[0x01]
                 txt_color = emu.memory.read(0x0286) & 0x0F
                 bg = emu.memory.peek_vic(0x21) & 0x0F
                 border = emu.memory.peek_vic(0x20) & 0x0F
+                cli_count = getattr(emu.cpu, 'cli_count', 0)
                 status_text = (
                     f"🎮 C64 | Cycle: {emu.current_cycles:,} | PC: ${emu.cpu.state.pc:04X} | "
                     f"A: ${emu.cpu.state.a:02X} | X: ${emu.cpu.state.x:02X} | Y: ${emu.cpu.state.y:02X} | "
                     f"SP: ${emu.cpu.state.sp:02X} | Cursor: {cursor_row},{cursor_col} | "
-                    f"$01=${port01:02X} | BG:{bg} BORDER:{border} TXT:{txt_color}"
+                    f"CLI:{cli_count} | $01=${port01:02X}"
                 )
                 if self.status_bar:
                     self.status_bar.update(status_text)
@@ -416,306 +428,11 @@ class TextualInterface(App):
             # Default: return as-is (may need more mapping)
             return ascii_code & 0xFF
 
-    def _echo_character(self, petscii_code: int) -> None:
-        """Echo a character to the screen at current cursor position"""
+    def _queue_petscii(self, petscii_code: int) -> None:
         if not self.emulator:
             return
-
-        # Get cursor position from zero-page
-        cursor_low = self.emulator.memory.read(CURSOR_PTR_LOW)
-        cursor_high = self.emulator.memory.read(CURSOR_PTR_HIGH)
-        cursor_addr = cursor_low | (cursor_high << 8)
-
-        # If cursor is invalid, start at screen base
-        if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + 1000:
-            cursor_addr = SCREEN_MEM
-
-        # Handle special characters
-        if petscii_code == 0x0D:  # Carriage return
-            # Move to next line, scroll if at bottom
-            row = (cursor_addr - SCREEN_MEM) // 40
-            if row < 24:
-                # Just move to next row
-                cursor_addr = SCREEN_MEM + (row + 1) * 40
-            else:
-                # At bottom row, scroll screen up
-                self.emulator.memory._scroll_screen_up()
-                # Cursor stays at bottom row (24) after scroll
-                cursor_addr = SCREEN_MEM + 24 * 40
-        elif petscii_code == 0x0A:  # Line feed - ignore (C64 screen editor ignores it)
-            return  # Don't echo LF
-        elif petscii_code == 0x93:  # Clear screen
-            for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
-                self.emulator.memory.write(addr, 0x20)  # Space
-            # Clear color RAM to current text color as well
-            current_color = self.emulator.memory.read(0x0286) & 0x0F
-            for addr in range(COLOR_MEM, COLOR_MEM + 1000):
-                self.emulator.memory.write(addr, current_color)
-            cursor_addr = SCREEN_MEM
-        else:
-            # Write character to screen
-            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-                self.emulator.memory.write(cursor_addr, petscii_code)
-                # Also update color RAM so typed characters reflect the active BASIC color.
-                current_color = self.emulator.memory.read(0x0286) & 0x0F
-                self.emulator.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
-                cursor_addr += 1
-                # Handle wrapping/scrolling when reaching end of screen
-                if cursor_addr >= SCREEN_MEM + 1000:
-                    # At end of screen - scroll up and move to next line
-                    self.emulator.memory._scroll_screen_up()
-                    # Cursor moves to start of bottom row (row 24, column 0)
-                    cursor_addr = SCREEN_MEM + 24 * 40
-
-        # Update cursor position
-        self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
-        self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
-
-        # Also update row and column variables
-        row = (cursor_addr - SCREEN_MEM) // 40
-        col = (cursor_addr - SCREEN_MEM) % 40
-        self.emulator.memory.write(CURSOR_ROW_ADDR, row)  # Cursor row
-        self.emulator.memory.write(CURSOR_COL_ADDR, col)  # Cursor column
-
-        # Update the text screen representation for display
-        self.emulator._update_text_screen()
-
-    def _get_cursor_position(self) -> Tuple[int, int, int]:
-        """Return cursor row, column, and absolute address."""
-        if not self.emulator:
-            return 0, 0, SCREEN_MEM
-        return self.emulator.get_cursor_position()
-
-    def _set_cursor_position(self, row: int, col: int) -> None:
-        """Update cursor position in zero-page variables."""
-        if not self.emulator:
-            return
-
-        row = max(0, min(row, 24))
-        col = max(0, min(col, 39))
-        cursor_addr = SCREEN_MEM + row * 40 + col
-
-        self.emulator.memory.write(CURSOR_PTR_LOW, cursor_addr & 0xFF)
-        self.emulator.memory.write(CURSOR_PTR_HIGH, (cursor_addr >> 8) & 0xFF)
-        self.emulator.memory.write(CURSOR_ROW_ADDR, row)
-        self.emulator.memory.write(CURSOR_COL_ADDR, col)
-
-    def _move_cursor_left(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if col > 0:
-            col -= 1
-        elif row > 0:
-            row -= 1
-            col = 39
-        self._set_cursor_position(row, col)
-
-    def _move_cursor_right(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if col < 39:
-            col += 1
-        elif row < 24:
-            row += 1
-            col = 0
-        else:
-            # Wrap past bottom-right with scroll
-            self.emulator.memory._scroll_screen_up()
-            row = 24
-            col = 0
-        self._set_cursor_position(row, col)
-
-    def _move_cursor_up(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if row > 0:
-            row -= 1
-        self._set_cursor_position(row, col)
-
-    def _move_cursor_down(self) -> None:
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-        if row < 24:
-            row += 1
-        else:
-            # Scroll when moving down at bottom row
-            self.emulator.memory._scroll_screen_up()
-            row = 24
-        self._set_cursor_position(row, col)
-
-    def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
-        if not self.emulator:
-            return False
-        # Delegate to emulator to keep buffer logic centralized.
-        return self.emulator._enqueue_keyboard_buffer(petscii_code)
-
-    def _remove_last_keyboard_buffer_char(self) -> bool:
-        if not self.emulator:
-            return False
-
-        kb_buf_base = KEYBOARD_BUFFER_BASE
-        kb_buf_len = self.emulator.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
-        if kb_buf_len <= 0:
-            return False
-
-        kb_buf_len -= 1
-        self.emulator.memory.write(kb_buf_base + kb_buf_len, 0)
-        self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
-        return True
-
-    def _clear_keyboard_buffer(self) -> None:
-        if not self.emulator:
-            return
-
-        kb_buf_base = KEYBOARD_BUFFER_BASE
-        self.emulator.memory.write(KEYBOARD_BUFFER_LEN_ADDR, 0)
-        for i in range(10):
-            self.emulator.memory.write(kb_buf_base + i, 0)
-
-    def _is_line_edit_mode(self) -> bool:
-        if not self.emulator:
-            return False
-
-        try:
-            # Heuristic: CHRIN is used for keyboard input; this does not
-            # fully represent the C64 screen editor state.
-            return self.emulator.cpu.state.pc == 0xFFCF
-        except Exception:
-            return False
-
-    def _read_screen_line_codes(self, row: int) -> List[int]:
-        if not self.emulator:
-            return []
-        return self.emulator.read_screen_line_codes(row)
-
-    def _extract_current_line_codes(self) -> List[int]:
-        row, _, _ = self._get_cursor_position()
-        line_codes = self._read_screen_line_codes(row)
-        last_non_space = -1
-        for i in range(39, -1, -1):
-            if line_codes[i] != 0x20:
-                last_non_space = i
-                break
-        if last_non_space == -1:
-            return []
-        return line_codes[:last_non_space + 1]
-
-    def _codes_to_ascii(self, codes: List[int]) -> str:
-        chars = []
-        for code in codes:
-            if 0x20 <= code <= 0x7E:
-                chars.append(chr(code))
-            else:
-                chars.append(".")
-        return "".join(chars)
-
-    def _commit_current_line(self) -> None:
-        if not self.emulator:
-            return
-
-        line_codes = self._extract_current_line_codes()
-        max_line_len = 88  # 89 bytes total including CR
-        if len(line_codes) > max_line_len:
-            line_codes = line_codes[:max_line_len]
-        line_codes.append(0x0D)
-
-        for i in range(89):
-            value = line_codes[i] if i < len(line_codes) else 0
-            self.emulator.memory.write(INPUT_BUFFER_BASE + i, value)
-
-        self.emulator.memory.write(INPUT_BUFFER_INDEX_ADDR, 0)  # Input buffer read index
-        self.emulator.memory.write(INPUT_BUFFER_LEN_ADDR, len(line_codes))  # Input buffer length
-        self._clear_keyboard_buffer()
-
-        self.last_committed_line = self._codes_to_ascii(line_codes[:-1])
-        self.add_debug_log(f"⌨️  Committed line: '{self.last_committed_line}' (len={len(line_codes)})")
-
-    def _process_petscii_code(self, petscii_code: int, line_edit_mode: Optional[bool] = None) -> None:
-        if not self.emulator:
-            return
-
-        if line_edit_mode is None:
-            line_edit_mode = self._is_line_edit_mode()
-
-        # Don't accept input while the machine is running something (not waiting in CHRIN).
-        if not line_edit_mode:
-            return
-
-        # Cursor control codes
-        if petscii_code == 0x9D:  # Cursor left
-            self._move_cursor_left()
-            return
-        if petscii_code == 0x1D:  # Cursor right
-            self._move_cursor_right()
-            return
-        if petscii_code == 0x91:  # Cursor up
-            self._move_cursor_up()
-            return
-        if petscii_code == 0x11:  # Cursor down
-            self._move_cursor_down()
-            return
-
-        if petscii_code == 0x14:  # Backspace/Delete
-            self._handle_backspace()
-            return
-
-        if petscii_code == 0x0D:  # Enter / CR
-            self._commit_current_line()
-            # IMPORTANT: Do NOT locally echo CR here.
-            # The edited line already exists on screen (we echoed keystrokes),
-            # and the ROM/BASIC side will advance the line / print the next prompt.
-            # Echoing it here results in a double line break and can confuse
-            # the internal editor state.
-            return
-
-        if petscii_code == 0x93:  # Clear screen
-            self._echo_character(0x93)
-            return
-
-        # Printable characters
-        if 0x20 <= petscii_code <= 0xFF:
-            # While waiting for input, we use local echo as a stand-in for the
-            # full ROM screen editor/keyboard scanning path.
-            self._echo_character(petscii_code)
-            return
-
-    def _handle_backspace(self) -> None:
-        """Handle backspace - erase character at cursor and move cursor back"""
-        if not self.emulator:
-            return
-
-        row, col, _ = self._get_cursor_position()
-
-        # Don't backspace if we're at the start of screen
-        if row == 0 and col == 0:
-            return
-
-        if col > 0:
-            col -= 1
-        else:
-            row -= 1
-            col = 39
-
-        self._set_cursor_position(row, col)
-        cursor_addr = SCREEN_MEM + row * 40 + col
-
-        # Erase character at cursor position (write space)
-        if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-            self.emulator.memory.write(cursor_addr, 0x20)  # Space
-            # Erase the color too (set to current text color for consistency)
-            current_color = self.emulator.memory.read(0x0286) & 0x0F
-            self.emulator.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
-
-        # Update the text screen representation for display
-        self.emulator._update_text_screen()
+        if not self.emulator.send_petscii(petscii_code & 0xFF):
+            self.add_debug_log("Keyboard buffer full, ignoring key")
 
     def on_key(self, event: Key) -> None:
         """Handle keyboard input and send to C64 keyboard buffer"""
@@ -739,35 +456,30 @@ class TextualInterface(App):
         if not self.emulator or not self.emulator.running:
             return
 
-        # Only accept keys when the ROM is actually waiting for keyboard input.
-        # This prevents local echo/cursor movement while programs are running.
-        if not self._is_line_edit_mode():
-            return
-
         if event.key == "left":
-            self._move_cursor_left()
+            self._queue_petscii(0x9D)
             event.prevent_default()
             return
         if event.key == "right":
-            self._move_cursor_right()
+            self._queue_petscii(0x1D)
             event.prevent_default()
             return
         if event.key == "up":
-            self._move_cursor_up()
+            self._queue_petscii(0x91)
             event.prevent_default()
             return
         if event.key == "down":
-            self._move_cursor_down()
+            self._queue_petscii(0x11)
             event.prevent_default()
             return
 
         if event.key == "backspace":
-            self._process_petscii_code(0x14)
+            self._queue_petscii(0x14)
             event.prevent_default()
             return
 
         if event.key == "enter":
-            self._process_petscii_code(0x0D)
+            self._queue_petscii(0x0D)
             event.prevent_default()
             return
 
@@ -775,11 +487,5 @@ class TextualInterface(App):
         if event.is_printable and event.character:
             char = event.character
             petscii_code = self._ascii_to_petscii(char)
-            self._process_petscii_code(petscii_code)
+            self._queue_petscii(petscii_code)
             event.prevent_default()
-
-    def handle_petscii_input(self, petscii_code: int) -> None:
-        """Handle a PETSCII code injected programmatically."""
-        self._process_petscii_code(petscii_code)
-
-
