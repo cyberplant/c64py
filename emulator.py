@@ -106,6 +106,7 @@ class C64:
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
         self._prev_color_data = b''
+        self._screen_dirty = False  # Flag for manual screen updates
         self._screen_dirty = True  # Force initial render
 
         # Backward compatibility
@@ -555,6 +556,52 @@ class C64:
         """
         return self.drives.get(device)
 
+    def _print_to_screen(self, message: str) -> None:
+        """Print a message to the C64 screen at current cursor position.
+        
+        Args:
+            message: Message to print (will be converted to PETSCII)
+        """
+        # Get cursor position
+        cursor_row = self.memory.read(CURSOR_ROW_ADDR)
+        cursor_col = self.memory.read(CURSOR_COL_ADDR)
+        
+        # Print each character
+        for ch in message:
+            if cursor_col >= 40:
+                # Move to next line
+                cursor_row = (cursor_row + 1) % 25
+                cursor_col = 0
+                self.memory.write(CURSOR_ROW_ADDR, cursor_row)
+                self.memory.write(CURSOR_COL_ADDR, cursor_col)
+            
+            # Convert to screen code and write
+            if ch == '\n':
+                cursor_row = (cursor_row + 1) % 25
+                cursor_col = 0
+            else:
+                addr = SCREEN_MEM + cursor_row * 40 + cursor_col
+                # Simple ASCII to screen code conversion
+                if 'A' <= ch <= 'Z':
+                    screen_code = ord(ch) - ord('A') + 1
+                elif 'a' <= ch <= 'z':
+                    screen_code = ord(ch) - ord('a') + 1
+                elif '0' <= ch <= '9':
+                    screen_code = ord(ch)
+                elif ch == ' ':
+                    screen_code = 0x20
+                else:
+                    screen_code = ord(ch)
+                
+                self.memory.write(addr, screen_code)
+                cursor_col += 1
+            
+            self.memory.write(CURSOR_ROW_ADDR, cursor_row)
+            self.memory.write(CURSOR_COL_ADDR, cursor_col)
+        
+        # Mark screen as dirty for update
+        self._screen_dirty = True
+
     def _handle_kernal_load(self) -> bool:
         """Handle KERNAL LOAD operation for virtual disk drives.
         
@@ -584,7 +631,16 @@ class C64:
         # Check if we have a drive attached for this device
         drive = self.get_drive(device)
         if not drive or not drive.has_disk():
-            return False
+            # No disk attached - show "DEVICE NOT PRESENT" error
+            if self.interface:
+                self.interface.add_debug_log(f"❌ No disk in drive {device}")
+            # Set error status
+            self.memory.write(0x90, 0x80)  # Status byte: device not present
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+            # Return from JSR
+            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            return True
         
         # Get LOAD parameters
         verify = self.cpu.state.a != 0  # A=0 for LOAD, A=1 for VERIFY
@@ -598,6 +654,9 @@ class C64:
             filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
         filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
         
+        # Show "SEARCHING FOR filename" message
+        self._print_to_screen(f"\nSEARCHING FOR {filename}\n")
+        
         if self.interface:
             self.interface.add_debug_log(f"🔧 KERNAL LOAD intercepted: device={device}, file='{filename}', verify={verify}")
         
@@ -607,6 +666,8 @@ class C64:
         if file_data is None:
             if self.interface:
                 self.interface.add_debug_log(f"❌ File not found: '{filename}'")
+            # Show "FILE NOT FOUND" error
+            self._print_to_screen("FILE NOT FOUND ERROR\n")
             # Set error: FILE NOT FOUND
             self.memory.write(0x90, 0x40)  # Status byte: error
             # Set carry flag to indicate error
@@ -614,6 +675,9 @@ class C64:
             # Return from JSR (pop return address and continue)
             self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
             return True
+        
+        # Show "LOADING" message
+        self._print_to_screen("LOADING\n")
         
         # Get load address
         if secondary_addr == 0:
@@ -671,6 +735,93 @@ class C64:
         ret_addr = ret_addr_low | (ret_addr_high << 8)
         # JSR pushes PC+2 (where PC points to last byte of JSR instruction)
         # RTS adds 1 to get to next instruction
+        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
+        self.cpu.state.sp = (sp + 2) & 0xFF
+        
+        return True
+
+    def _handle_kernal_save(self) -> bool:
+        """Handle KERNAL SAVE operation for virtual disk drives.
+        
+        This intercepts SAVE calls when PC is at $FFD8 and device is 8-11.
+        Returns True if SAVE was handled, False otherwise.
+        
+        KERNAL SAVE calling convention:
+        - A: Zero page pointer to start address (low byte)
+        - X: Start address low byte  
+        - Y: Start address high byte
+        - $B7: Filename length
+        - $BB-$BC: Filename pointer
+        - $BA: Device number
+        - $AE-$AF: End address + 1
+        """
+        # Check if we're at the SAVE entry point
+        if self.cpu.state.pc != 0xFFD8:
+            return False
+        
+        # Get device number from zero page
+        device = self.memory.read(0xBA)
+        
+        # Only handle disk devices (8-11)
+        if device < 8 or device > 11:
+            return False
+        
+        # Check if we have a drive attached for this device
+        drive = self.get_drive(device)
+        if not drive or not drive.has_disk():
+            # No disk attached - show error
+            if self.interface:
+                self.interface.add_debug_log(f"❌ No disk in drive {device}")
+            self._print_to_screen("\nDEVICE NOT PRESENT ERROR\n")
+            # Set error status
+            self.memory.write(0x90, 0x80)
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+            # Return from JSR
+            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            return True
+        
+        # Get SAVE parameters
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        
+        # Read filename from memory
+        filename_bytes = []
+        for i in range(filename_len):
+            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
+        
+        # Get start and end addresses
+        start_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+        end_addr = self.memory.read(0xAE) | (self.memory.read(0xAF) << 8)
+        
+        # Show "SAVING filename" message
+        self._print_to_screen(f"\nSAVING {filename}\n")
+        
+        if self.interface:
+            self.interface.add_debug_log(
+                f"🔧 KERNAL SAVE intercepted: device={device}, file='{filename}', "
+                f"${start_addr:04X}-${end_addr:04X}"
+            )
+        
+        # For now, we just pretend to save (read-only D64 support)
+        # Show a warning that save is not actually persisted
+        self._print_to_screen("(SAVE NOT PERSISTED)\n")
+        
+        if self.interface:
+            self.interface.add_debug_log("⚠️ SAVE operation simulated (D64 write not implemented)")
+        
+        # Clear carry flag to indicate "success"
+        self.cpu.state.p &= ~0x01
+        
+        # Clear status byte
+        self.memory.write(0x90, 0x00)
+        
+        # Return from JSR
+        sp = self.cpu.state.sp
+        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
+        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
+        ret_addr = ret_addr_low | (ret_addr_high << 8)
         self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
         self.cpu.state.sp = (sp + 2) & 0xFF
         
@@ -763,6 +914,11 @@ class C64:
             # Check for KERNAL LOAD hook (before executing instruction)
             if self._handle_kernal_load():
                 # LOAD was handled, skip this CPU instruction
+                continue
+
+            # Check for KERNAL SAVE hook (before executing instruction)
+            if self._handle_kernal_save():
+                # SAVE was handled, skip this CPU instruction
                 continue
 
             step_cycles = self.cpu.step(self.udp_debug, cycles)

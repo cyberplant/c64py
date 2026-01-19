@@ -55,7 +55,7 @@ class DiskDrive:
         """Load a file from the attached disk.
         
         Args:
-            filename: File to load (use "$" for directory)
+            filename: File to load (use "$" for directory, "*" for first program)
             secondary_address: Secondary address (0 for load, 1 for verify)
             
         Returns:
@@ -67,6 +67,17 @@ class DiskDrive:
         # Special case: "$" loads directory
         if filename == "$":
             return self._load_directory()
+        
+        # Special case: "*" loads first program file
+        if filename == "*":
+            entries = self.disk.read_directory()
+            # Find first PRG file
+            for entry in entries:
+                if entry.filetype == 2:  # PRG
+                    file_data = self.disk.read_file(entry)
+                    return file_data
+            # No PRG files found
+            return None
         
         # Find file in directory
         entries = self.disk.read_directory()

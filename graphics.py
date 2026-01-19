@@ -248,6 +248,11 @@ class PygameInterface:
                     # LOAD was handled, skip this CPU instruction
                     continue
 
+                # Check for KERNAL SAVE hook (before executing instruction)
+                if self.emulator._handle_kernal_save():
+                    # SAVE was handled, skip this CPU instruction
+                    continue
+
                 step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles)
                 cycles += step_cycles
                 self.emulator.current_cycles = cycles
