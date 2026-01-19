@@ -101,7 +101,6 @@ class C64:
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
         self._prev_color_data = b''
-        self._cached_screen_text = None  # Cached Rich Text output
         self._screen_dirty = True  # Force initial render
 
         # Backward compatibility
@@ -814,7 +813,6 @@ class C64:
         self._prev_screen_data = current_screen_bytes
         self._prev_color_data = current_color_bytes
         self._screen_dirty = False
-        self._cached_screen_text = None
 
         lookup = self._SCREEN_CODE_TO_ASCII
         

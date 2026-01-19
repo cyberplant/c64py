@@ -101,7 +101,7 @@ def main():
                 args.prg_file = benchmark_prg
             else:
                 print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
-                print("Run: src/compile.sh to build it")
+                print("Run: compile.sh to build it")
     
     # Track start time for speed calculation
     start_time = time.perf_counter()

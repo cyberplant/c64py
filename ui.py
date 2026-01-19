@@ -67,8 +67,6 @@ class C64Display(Widget):
 class TextualInterface(App):
     """Textual-based interface with TCSS styling"""
 
-    count = 0
-
     BINDINGS = [
         ("ctrl+x", "quit", "Quit the emulator"),
         ("ctrl+r", "random_screen", "Fill screen with random characters"),
@@ -123,6 +121,7 @@ class TextualInterface(App):
         self.max_cycles = max_cycles
         self.max_logs = 1000
         self.current_cycle = 0
+        self.ui_refresh_iteration = 0
         self.emulator_thread = None
         self.running = False
         self.fullscreen = fullscreen
@@ -238,8 +237,6 @@ class TextualInterface(App):
 
     def _update_ui(self):
         """Update the UI periodically"""
-        import time
-        t_start = time.perf_counter()
 
         if self.emulator:
             if not self.emulator.running:
@@ -255,27 +252,13 @@ class TextualInterface(App):
                         print(line)
                 return
 
-            # Initialize timing accumulators
-            if not hasattr(self, '_timing_dirty'):
-                self._timing_dirty = 0.0
-                self._timing_render = 0.0
-                self._timing_widget = 0.0
-                self._timing_total = 0.0
-                self._timing_renders = 0
-
             # Update text screen from memory (returns True if changed)
-            t1 = time.perf_counter()
             screen_changed = self.emulator._update_text_screen()
-            t2 = time.perf_counter()
-            self._timing_dirty += (t2 - t1)
 
             # Only do expensive rendering if screen actually changed
             if screen_changed:
-                self._timing_renders += 1
                 # Update screen display
                 screen_content = self.emulator.render_text_screen(no_colors=False)
-                t3 = time.perf_counter()
-                self._timing_render += (t3 - t2)
 
                 # Normalize render output once.
                 if isinstance(screen_content, Text):
@@ -283,37 +266,16 @@ class TextualInterface(App):
                 else:
                     screen_text = Text(str(screen_content))
 
-                # Debug: Check if screen has any non-space content (once)
-#                non_space_count = sum(1 for row in self.emulator.text_screen for char in row if char != ' ')
-#                if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
-#                    sample_chars = []
-#                    for addr in range(SCREEN_MEM, SCREEN_MEM + 20):
-#                        char_code = self.emulator.memory.read(addr)
-#                        sample_chars.append(f"${char_code:02X}")
-#                    self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
-#                    self._screen_debug_logged = True
+                # Debug: Screen content is available in `screen_text` for optional diagnostics.
 
                 # Update display widget using reactive pattern
-                t4 = time.perf_counter()
                 self.c64_display.update_screen(screen_text)
-                t5 = time.perf_counter()
-                self._timing_widget += (t5 - t4)
 
-            self.count += 1
-            t_end = time.perf_counter()
-            self._timing_total += (t_end - t_start)
+            self.ui_refresh_iteration += 1
 
-            # Log timing every 20 updates
-            if self.count % 20 != 0:
+            # Update UI extra components every 20 screen updates
+            if self.ui_refresh_iteration % 20 != 0:
                 return
-
-            # Reset accumulators
-            self._timing_dirty = 0.0
-            self._timing_render = 0.0
-            self._timing_widget = 0.0
-            self._timing_total = 0.0
-            self._timing_renders = 0
-
 
             # Update status bar with actual cycle count from emulator (only in non-fullscreen mode)
             if not self.fullscreen:
