@@ -82,8 +82,26 @@ def main():
     ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
     ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
+    ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
+    ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
 
     args = ap.parse_args()
+    
+    # --benchmark implies other flags and loads benchmark PRG
+    if args.benchmark:
+        args.turbo = True
+        args.autoquit = True
+        args.no_colors = True
+        if args.max_cycles is None:
+            args.max_cycles = 15_000_000  # Enough cycles for benchmark to complete
+        # Auto-load benchmark PRG if no file specified
+        if args.prg_file is None:
+            benchmark_prg = os.path.join(script_dir, "programs", "benchmark.prg")
+            if os.path.exists(benchmark_prg):
+                args.prg_file = benchmark_prg
+            else:
+                print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
+                print("Run: src/compile.sh to build it")
     
     # Track start time for speed calculation
     start_time = time.perf_counter()
@@ -105,6 +123,7 @@ def main():
     emu = C64(interface_factory=interface_factory)
     emu.debug = args.debug
     emu.autoquit = args.autoquit
+    emu.turbo = args.turbo
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
     if args.debug:
