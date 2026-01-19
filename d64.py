@@ -48,7 +48,8 @@ class D64Image:
         Args:
             data: Raw D64 disk image data
         """
-        self.data = data
+        # Use bytearray for mutable data
+        self.data = bytearray(data)
         # Validate size (should be 174848 bytes for standard 35-track D64)
         if len(data) not in (D64_SIZE_STANDARD, D64_SIZE_WITH_ERRORS):
             raise ValueError(
@@ -275,6 +276,33 @@ class D64Image:
         lines.append(f"{blocks_free} BLOCKS FREE.")
         
         return '\n'.join(lines)
+    
+    def write_file(self, filename: str, file_data: bytes) -> bool:
+        """Write a file to the D64 disk image.
+        
+        This is a simplified implementation that saves files to a companion
+        directory rather than modifying the D64 image itself (which would require
+        complex BAM management and sector allocation).
+        
+        Args:
+            filename: Filename (will be padded/truncated to 16 chars)
+            file_data: File data (including load address for PRG files)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        # For now, return False to indicate write not supported in D64
+        # The drive layer can handle this by saving to filesystem
+        return False
+    
+    def save_to_file(self, filename: str) -> None:
+        """Save the D64 image to a file.
+        
+        Args:
+            filename: Path to save the D64 file
+        """
+        with open(filename, 'wb') as f:
+            f.write(self.data)
 
 
 def load_d64(filename: str) -> D64Image:

@@ -101,6 +101,45 @@ class DiskDrive:
         
         return None
     
+    def save_file(self, filename: str, file_data: bytes) -> bool:
+        """Save a file from the C64.
+        
+        Since modifying D64 images requires complex BAM and sector management,
+        we save files to the filesystem alongside the D64 image.
+        
+        Args:
+            filename: File to save
+            file_data: File data including load address (first 2 bytes for PRG)
+            
+        Returns:
+            True if save succeeded, False otherwise
+        """
+        if not self.has_disk():
+            return False
+        
+        # Clean up filename for saving
+        clean_filename = filename.strip().upper().strip('"')
+        
+        # Save to filesystem alongside the D64
+        if self.disk_filename:
+            import os
+            # Get directory of D64 file
+            d64_dir = os.path.dirname(self.disk_filename)
+            if not d64_dir:
+                d64_dir = "."
+            
+            # Save as .prg file
+            prg_filename = os.path.join(d64_dir, clean_filename + ".prg")
+            
+            try:
+                with open(prg_filename, 'wb') as f:
+                    f.write(file_data)
+                return True
+            except Exception:
+                return False
+        
+        return False
+    
     def _load_directory(self) -> bytes:
         """Load directory as a PRG file (as C64 does).
         
