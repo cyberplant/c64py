@@ -750,34 +750,42 @@ class C64:
 
     # Precomputed screen code to ASCII lookup table (0-127)
     _SCREEN_CODE_TO_ASCII = None
+    _SCREEN_CODE_TABLE_LOCK = threading.Lock()
     
     @classmethod
     def _init_screen_code_table(cls):
-        """Initialize the screen code to ASCII lookup table."""
+        """Initialize the screen code to ASCII lookup table (thread-safe)."""
+        # Double-checked locking pattern for thread-safe lazy initialization
         if cls._SCREEN_CODE_TO_ASCII is not None:
             return
-        table = [' '] * 128
-        table[0] = '@'
-        for i in range(1, 27):  # 0x01-0x1A -> A-Z
-            table[i] = chr(ord('A') + i - 1)
-        for i in range(0x1B, 0x20):  # [\]^_
-            table[i] = chr(ord('[') + i - 0x1B)
-        table[0x20] = ' '
-        punct = '!"#$%&\'()*+,-./'
-        for i, ch in enumerate(punct):
-            table[0x21 + i] = ch
-        for i in range(0x30, 0x3A):  # 0-9
-            table[i] = chr(ord('0') + i - 0x30)
-        for i in range(0x3A, 0x41):  # : ; < = > ? @
-            table[i] = chr(i)
-        for i in range(0x41, 0x5B):  # A-Z
-            table[i] = chr(i)
-        for i in range(0x5B, 0x60):  # [\]^_
-            table[i] = chr(ord('[') + i - 0x5B)
-        for i in range(0x60, 0x7F):
-            table[i] = chr(i - 0x60) if i - 0x60 <= 0x1F else chr(i)
-        table[0x7F] = chr(0x7F)
-        cls._SCREEN_CODE_TO_ASCII = table
+        
+        with cls._SCREEN_CODE_TABLE_LOCK:
+            # Check again inside the lock in case another thread initialized it
+            if cls._SCREEN_CODE_TO_ASCII is not None:
+                return
+            
+            table = [' '] * 128
+            table[0] = '@'
+            for i in range(1, 27):  # 0x01-0x1A -> A-Z
+                table[i] = chr(ord('A') + i - 1)
+            for i in range(0x1B, 0x20):  # [\]^_
+                table[i] = chr(ord('[') + i - 0x1B)
+            table[0x20] = ' '
+            punct = '!"#$%&\'()*+,-./'
+            for i, ch in enumerate(punct):
+                table[0x21 + i] = ch
+            for i in range(0x30, 0x3A):  # 0-9
+                table[i] = chr(ord('0') + i - 0x30)
+            for i in range(0x3A, 0x41):  # : ; < = > ? @
+                table[i] = chr(i)
+            for i in range(0x41, 0x5B):  # A-Z
+                table[i] = chr(i)
+            for i in range(0x5B, 0x60):  # [\]^_
+                table[i] = chr(ord('[') + i - 0x5B)
+            for i in range(0x60, 0x7F):
+                table[i] = chr(i - 0x60) if i - 0x60 <= 0x1F else chr(i)
+            table[0x7F] = chr(0x7F)
+            cls._SCREEN_CODE_TO_ASCII = table
 
     def _update_text_screen(self) -> bool:
         """Update text screen from screen memory (thread-safe).
