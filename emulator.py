@@ -107,6 +107,17 @@ class C64:
         # Backward compatibility
         self.rich_interface = self.interface
 
+        if enable_sid:
+            try:
+                from .sid import SidEmulator
+                self.sid = SidEmulator(video_standard=self.memory.video_standard)
+                self.memory.sid = self.sid
+                if self.interface:
+                    self.interface.add_debug_log("🔊 SID audio enabled")
+            except Exception as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ SID audio unavailable: {exc}")
+
     def load_roms(self, rom_dir: str, *, require_char_rom: bool = True) -> None:
         """Load C64 ROM files
 
