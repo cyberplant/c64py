@@ -15,4 +15,6 @@ COPY . .
 RUN pip install -e .
 
 # Default command: run emulator (speed shown by default)
-CMD ["python", "C64.py", "--max-cycles", "5000000", "--autoquit", "--no-colors"]
+CMD ["--benchmark"]
+
+ENTRYPOINT ["python", "C64.py"]

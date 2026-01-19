@@ -22,4 +22,6 @@ COPY . .
 RUN pip install -e .
 
 # Default command: run emulator (speed shown by default)
-CMD ["pypy3", "C64.py", "--max-cycles", "5000000", "--autoquit", "--no-colors"]
+CMD ["--benchmark"]
+
+ENTRYPOINT ["pypy3", "C64.py"]

@@ -7,11 +7,9 @@ services:
       dockerfile: Dockerfile.cpython
     volumes:
       - type: bind
-        source: ${ROM_DIR:-.}
-        target: /roms
+        source: ./roms
+        target: /usr/share/c64py/roms
         read_only: true
-    environment:
-      - ROM_DIR=/roms
 
   pypy:
     build:
@@ -19,8 +17,6 @@ services:
       dockerfile: Dockerfile.pypy
     volumes:
       - type: bind
-        source: ${ROM_DIR:-.}
-        target: /roms
+        source: ./roms
+        target: /usr/share/c64py/roms
         read_only: true
-    environment:
-      - ROM_DIR=/roms
