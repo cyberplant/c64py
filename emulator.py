@@ -450,24 +450,15 @@ class C64:
         run_command = b"RUN"  # RUN command (without CR - CR goes to keyboard buffer)
         
         # Method 1: Put in keyboard buffer (raw keypresses)
-        kb_buf_base = 0x0277  # Keyboard buffer start
         # Clear buffer first
         for i in range(10):
-            self.memory.write(kb_buf_base + i, 0)
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, 0)
         # Write "RUN" + RETURN
         full_command = b"RUN\x0D"
         for i, char in enumerate(full_command):
-            if i < 10:  # Buffer is only 10 bytes
-                self.memory.write(kb_buf_base + i, char)
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, char)
         # Set buffer length
-        self.memory.write(0xC6, len(full_command))
-        
-        # Method 2: Also put in BASIC input buffer at $0200 (screen editor output)
-        input_buf_base = 0x0200
-        for i, char in enumerate(run_command):
-            self.memory.write(input_buf_base + i, char)
-        # Set input buffer length ($D3 is cursor column, but $0D is CRSW - quote mode flag)
-        # Actually, BASIC uses TXTPTR and other variables - let's just rely on keyboard buffer
+        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, len(full_command))
         
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
