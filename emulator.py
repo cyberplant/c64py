@@ -496,8 +496,8 @@ class C64:
             self.memory.write(KEYBOARD_BUFFER_BASE + i, 0)
 
         # Write 'LOAD"$",8' + RETURN
-        # PETSCII: L O A D " $ " , 8 RETURN
-        command = f'LOAD"$",{device}\x0D'
+        # PETSCII: L O A D " $ " , 8 RETURN (RETURN = 0x0D)
+        command = f'LOAD"$",{device}\r'  # \r is carriage return (0x0D)
         command_bytes = command.encode('ascii')
         
         for i, char in enumerate(command_bytes):

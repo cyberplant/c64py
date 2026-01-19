@@ -13,7 +13,7 @@ import sys
 import os
 
 # Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/../c64py')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'c64py'))
 
 from c64py.d64 import load_d64
 from c64py.drive import DiskDrive
@@ -26,7 +26,8 @@ def test_d64_parsing():
     print("TEST 1: D64 Parsing")
     print("=" * 60)
     
-    d64_path = "/tmp/test-disk.d64"
+    import tempfile
+    d64_path = os.path.join(tempfile.gettempdir(), "test-disk.d64")
     if not os.path.exists(d64_path):
         print(f"❌ Test D64 not found at {d64_path}")
         print("   Run the create_test_d64.py script first")
@@ -54,7 +55,8 @@ def test_disk_drive():
     print("TEST 2: Disk Drive")
     print("=" * 60)
     
-    d64_path = "/tmp/test-disk.d64"
+    import tempfile
+    d64_path = os.path.join(tempfile.gettempdir(), "test-disk.d64")
     d64 = load_d64(d64_path)
     
     drive = DiskDrive(device_number=8)
@@ -87,7 +89,8 @@ def test_emulator_integration():
     print("✅ Created emulator")
     
     # Attach disk
-    d64_path = "/tmp/test-disk.d64"
+    import tempfile
+    d64_path = os.path.join(tempfile.gettempdir(), "test-disk.d64")
     emu.attach_disk(d64_path, device=8)
     print(f"✅ Attached disk to drive 8")
     
@@ -126,7 +129,9 @@ def test_server_commands():
     print("✅ Created server")
     
     # Test ATTACH-DISK command
-    response = server._handle_command("ATTACH-DISK /tmp/test-disk.d64 8")
+    import tempfile
+    d64_path = os.path.join(tempfile.gettempdir(), "test-disk.d64")
+    response = server._handle_command(f"ATTACH-DISK {d64_path} 8")
     print(f"✅ ATTACH-DISK response: {response}")
     
     if 8 not in emu.drives:

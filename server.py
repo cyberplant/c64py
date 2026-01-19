@@ -216,8 +216,8 @@ HELP/?              - Show this help message"""
                     return f"ERROR: Invalid device number {device} (must be 8-11)"
                 self.emu.attach_disk(disk_path, device)
                 return f"OK: Disk attached to drive {device}"
-            except ValueError as e:
-                return f"ERROR: Invalid device number"
+            except (ValueError, IndexError) as e:
+                return f"ERROR: Invalid device number - {e}"
             except Exception as e:
                 return f"ERROR: {e}"
 

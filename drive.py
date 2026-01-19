@@ -9,6 +9,9 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .d64 import D64Image
 
+# Import disk constants
+from .d64 import TOTAL_DISK_BLOCKS
+
 
 class DiskDrive:
     """Emulates a Commodore 1541 disk drive.
@@ -136,7 +139,7 @@ class DiskDrive:
         
         # Last line: blocks free
         total_blocks = sum(e.blocks for e in entries)
-        blocks_free = max(0, 664 - total_blocks)
+        blocks_free = max(0, TOTAL_DISK_BLOCKS - total_blocks)
         free_line = f"{blocks_free} BLOCKS FREE."
         current_addr = self._add_basic_line(prg_data, current_addr, blocks_free, free_line)
         

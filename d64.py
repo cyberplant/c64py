@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 
+# D64 disk image constants
+D64_SIZE_STANDARD = 174848  # Standard 35-track D64 without error bytes
+D64_SIZE_WITH_ERRORS = 175531  # D64 with error bytes appended
+TOTAL_DISK_BLOCKS = 664  # Total blocks on a standard 1541 disk
+
+
 @dataclass
 class D64DirEntry:
     """Represents a directory entry in a D64 disk image."""
@@ -44,8 +50,11 @@ class D64Image:
         """
         self.data = data
         # Validate size (should be 174848 bytes for standard 35-track D64)
-        if len(data) not in (174848, 175531):  # With or without error bytes
-            raise ValueError(f"Invalid D64 size: {len(data)} bytes (expected 174848 or 175531)")
+        if len(data) not in (D64_SIZE_STANDARD, D64_SIZE_WITH_ERRORS):
+            raise ValueError(
+                f"Invalid D64 size: {len(data)} bytes "
+                f"(expected {D64_SIZE_STANDARD} or {D64_SIZE_WITH_ERRORS})"
+            )
     
     def _get_sectors_per_track(self, track: int) -> int:
         """Get number of sectors for a given track."""
@@ -261,8 +270,8 @@ class D64Image:
         
         # Calculate blocks free (simplified - just count total used)
         total_blocks = sum(e.blocks for e in entries)
-        # Standard 1541 has 664 blocks free when empty
-        blocks_free = max(0, 664 - total_blocks)
+        # Standard 1541 has 664 blocks total
+        blocks_free = max(0, TOTAL_DISK_BLOCKS - total_blocks)
         lines.append(f"{blocks_free} BLOCKS FREE.")
         
         return '\n'.join(lines)
