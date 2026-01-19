@@ -68,7 +68,7 @@ class C64:
         (0xBB, 0xBB, 0xBB),  # 15 light gray
     )
 
-    def __init__(self, interface_factory=None):
+    def __init__(self, interface_factory=None, enable_sid: bool = False):
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -77,6 +77,7 @@ class C64:
 
         # Create CPU with interface reference
         self.cpu = CPU6502(self.memory, self.interface)
+        self.sid = None
 
         self.running = False
         # Use NumPy arrays for faster screen operations (fallback to lists if unavailable)
@@ -105,6 +106,17 @@ class C64:
 
         # Backward compatibility
         self.rich_interface = self.interface
+
+        if enable_sid:
+            try:
+                from .sid import SidEmulator
+                self.sid = SidEmulator(video_standard=self.memory.video_standard)
+                self.memory.sid = self.sid
+                if self.interface:
+                    self.interface.add_debug_log("🔊 SID audio enabled")
+            except Exception as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ SID audio unavailable: {exc}")
 
     def load_roms(self, rom_dir: str, *, require_char_rom: bool = True) -> None:
         """Load C64 ROM files
@@ -407,6 +419,17 @@ class C64:
 
         if self.rich_interface:
             self.rich_interface.add_debug_log("🎮 C64 initialized")
+
+    def set_video_standard(self, standard: str) -> None:
+        self.memory.video_standard = standard
+        if self.sid:
+            self.sid.set_video_standard(standard)
+
+    def shutdown(self) -> None:
+        if self.sid:
+            self.sid.close()
+            self.sid = None
+            self.memory.sid = None
 
     def load_prg(self, prg_path: str) -> None:
         """Load a PRG file into memory"""

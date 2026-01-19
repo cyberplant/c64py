@@ -94,6 +94,7 @@ def main():
     ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
     ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
+    ap.add_argument("--enable-sid", action="store_true", help="Enable SID audio output via pygame")
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
 
@@ -132,7 +133,7 @@ def main():
             border_size=args.graphics_border,
         )
 
-    emu = C64(interface_factory=interface_factory)
+    emu = C64(interface_factory=interface_factory, enable_sid=args.enable_sid)
     emu.debug = args.debug
     emu.autoquit = args.autoquit
     emu.turbo = args.turbo
@@ -201,7 +202,6 @@ def main():
             if hasattr(emu, "interface") and hasattr(emu.interface, "exit"):
                 emu.interface.exit()
         except Exception:
-            # Ignore errors during cleanup so we don't mask the original ROM loading failure.
             pass
         print(f"ERROR: {e}")
         sys.exit(1)
@@ -211,17 +211,6 @@ def main():
         emu.prg_file_path = args.prg_file
         if show_ui_logs:
             emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {args.prg_file}")
-
-    # Initialize CPU (use _read_word to ensure correct byte order and ROM mapping)
-    reset_vector = emu.cpu._read_word(0xFFFC)
-    emu.cpu.state.pc = reset_vector
-    if show_ui_logs:
-        emu.interface.add_debug_log(f"🔄 Reset vector: ${reset_vector:04X}")
-
-    if args.debug and show_ui_logs:
-        emu.interface.add_debug_log(f"🖥️ Initial CPU state: PC=${emu.cpu.state.pc:04X}, A=${emu.cpu.state.a:02X}, X=${emu.cpu.state.x:02X}, Y=${emu.cpu.state.y:02X}")
-        emu.interface.add_debug_log(f"💾 Memory config ($01): ${emu.memory.ram[0x01]:02X}")
-        emu.interface.add_debug_log(f"📺 Screen memory sample ($0400-$040F): {[hex(emu.memory.ram[0x0400 + i]) for i in range(16)]}")
 
     # Start server if requested (runs in parallel with UI)
     server = None
@@ -292,8 +281,8 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping emulator...")
         emu.running = False
-        if server:
-            server.running = False
+        if emu.screen_update_thread and emu.screen_update_thread.is_alive():
+            emu.screen_update_thread.join(timeout=1.0)
 
     if args.debug:
         chrout_count = getattr(emu.cpu, "chrout_count", None)
