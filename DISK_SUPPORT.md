@@ -145,6 +145,31 @@ This tests:
 - No support for other file types (SEQ, REL, etc.)
 - Directory is formatted but cannot be displayed via BASIC LIST
 
+## Implementation Notes
+
+### Simplified Free Block Calculation
+
+The current implementation uses a simplified free block calculation:
+```python
+blocks_free = TOTAL_DISK_BLOCKS - sum(file.blocks for file in files)
+```
+
+A more accurate implementation would:
+- Read the Block Availability Map (BAM) from track 18, sector 0
+- Count actual free blocks from the BAM entries
+- Account for sector fragmentation and partially used sectors
+
+The simplified calculation is sufficient for directory display purposes.
+
+### Basic PETSCII Conversion
+
+The PETSCII-to-ASCII conversion is simplified for common characters:
+- Uppercase letters, numbers, and basic punctuation
+- Handles spaces and common screen codes
+- May not correctly convert all PETSCII graphics characters
+
+A complete implementation would include full PETSCII character tables.
+
 ## Future Enhancements
 
 1. Implement IEC serial bus emulation
@@ -155,3 +180,5 @@ This tests:
 6. Disk change detection
 7. Error channel emulation
 8. Support for REL files
+9. Accurate BAM-based free block calculation
+10. Complete PETSCII character mapping
