@@ -85,6 +85,11 @@ class C64:
         self.program_loaded = False  # Track if a program was loaded via command line
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
+        # Dirty-checking for screen updates - cache previous state
+        self._prev_screen_data = None  # Previous screen memory snapshot
+        self._prev_color_data = None   # Previous color memory snapshot
+        self._cached_screen_text = None  # Cached Rich Text output
+        self._screen_dirty = True  # Force initial render
 
         # Backward compatibility
         self.rich_interface = self.interface
@@ -760,15 +765,33 @@ class C64:
             # Uppercase graphics
             return petscii_char - 128
 
-    def _update_text_screen(self) -> None:
-        """Update text screen from screen memory (thread-safe)"""
+    def _update_text_screen(self) -> bool:
+        """Update text screen from screen memory (thread-safe).
+        
+        Returns True if screen was updated, False if unchanged (dirty-check optimization).
+        """
         screen_base = SCREEN_MEM
         color_base = COLOR_MEM
-        cursor_color = self.memory.read(0x0286) & 0x0F  # Current text color for cursor
-
-        # Debug: screen update
-        #if hasattr(self, 'interface') and self.interface:
-            #self.interface.add_debug_log("🎨 Updating text screen from memory")
+        
+        # Fast dirty-check: snapshot screen and color memory
+        # Read as bytes for fast comparison
+        current_screen = bytes(self.memory.ram[screen_base:screen_base + 1000])
+        current_color = bytes(self.memory.ram[color_base:color_base + 1000])
+        cursor_color_byte = self.memory.ram[0x0286] & 0x0F
+        
+        # Check if anything changed
+        if (current_screen == self._prev_screen_data and 
+            current_color == self._prev_color_data and
+            not self._screen_dirty):
+            return False  # Nothing changed, skip expensive update
+        
+        # Update cache
+        self._prev_screen_data = current_screen
+        self._prev_color_data = current_color
+        self._screen_dirty = False
+        self._cached_screen_text = None  # Invalidate cached render
+        
+        cursor_color = cursor_color_byte
 
         # Use lock to ensure thread-safe access
         with self.screen_lock:
@@ -822,6 +845,7 @@ class C64:
 
                     self.text_screen[row][col] = char
                     self.text_colors[row][col] = color_code
+        return True  # Screen was updated
 
     @classmethod
     def _c64_color_to_rich_rgb(cls, color_code: int) -> str:
@@ -830,9 +854,11 @@ class C64:
         return f"rgb({r},{g},{b})"
 
     def _render_text_screen_rich(self) -> Text:
-        """Render text screen as a Rich Text renderable with C64 colors."""
+        """Render text screen as a Rich Text renderable with C64 colors.
+        
+        Optimized to batch consecutive characters with same style.
+        """
         # VIC-II background color (applies to the whole screen in standard text mode)
-        # IMPORTANT: render should reflect VIC state, not CPU-visible banking.
         background_color = self.memory.peek_vic(0x21) & 0x0F
         bg_style = self._c64_color_to_rich_rgb(background_color)
         border_color = self.memory.peek_vic(0x20) & 0x0F
@@ -841,39 +867,57 @@ class C64:
 
         with self.screen_lock:
             screen_text = Text()
-            # Draw a simple 1-character border around the 40x25 screen.
-            # C64 border is a solid color region; we emulate it with spaces.
             full_cols = SCREEN_COLS + BORDER_WIDTH * 2
 
-            # Top border
-            for _ in range(BORDER_HEIGHT):
-                screen_text.append(" " * full_cols, style=border_cell_style)
-                screen_text.append("\n")
+            # Top border (single append per line)
+            top_border = (" " * full_cols + "\n") * BORDER_HEIGHT
+            if top_border:
+                screen_text.append(top_border, style=border_cell_style)
 
             for row in range(SCREEN_ROWS):
                 # Left border
                 screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
+                
+                # Batch consecutive characters with same style
+                batch_chars = []
+                batch_style = None
+                
                 for col in range(SCREEN_COLS):
                     char = self.text_screen[row][col]
                     fg = self.text_colors[row][col] & 0x0F
-                    fg_style = self._c64_color_to_rich_rgb(fg)
-                    # Check if this cell is reversed (cursor)
-                    if self.text_reversed[row][col]:
-                        # Reversed: swap fg and bg - cursor color becomes background
-                        screen_text.append(char, style=f"{bg_style} on {fg_style}")
+                    reversed_char = self.text_reversed[row][col]
+                    
+                    # Compute style for this character
+                    if reversed_char:
+                        fg_rgb = self._c64_color_to_rich_rgb(fg)
+                        cell_style = f"{bg_style} on {fg_rgb}"
                     else:
-                        screen_text.append(char, style=f"{fg_style} on {bg_style}")
+                        fg_rgb = self._c64_color_to_rich_rgb(fg)
+                        cell_style = f"{fg_rgb} on {bg_style}"
+                    
+                    # If style changed, flush batch
+                    if cell_style != batch_style:
+                        if batch_chars:
+                            screen_text.append("".join(batch_chars), style=batch_style)
+                        batch_chars = [char]
+                        batch_style = cell_style
+                    else:
+                        batch_chars.append(char)
+                
+                # Flush remaining batch
+                if batch_chars:
+                    screen_text.append("".join(batch_chars), style=batch_style)
+                
                 # Right border
                 screen_text.append(" " * BORDER_WIDTH, style=border_cell_style)
                 if row < (SCREEN_ROWS - 1):
                     screen_text.append("\n")
 
-            # Bottom border
+            # Bottom border (single append)
             screen_text.append("\n")
-            for i in range(BORDER_HEIGHT):
-                screen_text.append(" " * full_cols, style=border_cell_style)
-                if i < BORDER_HEIGHT - 1:
-                    screen_text.append("\n")
+            bottom_border = (" " * full_cols + "\n") * (BORDER_HEIGHT - 1) + " " * full_cols
+            if bottom_border:
+                screen_text.append(bottom_border, style=border_cell_style)
             return screen_text
 
     def render_text_screen(self, no_colors: bool = False) -> Union[str, Text]:
