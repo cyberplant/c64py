@@ -165,7 +165,7 @@ while total_cycles < max_cycles:
 ## Common Tasks
 
 ### Adding a New CPU Instruction
-1. Add opcode handling in `cpu.py` in the `execute_opcode()` method
+1. Add opcode handling in `cpu.py` in the `_execute_opcode()` method
 2. Return the correct cycle count
 3. Update flags (N, Z, C, V) as appropriate
 4. Add comments explaining addressing mode and operation
