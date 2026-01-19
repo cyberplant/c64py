@@ -40,6 +40,7 @@ from .constants import (
 )
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
+from .drive import DiskDrive
 from .memory import MemoryMap
 from .roms import REQUIRED_ROMS
 from .ui import TextualInterface
@@ -98,6 +99,10 @@ class C64:
         self.program_loaded = False  # Track if a program was loaded via command line
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
+        
+        # Disk drives (devices 8-11)
+        self.drives: Dict[int, DiskDrive] = {}
+        self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
         self._prev_color_data = b''
@@ -482,6 +487,74 @@ class C64:
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
 
+    def _inject_load_directory_command(self, device: int = 8) -> None:
+        """Inject 'LOAD"$",device' command into keyboard buffer to list disk directory."""
+        
+        # Put in keyboard buffer (raw keypresses)
+        # Clear buffer first
+        for i in range(10):
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, 0)
+
+        # Write 'LOAD"$",8' + RETURN
+        # PETSCII: L O A D " $ " , 8 RETURN
+        command = f'LOAD"$",{device}\x0D'
+        command_bytes = command.encode('ascii')
+        
+        for i, char in enumerate(command_bytes):
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, char)
+
+        # Set buffer length
+        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, len(command_bytes))
+        
+        if self.interface:
+            self.interface.add_debug_log(f"💾 Injected 'LOAD\"$\",{device}' command into keyboard buffer")
+
+    def attach_disk(self, disk_path: str, device: int = 8) -> None:
+        """Attach a D64 disk image to a drive.
+        
+        Args:
+            disk_path: Path to D64 disk image file
+            device: Device number (8-11, default 8)
+        """
+        from .d64 import load_d64
+        
+        if device < 8 or device > 11:
+            raise ValueError(f"Invalid device number: {device} (must be 8-11)")
+        
+        # Load D64 image
+        d64 = load_d64(disk_path)
+        
+        # Create or get drive
+        if device not in self.drives:
+            self.drives[device] = DiskDrive(device)
+        
+        # Attach disk
+        self.drives[device].attach_disk(d64, disk_path)
+        
+        if self.interface:
+            disk_name, disk_id = d64.read_bam()
+            self.interface.add_debug_log(f"💾 Attached disk '{disk_name}' (ID: {disk_id}) to drive {device}")
+            self.interface.add_debug_log(f"   File: {disk_path}")
+
+    def detach_disks(self) -> None:
+        """Detach all disk images from drives."""
+        for device, drive in self.drives.items():
+            drive.detach_disk()
+            if self.interface:
+                self.interface.add_debug_log(f"💾 Detached disk from drive {device}")
+        self.drives.clear()
+
+    def get_drive(self, device: int) -> Optional[DiskDrive]:
+        """Get disk drive by device number.
+        
+        Args:
+            device: Device number (8-11)
+            
+        Returns:
+            DiskDrive instance or None if not attached
+        """
+        return self.drives.get(device)
+
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
         import time
@@ -547,6 +620,24 @@ class C64:
                         if self.interface:
                             self.interface.add_debug_log(f"❌ Failed to load program: {e}")
                         self.prg_file_path = None  # Clear path even on error
+
+            # Attach disk if pending (after BASIC boot completes)
+            if self.disk_image_path and not hasattr(self, '_disk_attached_after_boot'):
+                # BASIC is ready - attach disk now (after boot has completed)
+                # Wait until we're past boot sequence
+                if cycles > BASIC_BOOT_CYCLES:
+                    try:
+                        self.attach_disk(self.disk_image_path, device=8)
+                        self.disk_image_path = None  # Clear path after attaching
+                        self._disk_attached_after_boot = True
+                        if self.interface:
+                            self.interface.add_debug_log("💾 Disk attached after BASIC boot completed")
+                        # Inject LOAD"$",8 command into keyboard buffer to list directory
+                        self._inject_load_directory_command(device=8)
+                    except Exception as e:
+                        if self.interface:
+                            self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
+                        self.disk_image_path = None  # Clear path even on error
 
             step_cycles = self.cpu.step(self.udp_debug, cycles)
             cycles += step_cycles

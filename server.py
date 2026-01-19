@@ -108,6 +108,8 @@ SEND_KEYS <codes..> - Inject multiple PETSCII key codes
 SHOW_KEYBOARD_BUFFER- Show keyboard buffer length and contents
 SHOW_CURRENT_LINE   - Show current screen line at cursor
 LOAD <file>         - Load PRG file
+ATTACH-DISK <file> [device] - Attach D64 disk image (device 8-11, default: 8)
+DETACH-DISKS        - Detach all disk images
 STOP                - Stop emulator execution
 QUIT/EXIT           - Quit server and emulator
 HELP/?              - Show this help message"""
@@ -201,6 +203,28 @@ HELP/?              - Show this help message"""
             try:
                 self.emu.load_prg(parts[1])
                 return "OK"
+            except Exception as e:
+                return f"ERROR: {e}"
+
+        elif cmd == "ATTACH-DISK":
+            if len(parts) < 2:
+                return "ERROR: Missing D64 file path"
+            try:
+                disk_path = parts[1]
+                device = int(parts[2]) if len(parts) > 2 else 8
+                if device < 8 or device > 11:
+                    return f"ERROR: Invalid device number {device} (must be 8-11)"
+                self.emu.attach_disk(disk_path, device)
+                return f"OK: Disk attached to drive {device}"
+            except ValueError as e:
+                return f"ERROR: Invalid device number"
+            except Exception as e:
+                return f"ERROR: {e}"
+
+        elif cmd == "DETACH-DISKS":
+            try:
+                self.emu.detach_disks()
+                return "OK: All disks detached"
             except Exception as e:
                 return f"ERROR: {e}"
 
