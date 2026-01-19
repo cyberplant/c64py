@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.text import Text
 
 from .constants import (
+    BASIC_BOOT_CYCLES,
     COLOR_MEM,
     BLNSW,
     BLNCT,
@@ -420,6 +421,14 @@ class C64:
             self.memory.ram[0x002D] = end_addr & 0xFF
             self.memory.ram[0x002E] = (end_addr >> 8) & 0xFF
 
+            # Set variable/array pointers ($2F-$32) - same as end, no variables yet
+            # ARYTAB ($2F/$30) - start of arrays
+            self.memory.ram[0x002F] = end_addr & 0xFF
+            self.memory.ram[0x0030] = (end_addr >> 8) & 0xFF
+            # STREND ($31/$32) - end of arrays/start of free RAM
+            self.memory.ram[0x0031] = end_addr & 0xFF
+            self.memory.ram[0x0032] = (end_addr >> 8) & 0xFF
+
             # Debug: Log the BASIC pointers
             if self.interface:
                 self.interface.add_debug_log(f"📝 BASIC start: ${self.memory.ram[0x002B] | (self.memory.ram[0x002C] << 8):04X}")
@@ -435,6 +444,33 @@ class C64:
                 # Show first few bytes of program
                 first_bytes = [f"${self.memory.read(0x0801 + i):02X}" for i in range(min(16, len(prg_data)))]
                 self.interface.add_debug_log(f"📝 First bytes at $0801: {', '.join(first_bytes)}")
+
+    def _inject_run_command(self) -> None:
+        """Inject 'RUN' command into keyboard buffer for autorun."""
+        run_command = b"RUN"  # RUN command (without CR - CR goes to keyboard buffer)
+        
+        # Method 1: Put in keyboard buffer (raw keypresses)
+        kb_buf_base = 0x0277  # Keyboard buffer start
+        # Clear buffer first
+        for i in range(10):
+            self.memory.write(kb_buf_base + i, 0)
+        # Write "RUN" + RETURN
+        full_command = b"RUN\x0D"
+        for i, char in enumerate(full_command):
+            if i < 10:  # Buffer is only 10 bytes
+                self.memory.write(kb_buf_base + i, char)
+        # Set buffer length
+        self.memory.write(0xC6, len(full_command))
+        
+        # Method 2: Also put in BASIC input buffer at $0200 (screen editor output)
+        input_buf_base = 0x0200
+        for i, char in enumerate(run_command):
+            self.memory.write(input_buf_base + i, char)
+        # Set input buffer length ($D3 is cursor column, but $0D is CRSW - quote mode flag)
+        # Actually, BASIC uses TXTPTR and other variables - let's just rely on keyboard buffer
+        
+        if self.interface:
+            self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
 
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
@@ -480,14 +516,16 @@ class C64:
             # Load program if pending (after BASIC boot completes)
             if self.prg_file_path and not hasattr(self, '_program_loaded_after_boot'):
                 # BASIC is ready - load the program now (after boot has completed)
-                # Wait until we're past boot sequence (cycles > 2020000)
-                if cycles > 2020000:
+                # Wait until we're past boot sequence
+                if cycles > BASIC_BOOT_CYCLES:
                     try:
                         self.load_prg(self.prg_file_path)
                         self.prg_file_path = None  # Clear path after loading
                         self._program_loaded_after_boot = True
                         if self.interface:
                             self.interface.add_debug_log("💾 Program loaded after BASIC boot completed")
+                        # Inject "RUN" command into keyboard buffer for autorun
+                        self._inject_run_command()
                     except Exception as e:
                         if self.interface:
                             self.interface.add_debug_log(f"❌ Failed to load program: {e}")

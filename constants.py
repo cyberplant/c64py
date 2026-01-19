@@ -66,7 +66,7 @@ CURSOR_BLINK_TICKS = 30  # ~0.5s at 60Hz
 
 # KERNAL addresses and bootstrap heuristics
 KERNAL_CHRIN_ADDR = 0xFFCF
-BASIC_BOOT_CYCLES = 2020000
+BASIC_BOOT_CYCLES = 2100000  # Must be AFTER BASIC cold start (~2045000) completes
 STUCK_PC_THRESHOLD = 1000
 
 # VIC-II registers

@@ -16,6 +16,7 @@ from textual.events import Key
 from textual.widgets import Static, Header, Footer, RichLog
 
 from .constants import (
+    BASIC_BOOT_CYCLES,
     BLNSW,
     BORDER_WIDTH,
     BORDER_HEIGHT,
@@ -155,8 +156,8 @@ class TextualInterface(App):
                 # Load program if pending (after BASIC boot completes)
                 if self.emulator.prg_file_path and not hasattr(self.emulator, '_program_loaded_after_boot'):
                     # BASIC is ready - load the program now (after boot has completed)
-                    # Wait until we're past boot sequence (cycles > 2020000)
-                    if cycles > 2020000:
+                    # Wait until we're past boot sequence
+                    if cycles > BASIC_BOOT_CYCLES:
                         try:
                             self.emulator.load_prg(self.emulator.prg_file_path)
                             self.emulator.prg_file_path = None  # Clear path after loading

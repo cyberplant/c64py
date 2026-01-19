@@ -221,6 +221,8 @@ class PygameInterface:
                             self.emulator.prg_file_path = None
                             self.emulator._program_loaded_after_boot = True
                             self.add_debug_log("Program loaded after BASIC boot completed")
+                            # Inject "RUN" command into keyboard buffer for autorun
+                            self.emulator._inject_run_command()
                         except Exception as exc:
                             self.add_debug_log(f"Failed to load program: {exc}")
                             self.emulator.prg_file_path = None
