@@ -11,7 +11,12 @@ import threading
 import time
 from typing import Dict, Optional, Tuple, Union
 
-import numpy as np
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    np = None
+    HAS_NUMPY = False
 
 from rich.console import Console
 from rich.text import Text
@@ -74,10 +79,15 @@ class C64:
         self.cpu = CPU6502(self.memory, self.interface)
 
         self.running = False
-        # Use NumPy arrays for faster screen operations
-        self.text_screen = np.full((25, 40), ' ', dtype='U1')  # Unicode chars
-        self.text_colors = np.full((25, 40), 7, dtype=np.uint8)  # Default: yellow
-        self.text_reversed = np.zeros((25, 40), dtype=np.bool_)  # Track reversed chars
+        # Use NumPy arrays for faster screen operations (fallback to lists if unavailable)
+        if HAS_NUMPY:
+            self.text_screen = np.full((25, 40), ' ', dtype='U1')  # Unicode chars
+            self.text_colors = np.full((25, 40), 7, dtype=np.uint8)  # Default: yellow
+            self.text_reversed = np.zeros((25, 40), dtype=np.bool_)  # Track reversed chars
+        else:
+            self.text_screen = [[' '] * 40 for _ in range(25)]
+            self.text_colors = [[7] * 40 for _ in range(25)]
+            self.text_reversed = [[False] * 40 for _ in range(25)]
         self.debug = False
         self.no_colors = False  # ANSI color output enabled by default
         self.udp_debug = None  # Will be set if UDP debugging is enabled
@@ -773,7 +783,7 @@ class C64:
         """Update text screen from screen memory (thread-safe).
         
         Returns True if screen was updated, False if unchanged (dirty-check optimization).
-        Uses NumPy for fast dirty-checking and bulk operations.
+        Uses NumPy for fast operations when available, falls back to pure Python.
         """
         # Ensure lookup table is initialized
         self._init_screen_code_table()
@@ -781,7 +791,7 @@ class C64:
         screen_base = SCREEN_MEM
         color_base = COLOR_MEM
         
-        # Fast dirty-check using bytes comparison (22x faster than NumPy)
+        # Fast dirty-check using bytes comparison
         current_screen_bytes = bytes(self.memory.ram[screen_base:screen_base + 1000])
         current_color_bytes = bytes(self.memory.ram[color_base:color_base + 1000])
         cursor_color = self.memory.ram[0x0286] & 0x0F
@@ -795,34 +805,41 @@ class C64:
         # Update cache
         self._prev_screen_data = current_screen_bytes
         self._prev_color_data = current_color_bytes
-        
-        # Convert to NumPy for vectorized processing
-        current_screen = np.frombuffer(current_screen_bytes, dtype=np.uint8)
-        current_color = np.frombuffer(current_color_bytes, dtype=np.uint8)
         self._screen_dirty = False
         self._cached_screen_text = None
 
-        # Vectorized operations for screen update
+        lookup = self._SCREEN_CODE_TO_ASCII
+        
         with self.screen_lock:
-            # Reshape to 25x40 for easier 2D access
-            screen_2d = current_screen.reshape(25, 40)
-            color_2d = current_color.reshape(25, 40)
-            
-            # Extract reversed flag (bit 7) and char codes (bits 0-6)
-            self.text_reversed[:] = (screen_2d & 0x80) != 0
-            char_codes = screen_2d & 0x7F
-            
-            # Apply colors (mask to 4 bits)
-            self.text_colors[:] = color_2d & 0x0F
-            
-            # Override color for reversed chars with cursor color
-            self.text_colors[self.text_reversed] = cursor_color
-            
-            # Convert screen codes to ASCII using lookup table
-            lookup = self._SCREEN_CODE_TO_ASCII
-            for row in range(25):
-                for col in range(40):
-                    self.text_screen[row, col] = lookup[char_codes[row, col]]
+            if HAS_NUMPY:
+                # NumPy vectorized path
+                current_screen = np.frombuffer(current_screen_bytes, dtype=np.uint8)
+                current_color = np.frombuffer(current_color_bytes, dtype=np.uint8)
+                screen_2d = current_screen.reshape(25, 40)
+                color_2d = current_color.reshape(25, 40)
+                
+                self.text_reversed[:] = (screen_2d & 0x80) != 0
+                char_codes = screen_2d & 0x7F
+                self.text_colors[:] = color_2d & 0x0F
+                self.text_colors[self.text_reversed] = cursor_color
+                
+                for row in range(25):
+                    for col in range(40):
+                        self.text_screen[row, col] = lookup[char_codes[row, col]]
+            else:
+                # Pure Python fallback path
+                for row in range(25):
+                    for col in range(40):
+                        idx = row * 40 + col
+                        raw_code = current_screen_bytes[idx]
+                        color_code = current_color_bytes[idx] & 0x0F
+                        
+                        reversed_char = bool(raw_code & 0x80)
+                        char_code = raw_code & 0x7F
+                        
+                        self.text_reversed[row][col] = reversed_char
+                        self.text_colors[row][col] = cursor_color if reversed_char else color_code
+                        self.text_screen[row][col] = lookup[char_code]
         
         return True  # Screen was updated
 

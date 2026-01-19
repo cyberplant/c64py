@@ -1,0 +1,32 @@
+name: Docker Build
+
+on:
+  push:
+    branches: ["main", "speed-optimization"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-cpython:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CPython image
+        run: docker build -f Dockerfile.cpython -t c64py-cpython .
+
+      - name: Test CPython image (smoke test)
+        run: |
+          docker run --rm c64py-cpython python -c "import c64py; print('CPython import OK')"
+
+  build-pypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build PyPy image
+        run: docker build -f Dockerfile.pypy -t c64py-pypy .
+
+      - name: Test PyPy image (smoke test)
+        run: |
+          docker run --rm c64py-pypy pypy3 -c "import c64py; print('PyPy import OK')"
