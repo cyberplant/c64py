@@ -34,3 +34,19 @@ jobs:
           python -m pip install .
           python -c "import c64py; import c64py.emulator; print(c64py.__version__)"
 
+      - name: Install ROM build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cc65
+
+      - name: Build ROMs from source
+        run: |
+          git clone --depth 1 https://github.com/mist64/c64rom.git /tmp/c64rom
+          cd /tmp/c64rom && make
+          mkdir -p $HOME/roms
+          cp /tmp/c64rom/basic.bin $HOME/roms/basic.901226-01.bin
+          cp /tmp/c64rom/kernal.bin $HOME/roms/kernal.901227-03.bin
+
+      - name: Run emulator smoke test
+        run: |
+          python -m pip install -e .
+          C64PY_ROM_DIR=$HOME/roms timeout 10 python C64.py --no-colors --max-cycles 3000000 --autoquit || true
+

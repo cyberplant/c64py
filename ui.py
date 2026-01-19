@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from rich.console import Console
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Key
+from textual.reactive import reactive
+from textual.widget import Widget
 from textual.widgets import Static, Header, Footer, RichLog
 
 from .constants import (
@@ -31,6 +33,36 @@ from .constants import (
 
 if TYPE_CHECKING:
     from .emulator import C64
+
+
+class C64Display(Widget):
+    """Reactive widget for C64 screen display.
+
+    Uses Textual's reactive pattern - when the reactive attribute
+    screen_version changes, render() is automatically called.
+    """
+
+    # Reactive attribute - changing this triggers automatic render()
+    screen_version = reactive(0)
+
+    def __init__(self, emulator: "C64", **kwargs):
+        super().__init__(**kwargs)
+        self.emulator = emulator
+        self._cached_content: Optional[Text] = None
+
+    def render(self) -> Text:
+        """Called automatically by Textual when screen_version changes."""
+        if self._cached_content is not None:
+            return self._cached_content
+        # Fallback - should not happen normally
+        return Text("Loading C64...")
+
+    def update_screen(self, content: Text) -> None:
+        """Update the screen content and trigger a reactive refresh."""
+        self._cached_content = content
+        # Increment version to trigger reactive refresh
+        self.screen_version += 1
+
 
 class TextualInterface(App):
     """Textual-based interface with TCSS styling"""
@@ -89,6 +121,7 @@ class TextualInterface(App):
         self.max_cycles = max_cycles
         self.max_logs = 1000
         self.current_cycle = 0
+        self.ui_refresh_iteration = 0
         self.emulator_thread = None
         self.running = False
         self.fullscreen = fullscreen
@@ -102,7 +135,7 @@ class TextualInterface(App):
     def compose(self) -> ComposeResult:
         if not self.fullscreen:
             yield Header()
-        yield RichLog(id="c64-display", auto_scroll=False)
+        yield C64Display(self.emulator, id="c64-display")
         if not self.fullscreen:
             yield RichLog(id="debug-panel", auto_scroll=True)
             yield Static("Initializing...", id="status-bar")
@@ -115,8 +148,7 @@ class TextualInterface(App):
             # In fullscreen mode, add the fullscreen class to the screen
             self.screen.add_class("fullscreen")
 
-        self.c64_display = self.query_one("#c64-display", RichLog)
-        self.c64_display.write("Loading C64...")
+        self.c64_display = self.query_one("#c64-display", C64Display)
 
         if not self.fullscreen:
             self.debug_logs = self.query_one("#debug-panel", RichLog)
@@ -133,14 +165,13 @@ class TextualInterface(App):
         self.emulator_thread = threading.Thread(target=self._run_emulator, daemon=True)
         self.emulator_thread.start()
 
-        # Update UI periodically
-        self.set_interval(0.1, self._update_ui)
+        # Update UI at 60Hz using Textual's native interval timer
+        # (call_from_thread doesn't guarantee 60Hz - Textual event loop throttles it)
+        self.set_interval(1/60, self._update_ui)
 
     def _run_emulator(self):
         """Run the emulator in background thread"""
         try:
-            # For Textual interface, run without the screen update worker
-            # since UI updates are handled by _update_ui
             self.emulator.running = True
             cycles = 0
             max_cycles = self.max_cycles
@@ -163,6 +194,8 @@ class TextualInterface(App):
                             self.emulator.prg_file_path = None  # Clear path after loading
                             self.emulator._program_loaded_after_boot = True
                             self.add_debug_log("💾 Program loaded after BASIC boot completed")
+                            # Inject "RUN" command into keyboard buffer for autorun
+                            self.emulator._inject_run_command()
                         except Exception as e:
                             self.add_debug_log(f"❌ Failed to load program: {e}")
                             self.emulator.prg_file_path = None  # Clear path even on error
@@ -204,66 +237,61 @@ class TextualInterface(App):
 
     def _update_ui(self):
         """Update the UI periodically"""
-        if self.emulator and not self.emulator.running:
-            # Emulator has stopped (e.g., due to autoquit), exit the app
-            self.add_debug_log("🛑 Emulator stopped, exiting...")
-            # Capture last lines of log before exiting
-            last_lines = self._get_last_log_lines(20)
-            self.exit()
-            # Print captured logs to console after UI shutdown
-            if last_lines:
-                print("\n=== Last log messages ===")
-                for line in last_lines:
-                    print(line)
-            return
 
         if self.emulator:
-            # Update text screen from memory
-            self.emulator._update_text_screen()
+            if not self.emulator.running:
+                # Emulator has stopped (e.g., due to autoquit), exit the app
+                self.add_debug_log("🛑 Emulator stopped, exiting...")
+                # Capture last lines of log before exiting
+                last_lines = self._get_last_log_lines(20)
+                self.exit()
+                # Print captured logs to console after UI shutdown
+                if last_lines:
+                    print("\n=== Last log messages ===")
+                    for line in last_lines:
+                        print(line)
+                return
 
-            # Update screen display
-            screen_content = self.emulator.render_text_screen(no_colors=False)
-            cursor_row = max(0, min(self.emulator.memory.read(CURSOR_ROW_ADDR), SCREEN_ROWS - 1))
-            cursor_col = max(0, min(self.emulator.memory.read(CURSOR_COL_ADDR), SCREEN_COLS - 1))
+            # Update text screen from memory (returns True if changed)
+            screen_changed = self.emulator._update_text_screen()
 
-            # Normalize render output once.
-            if isinstance(screen_content, Text):
-                screen_text = screen_content.copy()
-                screen_plain = screen_text.plain
-            else:
-                screen_plain = str(screen_content)
-                screen_text = Text(screen_plain)
+            # Only do expensive rendering if screen actually changed
+            if screen_changed:
+                # Update screen display
+                screen_content = self.emulator.render_text_screen(no_colors=False)
 
-            # Debug: Check if screen has any non-space content
-            non_space_count = sum(1 for row in self.emulator.text_screen for char in row if char != ' ')
-            if non_space_count > 0 and not hasattr(self, '_screen_debug_logged'):
-                # Sample first few characters from screen memory
-                sample_chars = []
-                for addr in range(SCREEN_MEM, SCREEN_MEM + 20):
-                    char_code = self.emulator.memory.read(addr)
-                    sample_chars.append(f"${char_code:02X}")
-                self.add_debug_log(f"📺 Screen has {non_space_count} non-space chars. First 20 bytes: {', '.join(sample_chars)}")
-                self._screen_debug_logged = True
+                # Normalize render output once.
+                if isinstance(screen_content, Text):
+                    screen_text = screen_content.copy()
+                else:
+                    screen_text = Text(str(screen_content))
 
-            # Cursor blinking is now handled by KERNAL IRQ at $EA31, which modifies
-            # screen memory directly (XORs character with $80 to reverse it).
-            # No special cursor handling needed here - just render screen memory as-is.
-            self.c64_display.clear()
-            self.c64_display.write(screen_text)
+                # Debug: Screen content is available in `screen_text` for optional diagnostics.
+
+                # Update display widget using reactive pattern
+                self.c64_display.update_screen(screen_text)
+
+            self.ui_refresh_iteration += 1
+
+            # Update UI extra components every 20 screen updates
+            if self.ui_refresh_iteration % 20 != 0:
+                return
 
             # Update status bar with actual cycle count from emulator (only in non-fullscreen mode)
             if not self.fullscreen:
                 emu = self.emulator
-                # Reuse cursor_row/cursor_col from earlier in this update cycle.
+                cursor_row = max(0, min(emu.memory.read(CURSOR_ROW_ADDR), SCREEN_ROWS - 1))
+                cursor_col = max(0, min(emu.memory.read(CURSOR_COL_ADDR), SCREEN_COLS - 1))
                 port01 = emu.memory.ram[0x01]
                 txt_color = emu.memory.read(0x0286) & 0x0F
                 bg = emu.memory.peek_vic(0x21) & 0x0F
                 border = emu.memory.peek_vic(0x20) & 0x0F
+                cli_count = getattr(emu.cpu, 'cli_count', 0)
                 status_text = (
                     f"🎮 C64 | Cycle: {emu.current_cycles:,} | PC: ${emu.cpu.state.pc:04X} | "
                     f"A: ${emu.cpu.state.a:02X} | X: ${emu.cpu.state.x:02X} | Y: ${emu.cpu.state.y:02X} | "
                     f"SP: ${emu.cpu.state.sp:02X} | Cursor: {cursor_row},{cursor_col} | "
-                    f"$01=${port01:02X} | BG:{bg} BORDER:{border} TXT:{txt_color}"
+                    f"CLI:{cli_count} | $01=${port01:02X}"
                 )
                 if self.status_bar:
                     self.status_bar.update(status_text)

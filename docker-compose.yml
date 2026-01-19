@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  cpython:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpython
+    volumes:
+      - ${C64PY_ROM_DIR:-./roms}:/roms:ro
+
+  pypy:
+    build:
+      context: .
+      dockerfile: Dockerfile.pypy
+    volumes:
+      - ${C64PY_ROM_DIR:-./roms}:/roms:ro

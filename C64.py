@@ -54,6 +54,18 @@ except ImportError:
     )
 
 
+def _show_speed(start_time: float, cycles: int) -> None:
+    """Display emulation speed statistics."""
+    import time
+    elapsed = time.perf_counter() - start_time
+    if elapsed > 0 and cycles > 0:
+        mhz = cycles / elapsed / 1e6
+        print(f"\n=== Emulation Speed ===")
+        print(f"Cycles: {cycles:,}")
+        print(f"Time:   {elapsed:.2f}s")
+        print(f"Speed:  {mhz:.2f} MHz ({mhz/1.0:.0%} of C64)")
+
+
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -82,8 +94,29 @@ def main():
     ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
     ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
+    ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
+    ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
 
     args = ap.parse_args()
+    
+    # --benchmark implies other flags and loads benchmark PRG
+    if args.benchmark:
+        args.turbo = True
+        args.autoquit = True
+        args.no_colors = True
+        if args.max_cycles is None:
+            args.max_cycles = 15_000_000  # Enough cycles for benchmark to complete
+        # Auto-load benchmark PRG if no file specified
+        if args.prg_file is None:
+            benchmark_prg = os.path.join(script_dir, "programs", "benchmark.prg")
+            if os.path.exists(benchmark_prg):
+                args.prg_file = benchmark_prg
+            else:
+                print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
+                print("Run: compile.sh to build it")
+    
+    # Track start time for speed calculation
+    start_time = time.perf_counter()
 
     interface_factory = None
     if args.graphics:
@@ -102,6 +135,7 @@ def main():
     emu = C64(interface_factory=interface_factory)
     emu.debug = args.debug
     emu.autoquit = args.autoquit
+    emu.turbo = args.turbo
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
     if args.debug:
@@ -222,6 +256,8 @@ def main():
                         print(line)
         if server:
             server.running = False
+        # Show emulation speed
+        _show_speed(start_time, emu.current_cycles)
         return
 
     # Start Textual interface (unless explicitly disabled with --no-colors)
@@ -244,6 +280,8 @@ def main():
         # After UI closes, stop server if running
         if server:
             server.running = False
+        # Show emulation speed
+        _show_speed(start_time, emu.current_cycles)
         return  # Exit after Textual interface closes
 
     # This code should never be reached since Textual blocks
@@ -327,6 +365,9 @@ def main():
     emu.running = False
     if emu.screen_update_thread and emu.screen_update_thread.is_alive():
         emu.screen_update_thread.join(timeout=1.0)
+
+    # Show emulation speed
+    _show_speed(start_time, emu.current_cycles)
 
     # Close UDP debug logger (flush all pending messages)
     if emu.udp_debug:

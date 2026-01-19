@@ -1080,8 +1080,10 @@ class CPU6502:
             self.memory.pending_irq = False
             self._set_flag(0x04, False)
             self.state.pc = (self.state.pc + 1) & 0xFFFF
-            if self.interface:
-                self.interface.add_debug_log(f"🚫 CLI executed, I-flag now {self._get_flag(0x04)}, cleared pending IRQs")
+            # Increment CLI counter instead of logging each time
+            if not hasattr(self, 'cli_count'):
+                self.cli_count = 0
+            self.cli_count += 1
             return 2
         elif opcode == 0x78:  # SEI
             self._set_flag(0x04, True)
