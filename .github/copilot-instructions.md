@@ -18,7 +18,7 @@ This is a Commodore 64 emulator implemented in Python with a text-based interfac
 - **MemoryMap** (`memory.py`): Memory management with ROM/RAM banking
 - **TextualInterface** (`ui.py`): Text-based UI using the Textual library
 - **EmulatorServer** (`server.py`): TCP/UDP server for remote control
-- **GraphicsRenderer** (`graphics.py`): Pygame-based graphics window
+- **PygameInterface** (`graphics.py`): Pygame-based graphics window
 
 ### Key Files
 - `constants.py`: C64-specific constants (memory addresses, timing, etc.)
