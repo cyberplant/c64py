@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 from rich.console import Console
 from rich.text import Text
@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 class C64Display(Widget):
     """Reactive widget for C64 screen display.
 
-    Uses Textual's reactive pattern - when screen_content changes,
-    render() is automatically called.
+    Uses Textual's reactive pattern - when the reactive attribute
+    screen_version changes, render() is automatically called.
     """
 
     # Reactive attribute - changing this triggers automatic render()
@@ -48,7 +48,7 @@ class C64Display(Widget):
     def __init__(self, emulator: "C64", **kwargs):
         super().__init__(**kwargs)
         self.emulator = emulator
-        self._cached_content: Text | None = None
+        self._cached_content: Optional[Text] = None
 
     def render(self) -> Text:
         """Called automatically by Textual when screen_version changes."""
@@ -307,14 +307,6 @@ class TextualInterface(App):
             if self.count % 20 != 0:
                 return
 
-            # Report accumulated timing
-#            self.add_debug_log(
-#                f"⏱️ 60 updates: total={self._timing_total*1000:.0f}ms "
-#                f"dirty={self._timing_dirty*1000:.0f}ms "
-#                f"render={self._timing_render*1000:.0f}ms "
-#                f"widget={self._timing_widget*1000:.0f}ms "
-#                f"renders={self._timing_renders}"
-#            )
             # Reset accumulators
             self._timing_dirty = 0.0
             self._timing_render = 0.0

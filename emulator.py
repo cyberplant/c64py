@@ -884,11 +884,10 @@ class C64:
                     reversed_char = self.text_reversed[row][col]
                     
                     # Compute style for this character
+                    fg_rgb = self._c64_color_to_rich_rgb(fg)
                     if reversed_char:
-                        fg_rgb = self._c64_color_to_rich_rgb(fg)
                         cell_style = f"{bg_style} on {fg_rgb}"
                     else:
-                        fg_rgb = self._c64_color_to_rich_rgb(fg)
                         cell_style = f"{fg_rgb} on {bg_style}"
                     
                     # If style changed, flush batch
