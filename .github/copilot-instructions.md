@@ -139,11 +139,11 @@ memory.poke_vic(reg, value)
 #### CPU Execution
 ```python
 # Execute single instruction
-cycles = cpu.execute()
+cycles = cpu.step()
 
 # Execute with cycle limit
 while total_cycles < max_cycles:
-    total_cycles += cpu.execute()
+    total_cycles += cpu.step()
 ```
 
 ### Security Considerations
