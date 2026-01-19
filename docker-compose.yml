@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  cpython:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpython
+    volumes:
+      - type: bind
+        source: ${ROM_DIR:-.}
+        target: /roms
+        read_only: true
+    environment:
+      - ROM_DIR=/roms
+
+  pypy:
+    build:
+      context: .
+      dockerfile: Dockerfile.pypy
+    volumes:
+      - type: bind
+        source: ${ROM_DIR:-.}
+        target: /roms
+        read_only: true
+    environment:
+      - ROM_DIR=/roms

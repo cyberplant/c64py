@@ -82,8 +82,12 @@ def main():
     ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
     ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
+    ap.add_argument("--show-speed", action="store_true", help="Show emulation speed (MHz) on exit")
 
     args = ap.parse_args()
+    
+    # Track start time for speed calculation
+    start_time = time.perf_counter()
 
     interface_factory = None
     if args.graphics:
@@ -327,6 +331,17 @@ def main():
     emu.running = False
     if emu.screen_update_thread and emu.screen_update_thread.is_alive():
         emu.screen_update_thread.join(timeout=1.0)
+
+    # Show emulation speed if requested
+    if args.show_speed:
+        elapsed = time.perf_counter() - start_time
+        cycles = emu.current_cycles
+        if elapsed > 0 and cycles > 0:
+            mhz = cycles / elapsed / 1e6
+            print(f"\n=== Emulation Speed ===")
+            print(f"Cycles: {cycles:,}")
+            print(f"Time:   {elapsed:.2f}s")
+            print(f"Speed:  {mhz:.2f} MHz ({mhz/1.0:.0%} of C64)")
 
     # Close UDP debug logger (flush all pending messages)
     if emu.udp_debug:
