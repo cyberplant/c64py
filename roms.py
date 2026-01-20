@@ -61,6 +61,22 @@ REQUIRED_ROMS: Sequence[RomSpec] = (
     ),
 )
 
+# 1541 Drive ROMs (optional, for full disk drive emulation)
+DRIVE_1541_ROMS: Sequence[RomSpec] = (
+    RomSpec(
+        "dos1541",
+        "dos1541",
+        aliases=("d1541-325302-01.bin", "325302-01.bin", "dos-1541.bin"),
+        expected_size=16384,
+    ),
+    RomSpec(
+        "serial1541",
+        "d1541II",
+        aliases=("901229-06.bin", "901229-05.bin", "serial-1541.bin"),
+        expected_size=8192,
+    ),
+)
+
 
 def _required_rom_specs(*, require_char_rom: bool = True) -> Sequence[RomSpec]:
     if require_char_rom:
@@ -106,7 +122,7 @@ def _vice_candidate_dirs() -> Sequence[Path]:
     """
     Common VICE ROM locations across platforms/package managers.
 
-    VICE typically stores ROMs in a tree containing a 'C64' directory.
+    VICE typically stores ROMs in a tree containing C64 and DRIVES directories.
     We include both the root and likely subdirectories.
     """
     out: list[Path] = []
@@ -116,8 +132,10 @@ def _vice_candidate_dirs() -> Sequence[Path]:
         [
             Path("/Applications/VICE.app/Contents/Resources"),
             Path("/Applications/VICE.app/Contents/Resources/C64"),
+            Path("/Applications/VICE.app/Contents/Resources/DRIVES"),
             Path("/Applications/VICE.app/Contents/Resources/vice"),
             Path("/Applications/VICE.app/Contents/Resources/vice/C64"),
+            Path("/Applications/VICE.app/Contents/Resources/vice/DRIVES"),
         ]
     )
 
@@ -126,14 +144,19 @@ def _vice_candidate_dirs() -> Sequence[Path]:
         [
             Path("/opt/homebrew/share/vice"),
             Path("/opt/homebrew/share/vice/C64"),
+            Path("/opt/homebrew/share/vice/DRIVES"),
             Path("/usr/local/share/vice"),
             Path("/usr/local/share/vice/C64"),
+            Path("/usr/local/share/vice/DRIVES"),
             Path("/usr/share/vice"),
             Path("/usr/share/vice/C64"),
+            Path("/usr/share/vice/DRIVES"),
             Path("/usr/lib/vice"),
             Path("/usr/lib/vice/C64"),
+            Path("/usr/lib/vice/DRIVES"),
             Path("/usr/local/lib/vice"),
             Path("/usr/local/lib/vice/C64"),
+            Path("/usr/local/lib/vice/DRIVES"),
         ]
     )
 
@@ -142,8 +165,10 @@ def _vice_candidate_dirs() -> Sequence[Path]:
         [
             Path.home() / ".vice",
             Path.home() / ".vice" / "C64",
+            Path.home() / ".vice" / "DRIVES",
             Path.home() / "Library" / "Application Support" / "VICE",
             Path.home() / "Library" / "Application Support" / "VICE" / "C64",
+            Path.home() / "Library" / "Application Support" / "VICE" / "DRIVES",
         ]
     )
 
@@ -388,4 +413,50 @@ def ensure_roms_available(
     finally:
         if temp_root is not None:
             shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def find_drive_rom(
+    rom_key: str,
+    explicit_rom_dir: Optional[str] = None,
+) -> Optional[bytes]:
+    """
+    Find and load a 1541 drive ROM.
+    
+    Args:
+        rom_key: "dos1541" or "serial1541"
+        explicit_rom_dir: Optional explicit ROM directory path
+        
+    Returns:
+        ROM data bytes if found, None otherwise
+    """
+    # Find the ROM spec
+    spec = None
+    for s in DRIVE_1541_ROMS:
+        if s.key == rom_key:
+            spec = s
+            break
+    if spec is None:
+        return None
+    
+    # Search for ROM
+    candidate_dirs = []
+    if explicit_rom_dir:
+        candidate_dirs.append(Path(explicit_rom_dir).expanduser())
+    candidate_dirs.extend(iter_candidate_rom_dirs())
+    
+    for rom_dir in candidate_dirs:
+        if not rom_dir.is_dir():
+            continue
+        # Try primary filename and aliases
+        for name in (spec.filename, *spec.aliases):
+            rom_path = rom_dir / name
+            if rom_path.is_file():
+                try:
+                    data = rom_path.read_bytes()
+                    if spec.expected_size is None or len(data) == spec.expected_size:
+                        return data
+                except Exception:
+                    continue
+    return None
+
 

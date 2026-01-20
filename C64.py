@@ -77,6 +77,7 @@ def main():
         default=None,
         help="Directory containing ROM files (default: auto-detect common locations)",
     )
+    ap.add_argument("--disk", type=str, help="D64 disk image to attach to drive 8")
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
@@ -211,6 +212,12 @@ def main():
         emu.prg_file_path = args.prg_file
         if show_ui_logs:
             emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {args.prg_file}")
+
+    # Store D64 disk image path for attaching after boot
+    if args.disk:
+        emu.disk_image_path = args.disk
+        if show_ui_logs:
+            emu.interface.add_debug_log(f"💾 D64 disk will be attached after BASIC boot: {args.disk}")
 
     # Initialize CPU (use _read_word to ensure correct byte order and ROM mapping)
     reset_vector = emu.cpu._read_word(0xFFFC)

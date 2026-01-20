@@ -16,6 +16,7 @@ from .cpu_state import CIATimer
 
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
+    from .iec_bus import IECBus
 
 
 @dataclass
@@ -36,6 +37,11 @@ class MemoryMap:
     vic_interrupt_state: int = 0  # VIC interrupt state for D019
     jiffy_cycles: int = 0  # Cycle counter for jiffy clock
     _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))
+    # IEC serial bus (optional, for 1541 drive emulation)
+    iec_bus: Optional['IECBus'] = None
+    # CIA2 Port A state (for IEC bus control)
+    cia2_pra: int = 0xFF  # Port A data register
+    cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)
 
     def peek_vic(self, reg: int) -> int:
         """Return VIC-II register state, bypassing 6510 banking.
@@ -332,13 +338,58 @@ class MemoryMap:
             self.cia1_timer_b.input_mode = (value >> 5) & 0x03
 
     def _read_cia2(self, reg: int) -> int:
-        """Read CIA2 register"""
-        # Serial bus, etc.
+        """Read CIA2 register.
+        
+        CIA2 Port A controls the IEC serial bus:
+        - Bit 3: ATN OUT
+        - Bit 4: CLK OUT
+        - Bit 5: DATA OUT
+        - Bit 6: CLK IN
+        - Bit 7: DATA IN
+        """
+        if reg == 0x00:  # Port A (IEC bus control)
+            result = self.cia2_pra
+            # If IEC bus is attached, read actual bus state
+            if self.iec_bus is not None:
+                # Bits 6-7 are inputs (CLK IN, DATA IN)
+                # Clear input bits
+                result &= 0x3F
+                # Set based on actual bus state
+                if self.iec_bus.clk:  # CLK released (high)
+                    result |= 0x40
+                if self.iec_bus.data:  # DATA released (high)
+                    result |= 0x80
+            return result
+        elif reg == 0x02:  # Data direction register A
+            return self.cia2_ddra
+        # Other registers return 0
         return 0
 
     def _write_cia2(self, reg: int, value: int) -> None:
-        """Write CIA2 register"""
-        pass
+        """Write CIA2 register.
+        
+        CIA2 Port A controls the IEC serial bus:
+        - Bit 3: ATN OUT
+        - Bit 4: CLK OUT
+        - Bit 5: DATA OUT
+        """
+        if reg == 0x00:  # Port A (IEC bus control)
+            self.cia2_pra = value
+            # If IEC bus is attached, update bus state
+            if self.iec_bus is not None:
+                # ATN is controlled by bit 3 (inverted: 0=asserted, 1=released)
+                atn_state = (value & 0x08) != 0
+                self.iec_bus.set_atn(atn_state)
+                
+                # CLK OUT is controlled by bit 4 (inverted: 0=asserted, 1=released)
+                clk_state = (value & 0x10) != 0
+                self.iec_bus.set_clk("c64", clk_state)
+                
+                # DATA OUT is controlled by bit 5 (inverted: 0=asserted, 1=released)
+                data_state = (value & 0x20) != 0
+                self.iec_bus.set_data("c64", data_state)
+        elif reg == 0x02:  # Data direction register A
+            self.cia2_ddra = value
 
     def _scroll_screen_up(self) -> None:
         """Scroll the screen up by one line (optimized)"""

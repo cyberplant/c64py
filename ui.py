@@ -200,6 +200,32 @@ class TextualInterface(App):
                             self.add_debug_log(f"❌ Failed to load program: {e}")
                             self.emulator.prg_file_path = None  # Clear path even on error
 
+                # Attach disk if pending (after BASIC boot completes)
+                if self.emulator.disk_image_path and not hasattr(self.emulator, '_disk_attached_after_boot'):
+                    # BASIC is ready - attach disk now (after boot has completed)
+                    # Wait until we're past boot sequence
+                    if cycles > BASIC_BOOT_CYCLES:
+                        try:
+                            self.emulator.attach_disk(self.emulator.disk_image_path, device=8)
+                            self.emulator.disk_image_path = None  # Clear path after attaching
+                            self.emulator._disk_attached_after_boot = True
+                            self.add_debug_log("💾 Disk attached after BASIC boot completed")
+                            # Inject LOAD"$",8 command into keyboard buffer to list directory
+                            self.emulator._inject_load_directory_command(device=8)
+                        except Exception as e:
+                            self.add_debug_log(f"❌ Failed to attach disk: {e}")
+                            self.emulator.disk_image_path = None  # Clear path even on error
+
+                # Check for KERNAL LOAD hook (before executing instruction)
+                if self.emulator._handle_kernal_load():
+                    # LOAD was handled, skip this CPU instruction
+                    continue
+
+                # Check for KERNAL SAVE hook (before executing instruction)
+                if self.emulator._handle_kernal_save():
+                    # SAVE was handled, skip this CPU instruction
+                    continue
+
                 step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles)
                 cycles += step_cycles
                 self.emulator.current_cycles = cycles
