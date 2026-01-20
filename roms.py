@@ -72,7 +72,7 @@ DRIVE_1541_ROMS: Sequence[RomSpec] = (
     RomSpec(
         "serial1541",
         "d1541II",
-        aliases=("901229-06.bin", "325302-01.bin", "serial-1541.bin"),
+        aliases=("901229-06.bin", "901229-05.bin", "serial-1541.bin"),
         expected_size=8192,
     ),
 )
@@ -122,7 +122,7 @@ def _vice_candidate_dirs() -> Sequence[Path]:
     """
     Common VICE ROM locations across platforms/package managers.
 
-    VICE typically stores ROMs in a tree containing a 'C64' directory and 'DRIVES' directory.
+    VICE typically stores ROMs in a tree containing C64 and DRIVES directories.
     We include both the root and likely subdirectories.
     """
     out: list[Path] = []
