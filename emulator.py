@@ -42,8 +42,10 @@ from .cpu import CPU6502
 from .debug import UdpDebugLogger
 from .drive import DiskDrive
 from .memory import MemoryMap
-from .roms import REQUIRED_ROMS
+from .roms import REQUIRED_ROMS, find_drive_rom
 from .ui import TextualInterface
+from .iec_bus import IECBus
+from .drive1541 import Drive1541
 
 class C64:
     """Main C64 emulator"""
@@ -103,6 +105,12 @@ class C64:
         # Disk drives (devices 8-11)
         self.drives: Dict[int, DiskDrive] = {}
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
+        
+        # IEC serial bus for 1541 drive emulation (optional, created when needed)
+        self.iec_bus: Optional[IECBus] = None
+        self.iec_drives: Dict[int, Drive1541] = {}  # 1541 drives with ROM
+        self.use_iec_bus = False  # Enable when 1541 ROMs are available
+        
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
         self._prev_color_data = b''
@@ -544,6 +552,12 @@ class C64:
             if self.interface:
                 self.interface.add_debug_log(f"💾 Detached disk from drive {device}")
         self.drives.clear()
+        
+        # Also detach from IEC drives if using IEC bus
+        for device, drive in self.iec_drives.items():
+            drive.detach_disk()
+            if self.interface:
+                self.interface.add_debug_log(f"💾 Detached disk from IEC drive {device}")
 
     def get_drive(self, device: int) -> Optional[DiskDrive]:
         """Get disk drive by device number.
@@ -555,6 +569,48 @@ class C64:
             DiskDrive instance or None if not attached
         """
         return self.drives.get(device)
+    
+    def initialize_iec_bus(self, rom_dir: Optional[str] = None) -> bool:
+        """Initialize IEC bus and 1541 drive emulation.
+        
+        This loads 1541 ROMs and creates the IEC bus infrastructure.
+        If ROMs cannot be found, falls back to KERNAL hook method.
+        
+        Args:
+            rom_dir: Optional ROM directory path
+            
+        Returns:
+            True if IEC bus was successfully initialized
+        """
+        # Try to load 1541 DOS ROM
+        dos_rom = find_drive_rom("dos1541", rom_dir)
+        if dos_rom is None:
+            if self.interface:
+                self.interface.add_debug_log("⚠️  1541 DOS ROM not found - using KERNAL hooks for disk I/O")
+            self.use_iec_bus = False
+            return False
+        
+        # Serial ROM is optional
+        serial_rom = find_drive_rom("serial1541", rom_dir)
+        if serial_rom is None:
+            if self.interface:
+                self.interface.add_debug_log("⚠️  1541 Serial ROM not found (optional)")
+        
+        # Create IEC bus
+        self.iec_bus = IECBus()
+        self.memory.iec_bus = self.iec_bus
+        
+        # Create 1541 drives for devices 8-11
+        for device in range(8, 12):
+            drive = Drive1541(device_number=device)
+            drive.load_rom(dos_rom, serial_rom)
+            self.iec_bus.attach_device(drive)
+            self.iec_drives[device] = drive
+        
+        self.use_iec_bus = True
+        if self.interface:
+            self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
+        return True
 
     def _handle_kernal_load(self) -> bool:
         """Handle KERNAL LOAD operation for virtual disk drives.
