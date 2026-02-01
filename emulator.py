@@ -890,6 +890,8 @@ class C64:
                     
                     # Sample pixels: count set pixels in top-left 4x4 quadrant
                     # This gives us a rough density for ASCII representation
+                    # pixel_count ranges from 0 (no pixels) to 16 (all pixels)
+                    # We map this to 5 density levels: 0-3, 4-7, 8-11, 12-15, 16
                     pixel_count = 0
                     for y in range(4):
                         if bitmap_offset + y < len(self.memory.ram):

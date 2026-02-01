@@ -483,8 +483,12 @@ class PygameInterface:
             sprite_addr = sprite_ptr * 64
             
             # Sprites are 24x21 pixels
-            sprite_x = sprite_data['x'] - 24  # Offset to screen coordinates
-            sprite_y = sprite_data['y'] - 50  # Offset to screen coordinates
+            # Offset sprite coordinates to screen space
+            # VIC-II sprite coordinates are relative to the display area, not the border
+            # Subtract 24 pixels for X to align with display area (standard C64 offset)
+            # Subtract 50 pixels for Y to align with display area (standard C64 offset)
+            sprite_x = sprite_data['x'] - 24
+            sprite_y = sprite_data['y'] - 50
             sprite_color = self._palette.get(sprite_data['color'], (255, 255, 255))
             
             # Render sprite pixels
@@ -513,7 +517,9 @@ class PygameInterface:
                         # Draw double-wide pixel
                         px = screen_left + sprite_x + bit_pair * 2
                         py = screen_top + sprite_y + row
-                        if 0 <= px < self._screen_rect.width and 0 <= py < self._screen_rect.height:
+                        # Check if pixel is within screen rect bounds
+                        if (self._screen_rect.left <= px < self._screen_rect.right and 
+                            self._screen_rect.top <= py < self._screen_rect.bottom):
                             self._frame_surface.fill(color, (px, py, 2, 1))
             else:
                 # Hi-res sprite: 24x21
@@ -530,7 +536,9 @@ class PygameInterface:
                         if pixel_bit:
                             px = screen_left + sprite_x + bit
                             py = screen_top + sprite_y + row
-                            if 0 <= px < self._screen_rect.width and 0 <= py < self._screen_rect.height:
+                            # Check if pixel is within screen rect bounds
+                            if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                self._screen_rect.top <= py < self._screen_rect.bottom):
                                 self._frame_surface.set_at((px, py), sprite_color)
 
     def _ascii_to_petscii(self, char: str) -> int:

@@ -404,8 +404,11 @@ class MemoryMap:
         screen_base = vm * 0x0400
         
         if bitmap_mode:
-            # In bitmap mode, CB selects bitmap base (bit 3 of d018)
-            bitmap_base = (cb & 0x04) * 0x0800  # 0x0000 or 0x2000
+            # In bitmap mode, bit 3 of $D018 (CB bit 2) selects bitmap base
+            # $D018 bit 3 clear (CB=0-3) -> bitmap at $0000
+            # $D018 bit 3 set (CB=4-7) -> bitmap at $2000
+            # Extract bit 3 of $D018, which is bit 2 of CB
+            bitmap_base = 0x2000 if (d018 & 0x08) else 0x0000
             char_base = 0
         else:
             # In text mode, CB selects character base
