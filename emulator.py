@@ -791,11 +791,20 @@ class C64:
         
         Returns True if screen was updated, False if unchanged (dirty-check optimization).
         Uses NumPy for fast operations when available, falls back to pure Python.
+        Supports bitmap mode rendering as ASCII art.
         """
+        # Check if we're in bitmap mode
+        mode_info = self.memory.get_display_mode()
+        
+        if mode_info['bitmap_mode']:
+            # Render bitmap mode as ASCII art
+            return self._update_bitmap_screen_ascii(mode_info)
+        
+        # Text mode rendering (original code)
         # Ensure lookup table is initialized
         self._init_screen_code_table()
         
-        screen_base = SCREEN_MEM
+        screen_base = mode_info['screen_base']
         color_base = COLOR_MEM
         
         # Fast dirty-check using bytes comparison
@@ -848,6 +857,71 @@ class C64:
                         self.text_screen[row][col] = lookup[char_code]
         
         return True  # Screen was updated
+    
+    def _update_bitmap_screen_ascii(self, mode_info: dict) -> bool:
+        """Render bitmap mode as ASCII art (simplified).
+        
+        Uses Unicode block characters to represent bitmap pixels.
+        Each 8x8 bitmap cell is converted to a 2x2 character block.
+        """
+        # Unicode block characters for different pixel densities
+        BLOCKS = [' ', '░', '▒', '▓', '█']
+        
+        bitmap_base = mode_info['bitmap_base']
+        screen_base = mode_info['screen_base']
+        
+        # For dirty checking, we'll sample the bitmap
+        # (full check would be too expensive for 8000 bytes)
+        sample_bytes = bytes(self.memory.ram[bitmap_base:bitmap_base + 100])
+        if hasattr(self, '_prev_bitmap_sample') and sample_bytes == self._prev_bitmap_sample:
+            return False
+        self._prev_bitmap_sample = sample_bytes
+        
+        with self.screen_lock:
+            # Process 40x25 character blocks
+            # Each block represents an 8x8 pixel area
+            # We'll convert to 2x2 character representation (4x4 pixels per char)
+            for char_row in range(25):
+                for char_col in range(40):
+                    char_index = char_row * 40 + char_col
+                    
+                    # Get bitmap data for this 8x8 block
+                    bitmap_offset = bitmap_base + char_index * 8
+                    
+                    # Sample pixels: count set pixels in top-left 4x4 quadrant
+                    # This gives us a rough density for ASCII representation
+                    pixel_count = 0
+                    for y in range(4):
+                        if bitmap_offset + y < len(self.memory.ram):
+                            byte = self.memory.ram[bitmap_offset + y]
+                            # Count bits in upper nibble (left 4 pixels)
+                            pixel_count += bin(byte >> 4).count('1')
+                    
+                    # Map pixel count to block character
+                    # 0 pixels = ' ', 16 pixels = '█'
+                    density = min(4, pixel_count // 4)
+                    char = BLOCKS[density]
+                    
+                    # Get colors from screen RAM
+                    color_data = self.memory.ram[screen_base + char_index]
+                    if mode_info['multicolor']:
+                        # In multicolor mode, use lower nibble for foreground
+                        fg_color = color_data & 0x0F
+                    else:
+                        # In hires mode, use upper nibble for foreground
+                        fg_color = (color_data >> 4) & 0x0F
+                    
+                    # Update text screen
+                    if HAS_NUMPY:
+                        self.text_screen[char_row, char_col] = char
+                        self.text_colors[char_row, char_col] = fg_color
+                        self.text_reversed[char_row, char_col] = False
+                    else:
+                        self.text_screen[char_row][char_col] = char
+                        self.text_colors[char_row][char_col] = fg_color
+                        self.text_reversed[char_row][char_col] = False
+        
+        return True
 
     @classmethod
     def _c64_color_to_rich_rgb(cls, color_code: int) -> str:
