@@ -10,7 +10,9 @@ from .constants import (
     ROM_KERNAL_START, ROM_KERNAL_END,
     ROM_CHAR_START, ROM_CHAR_END,
     VIC_BASE, SID_BASE, CIA1_BASE, CIA2_BASE,
-    SCREEN_MEM, COLOR_MEM
+    SCREEN_MEM, COLOR_MEM,
+    VIC_CONTROL_REG_1, VIC_CONTROL_REG_2,
+    VIC_D011_BMM, VIC_D011_ECM, VIC_D016_MCM
 )
 from .cpu_state import CIATimer
 
@@ -368,3 +370,138 @@ class MemoryMap:
         current_color = self.ram[0x0286] & 0x0F
         for col in range(40):
             self.ram[COLOR_MEM + 24 * 40 + col] = current_color
+
+    def get_display_mode(self) -> dict:
+        """Determine the current VIC-II display mode.
+        
+        Returns a dictionary with:
+        - 'mode': str - One of: 'text', 'bitmap', 'multicolor_text', 'multicolor_bitmap', 'extended_color'
+        - 'bitmap_mode': bool - True if bitmap mode is enabled
+        - 'multicolor': bool - True if multicolor mode is enabled
+        - 'extended_color': bool - True if extended color mode is enabled
+        - 'screen_base': int - Screen/color memory base address
+        - 'bitmap_base': int - Bitmap memory base address (if bitmap mode)
+        - 'char_base': int - Character memory base address (if text mode)
+        """
+        # Read VIC control registers
+        d011 = self._vic_regs[VIC_CONTROL_REG_1] if VIC_CONTROL_REG_1 < len(self._vic_regs) else 0
+        d016 = self._vic_regs[VIC_CONTROL_REG_2] if VIC_CONTROL_REG_2 < len(self._vic_regs) else 0
+        d018 = self._vic_regs[0x18] if 0x18 < len(self._vic_regs) else 0
+        
+        # Extract mode bits
+        bitmap_mode = (d011 & VIC_D011_BMM) != 0
+        extended_color = (d011 & VIC_D011_ECM) != 0
+        multicolor = (d016 & VIC_D016_MCM) != 0
+        
+        # Calculate memory addresses from $D018
+        # Bits 7-4: Video Matrix Base Address (VM)
+        # Bits 3-1: Character Base Address (CB) / Bitmap Base
+        vm = (d018 >> 4) & 0x0F
+        cb = (d018 >> 1) & 0x07
+        
+        # Screen base is VM * 1024 (within VIC bank)
+        # For simplicity, assume VIC bank 0 (default)
+        screen_base = vm * 0x0400
+        
+        if bitmap_mode:
+            # In bitmap mode, CB selects bitmap base (bit 3 of d018)
+            bitmap_base = (cb & 0x04) * 0x0800  # 0x0000 or 0x2000
+            char_base = 0
+        else:
+            # In text mode, CB selects character base
+            char_base = cb * 0x0800
+            bitmap_base = 0
+        
+        # Determine mode name
+        if bitmap_mode:
+            if multicolor:
+                mode = 'multicolor_bitmap'
+            else:
+                mode = 'bitmap'
+        elif extended_color:
+            mode = 'extended_color'
+        elif multicolor:
+            mode = 'multicolor_text'
+        else:
+            mode = 'text'
+        
+        return {
+            'mode': mode,
+            'bitmap_mode': bitmap_mode,
+            'multicolor': multicolor,
+            'extended_color': extended_color,
+            'screen_base': screen_base,
+            'bitmap_base': bitmap_base,
+            'char_base': char_base,
+        }
+    
+    def is_sprite_enabled(self, sprite_num: int) -> bool:
+        """Check if a sprite is enabled.
+        
+        Args:
+            sprite_num: Sprite number (0-7)
+            
+        Returns:
+            True if the sprite is enabled, False otherwise
+        """
+        if not 0 <= sprite_num <= 7:
+            return False
+        sprite_enable_reg = self._vic_regs[0x15] if 0x15 < len(self._vic_regs) else 0
+        return (sprite_enable_reg & (1 << sprite_num)) != 0
+    
+    def get_sprite_data(self, sprite_num: int) -> dict:
+        """Get sprite data for rendering.
+        
+        Args:
+            sprite_num: Sprite number (0-7)
+            
+        Returns:
+            Dictionary with sprite properties:
+            - 'enabled': bool
+            - 'x': int - X coordinate
+            - 'y': int - Y coordinate
+            - 'color': int - Sprite color (0-15)
+            - 'multicolor': bool
+            - 'pointer': int - Sprite data pointer
+        """
+        if not 0 <= sprite_num <= 7:
+            return {'enabled': False}
+        
+        # Check if sprite is enabled
+        sprite_enable_reg = self._vic_regs[0x15] if 0x15 < len(self._vic_regs) else 0
+        enabled = (sprite_enable_reg & (1 << sprite_num)) != 0
+        
+        if not enabled:
+            return {'enabled': False}
+        
+        # Read sprite position
+        x_low = self._vic_regs[sprite_num * 2] if sprite_num * 2 < len(self._vic_regs) else 0
+        y = self._vic_regs[sprite_num * 2 + 1] if sprite_num * 2 + 1 < len(self._vic_regs) else 0
+        
+        # X MSB from $D010
+        x_msb_reg = self._vic_regs[0x10] if 0x10 < len(self._vic_regs) else 0
+        x_msb = (x_msb_reg & (1 << sprite_num)) != 0
+        x = x_low + (256 if x_msb else 0)
+        
+        # Read sprite color from $D027-$D02E
+        color_reg = 0x27 + sprite_num
+        color = self._vic_regs[color_reg] if color_reg < len(self._vic_regs) else 0
+        
+        # Check multicolor mode
+        mc_reg = self._vic_regs[0x1C] if 0x1C < len(self._vic_regs) else 0
+        multicolor = (mc_reg & (1 << sprite_num)) != 0
+        
+        # Get sprite pointer (from screen memory + $3F8)
+        mode_info = self.get_display_mode()
+        screen_base = mode_info['screen_base']
+        pointer_addr = screen_base + 0x3F8 + sprite_num
+        pointer = self.ram[pointer_addr] if pointer_addr < len(self.ram) else 0
+        
+        return {
+            'enabled': True,
+            'x': x,
+            'y': y,
+            'color': color & 0x0F,
+            'multicolor': multicolor,
+            'pointer': pointer,
+        }

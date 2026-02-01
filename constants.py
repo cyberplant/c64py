@@ -70,4 +70,25 @@ BASIC_BOOT_CYCLES = 2100000  # Must be AFTER BASIC cold start (~2045000) complet
 STUCK_PC_THRESHOLD = 1000
 
 # VIC-II registers
-VIC_MEMORY_CONTROL_REG = 0x18
+VIC_CONTROL_REG_1 = 0x11  # $D011 - Control Register 1 (BMM, ECM, RST8, RSEL, DEN, etc.)
+VIC_CONTROL_REG_2 = 0x16  # $D016 - Control Register 2 (MCM, CSEL, etc.)
+VIC_MEMORY_CONTROL_REG = 0x18  # $D018 - Memory Control (VM13-VM10, CB13-CB11)
+
+# VIC-II Control Register 1 ($D011) bit masks
+VIC_D011_BMM = 0x20  # Bit 5: Bitmap Mode (1=bitmap, 0=text)
+VIC_D011_ECM = 0x40  # Bit 6: Extended Color Mode (1=extended, 0=normal)
+VIC_D011_DEN = 0x10  # Bit 4: Display Enable
+
+# VIC-II Control Register 2 ($D016) bit masks
+VIC_D016_MCM = 0x10  # Bit 4: Multicolor Mode (1=multicolor, 0=hires)
+
+# Bitmap memory locations (based on VIC bank and $D018)
+BITMAP_BASE = 0x2000  # Default bitmap location (in VIC bank 0)
+BITMAP_SIZE = 8000    # 320x200 / 8 = 8000 bytes
+
+# Sprite registers
+SPRITE_ENABLE = 0x15  # $D015 - Sprite enable register
+SPRITE_X_BASE = 0x00  # $D000-$D00F - Sprite X/Y coordinates (8 sprites * 2 bytes)
+SPRITE_POINTERS = 0x03F8  # Default sprite pointers (screen base + $3F8-$3FF)
+SPRITE_MULTICOLOR = 0x1C  # $D01C - Sprite multicolor enable
+SPRITE_COLOR_BASE = 0x27  # $D027-$D02E - Sprite colors
