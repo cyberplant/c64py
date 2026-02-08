@@ -233,10 +233,28 @@ class PygameInterface:
 
                 pc = self.emulator.cpu.state.pc
                 if pc == last_pc:
+                    # Check if we're in a graphics mode wait loop
+                    # A simple JMP * (4C XX XX where XX XX = current PC) is ok in graphics mode
+                    mode_info = self.emulator.memory.get_display_mode()
+                    in_graphics_mode = mode_info['bitmap_mode'] or self.emulator.memory.is_sprite_enabled(0)
+                    
                     if self.emulator.memory.kernal_rom and ROM_KERNAL_START <= pc < ROM_KERNAL_END:
                         stuck_count = 0
                     elif pc != KERNAL_CHRIN_ADDR:
-                        stuck_count += 1
+                        # Check if it's a simple wait loop (JMP to self or nearby)
+                        opcode = self.emulator.memory.read(pc)
+                        if opcode == 0x4C:  # JMP absolute
+                            target_low = self.emulator.memory.read(pc + 1)
+                            target_high = self.emulator.memory.read(pc + 2)
+                            target = target_low | (target_high << 8)
+                            # Allow JMP * in graphics mode (infinite wait loop)
+                            if in_graphics_mode and abs(target - pc) <= 10:
+                                stuck_count = 0
+                            else:
+                                stuck_count += 1
+                        else:
+                            stuck_count += 1
+                        
                         if stuck_count > STUCK_PC_THRESHOLD:
                             self.add_debug_log(f"PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
                             self.emulator.running = False

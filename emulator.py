@@ -581,15 +581,31 @@ class C64:
                         self.rich_interface.add_debug_log(debug_msg)
                 break
             elif self.cpu.state.pc == last_pc:
+                # Check if we're in a graphics mode wait loop
+                mode_info = self.memory.get_display_mode()
+                in_graphics_mode = mode_info['bitmap_mode'] or self.memory.is_sprite_enabled(0)
+                
                 # When the KERNAL ROM is running, input waits can loop inside the ROM.
                 if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
                     stuck_count = 0
                 # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
                 elif self.cpu.state.pc != 0xFFCF:
-                    stuck_count += 1
+                    # Check if it's a simple wait loop (JMP to self or nearby)
+                    opcode = self.memory.read(self.cpu.state.pc)
+                    if opcode == 0x4C:  # JMP absolute
+                        target_low = self.memory.read(self.cpu.state.pc + 1)
+                        target_high = self.memory.read(self.cpu.state.pc + 2)
+                        target = target_low | (target_high << 8)
+                        # Allow JMP * in graphics mode (infinite wait loop)
+                        if in_graphics_mode and abs(target - self.cpu.state.pc) <= 10:
+                            stuck_count = 0
+                        else:
+                            stuck_count += 1
+                    else:
+                        stuck_count += 1
+                    
                     if stuck_count > 1000:
                         if self.debug:
-                            opcode = self.memory.read(self.cpu.state.pc)
                             debug_msg1 = f"⚠️ PC stuck at ${self.cpu.state.pc:04X} (opcode ${opcode:02X}) for {stuck_count} steps"
                             debug_msg2 = "  This usually means an opcode is not implemented or not advancing PC correctly"
                             if self.rich_interface:
