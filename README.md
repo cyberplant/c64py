@@ -7,7 +7,7 @@ A Commodore 64 emulator implemented in Python with a text-based interface. This 
 - **6502 CPU Emulation**: Full 6502 instruction set implementation
 - **Memory Management**: Complete C64 memory map with ROM/RAM mapping
 - **I/O Devices**: VIC, SID, CIA1, CIA2 emulation
-- **SID Audio Output**: Optional pygame-ce-based SID sound (`--enable-sid`)
+- **SID Audio Output**: Optional pygame-ce-based SID sound (`--enable-sid`), or higher-accuracy reSID via ctypes (`--enable-resid`; build `resid_c` from `src/resid_wrapper/`)
 - **Text Mode Interface**: Beautiful textual UI using Rich and Textual libraries
 - **Graphics Mode**: Optional pygame window for C64 display output
 - **PRG File Loading**: Load and auto-run Commodore 64 programs
@@ -76,6 +76,7 @@ c64py
 - `--graphics-fps N`: Target FPS for graphics window (default: 30)
 - `--graphics-border N`: Border size in pixels for graphics window (default: 32)
 - `--enable-sid`: Enable SID audio output via pygame-ce
+- `--enable-resid`: Enable reSID-based SID audio (requires building/installing `resid_c.so` / `resid_c.dylib`; see `src/resid_wrapper/README.md`)
 
 ### Examples
 

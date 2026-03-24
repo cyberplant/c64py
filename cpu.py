@@ -109,6 +109,14 @@ class CPU6502:
         self._set_flag(0x02, value == 0)  # Z flag
         self._set_flag(0x80, (value & 0x80) != 0)  # N flag
 
+    def _adc_finish(self, old_a: int, value: int, wide_result: int) -> None:
+        """Set C, V, Z, N and A from ADC wide sum (old A + memory + carry-in)."""
+        self._set_flag(0x01, wide_result > 0xFF)
+        r = wide_result & 0xFF
+        self._set_flag(0x40, ((~(old_a ^ value)) & (old_a ^ r)) & 0x80)
+        self.state.a = r
+        self._update_flags(self.state.a)
+
     def _advance_raster(self, cycles: int) -> None:
         raster_max = 312 if self.memory.video_standard == "pal" else 263
         cycles_per_line = 63 if self.memory.video_standard == "pal" else 65
@@ -1404,22 +1412,20 @@ class CPU6502:
     # Arithmetic operations (simplified)
     def _adc_imm(self) -> int:
         value = self.memory.read(self.state.pc + 1)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _adc_zp(self) -> int:
         zp_addr = self.memory.read(self.state.pc + 1)
         value = self.memory.read(zp_addr)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
@@ -1430,11 +1436,10 @@ class CPU6502:
         addr_high = self.memory.read((zp_addr + 1) & 0xFF)
         addr = addr_low | (addr_high << 8)
         value = self.memory.read(addr)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6
 
@@ -1446,22 +1451,20 @@ class CPU6502:
         base = addr_low | (addr_high << 8)
         addr = (base + self.state.y) & 0xFFFF
         value = self.memory.read(addr)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5  # +1 if page crossed (not modeled)
 
     def _adc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
         value = self.memory.read(addr)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
@@ -1470,11 +1473,10 @@ class CPU6502:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
         value = self.memory.read(addr)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4  # +1 cycle if page boundary crossed, but we'll ignore for simplicity
 
@@ -1483,11 +1485,10 @@ class CPU6502:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.y) & 0xFFFF
         value = self.memory.read(addr)
+        old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
-        result = self.state.a + value + carry
-        self._set_flag(0x01, result > 0xFF)
-        self.state.a = result & 0xFF
-        self._update_flags(self.state.a)
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4  # +1 cycle if page boundary crossed, but we'll ignore for simplicity
 

@@ -235,6 +235,8 @@ class ReSIDEmulator:
 
         # Fixed chunk of C64 clock cycles per audio buffer (audio thread only).
         self._cycles_per_buffer = self._clock_hz * self._buffer_seconds
+        # resid_clock() returns unconsumed cycles in delta_t; carry between buffers.
+        self._cycle_remainder = 0
 
         # PCM output buffer (audio thread + resid_clock)
         self._pcm_buf = (ctypes.c_int16 * self._buffer_samples)()
@@ -260,6 +262,7 @@ class ReSIDEmulator:
     def set_video_standard(self, video_standard: str) -> None:
         """Update the SID clock frequency for the given video standard."""
         self._clock_hz = self._clock_for_standard(video_standard)
+        self._cycle_remainder = 0
         with self._lock:
             self._cycles_per_buffer = self._clock_hz * self._buffer_seconds
             self._lib.resid_set_sampling_parameters(
@@ -294,6 +297,7 @@ class ReSIDEmulator:
 
     def close(self) -> None:
         """Stop audio playback and release reSID resources."""
+        self._cycle_remainder = 0
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
@@ -394,7 +398,7 @@ class ReSIDEmulator:
 
     def _render_buffer(self) -> bytes:
         """Advance reSID by one buffer's worth of clock cycles and return PCM."""
-        delta_cycles = int(self._cycles_per_buffer)
+        delta_cycles = int(self._cycles_per_buffer) + self._cycle_remainder
         if delta_cycles < 1:
             return bytes(self._buffer_samples * 2)
 
@@ -409,6 +413,7 @@ class ReSIDEmulator:
                 self._pcm_buf,
                 self._buffer_samples,
             )
+        self._cycle_remainder = max(0, int(delta_t.value))
 
         if n <= 0:
             return bytes(self._buffer_samples * 2)

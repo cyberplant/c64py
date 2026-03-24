@@ -2,8 +2,10 @@
 # setup_resid.sh - Download and compile the reSID library on macOS
 set -e
 
-# Repository URL
-RESID_REPO="https://github.com/cyberplant/resid.git"
+# Repository URL (override: export RESID_REPO='https://example.com/your-fork.git')
+# VICE's upstream tree is github.com/VICE-Team/svn-mirror but reSID lives under
+# vice/src/resid with a different layout than this standalone autotools helper expects.
+RESID_REPO="${RESID_REPO:-https://github.com/cyberplant/resid.git}"
 RESID_DIR="resid"
 
 confirm() {

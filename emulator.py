@@ -189,15 +189,16 @@ class C64:
         tgt = self.target_cpu_hz
         ema = getattr(self, "_speed_sleep_overshoot_ema", 0.0)
         mx = self._SPEED_THROTTLE_OVERSHOOT_EMA_MAX
-        msg = (
-            f"⏱ throttle: ~{hz_ach / 1e6:.3f} MHz actual vs {tgt / 1e6:.3f} MHz target; "
-            f"sleep_overshoot_ema={ema * 1000:.3f} ms"
-        )
-        iface = getattr(self, "interface", None) or getattr(self, "rich_interface", None)
-        if iface and hasattr(iface, "add_debug_log"):
-            iface.add_debug_log(msg)
-        else:
-            print(msg, flush=True)
+        if getattr(self, "debug", False):
+            msg = (
+                f"⏱ throttle: ~{hz_ach / 1e6:.3f} MHz actual vs {tgt / 1e6:.3f} MHz target; "
+                f"sleep_overshoot_ema={ema * 1000:.3f} ms"
+            )
+            iface = getattr(self, "interface", None) or getattr(self, "rich_interface", None)
+            if iface and hasattr(iface, "add_debug_log"):
+                iface.add_debug_log(msg)
+            else:
+                print(msg, flush=True)
         if hz_ach < tgt * 0.995:
             ema = min(mx, ema + self._SPEED_THROTTLE_HZ_NUDGE_SLOW)
         elif hz_ach > tgt * 1.005:

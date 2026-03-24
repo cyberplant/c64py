@@ -115,15 +115,22 @@ class PygameInterface:
         self._pygame = pygame
         # Preserve any mixer settings already applied by the SID emulator.
         # pygame.init() would reset the mixer to stereo defaults otherwise.
-        if not pygame.mixer.get_init():
+        mixer = getattr(pygame, "mixer", None)
+        if mixer is None:
             pygame.init()
         else:
-            # Init everything except the mixer (already configured by SID).
-            for mod in (pygame.display, pygame.font, pygame.joystick, pygame.event):
-                try:
-                    mod.init()
-                except Exception:
-                    pass
+            try:
+                mixer_initialized = mixer.get_init()
+            except Exception:
+                mixer_initialized = None
+            if not mixer_initialized:
+                pygame.init()
+            else:
+                for mod in (pygame.display, pygame.font, pygame.joystick, pygame.event):
+                    try:
+                        mod.init()
+                    except Exception:
+                        pass
         pygame.display.set_caption("C64 Emulator (Graphics)")
         self._setup_surfaces()
 

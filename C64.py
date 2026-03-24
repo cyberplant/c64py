@@ -201,7 +201,7 @@ def main():
         emu.memory.udp_debug = emu.udp_debug
 
     try:
-        # Set video standard
+        # Video standard (memory + SID/reSID clock when audio is enabled)
         emu.set_video_standard(args.video_standard)
         if show_ui_logs:
             emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
