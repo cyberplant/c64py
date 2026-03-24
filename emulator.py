@@ -28,6 +28,8 @@ from .constants import (
     BLNCT,
     BORDER_WIDTH,
     BORDER_HEIGHT,
+    CPU_CLOCK_NTSC_HZ,
+    CPU_CLOCK_PAL_HZ,
     CURSOR_COL_ADDR,
     CURSOR_ROW_ADDR,
     KEYBOARD_BUFFER_BASE,
@@ -71,7 +73,7 @@ class C64:
         (0xBB, 0xBB, 0xBB),  # 15 light gray
     )
 
-    def __init__(self, interface_factory=None):
+    def __init__(self, interface_factory=None, enable_sid: bool = False, enable_resid: bool = False):
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -80,6 +82,7 @@ class C64:
 
         # Create CPU with interface reference
         self.cpu = CPU6502(self.memory, self.interface)
+        self.sid = None
 
         self.running = False
         # Use NumPy arrays for faster screen operations (fallback to lists if unavailable)
@@ -101,16 +104,17 @@ class C64:
         self.program_loaded = False  # Track if a program was loaded via command line
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
-        
+        self.turbo = False  # When True, no wall-clock throttling (see --turbo)
+
         # Disk drives (devices 8-11)
         self.drives: Dict[int, DiskDrive] = {}
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
-        
+
         # IEC serial bus for 1541 drive emulation (optional, created when needed)
         self.iec_bus: Optional[IECBus] = None
         self.iec_drives: Dict[int, Drive1541] = {}  # 1541 drives with ROM
         self.use_iec_bus = False  # Enable when 1541 ROMs are available
-        
+
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
         self._prev_color_data = b''
@@ -119,6 +123,136 @@ class C64:
 
         # Backward compatibility
         self.rich_interface = self.interface
+
+        if enable_resid:
+            try:
+                from .resid import ReSIDEmulator
+                self.sid = ReSIDEmulator(video_standard=self.memory.video_standard)
+                self.memory.sid = self.sid
+                if self.interface:
+                    self.interface.add_debug_log("🔊 reSID audio enabled (VICE-Team reSID)")
+            except ImportError as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ reSID library not found: {exc}")
+            except Exception as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ reSID initialisation failed: {exc}")
+        elif enable_sid:
+            try:
+                from .sid import SidEmulator
+                self.sid = SidEmulator(video_standard=self.memory.video_standard)
+                self.memory.sid = self.sid
+                if self.interface:
+                    self.interface.add_debug_log("🔊 SID audio enabled")
+            except Exception as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ SID audio unavailable: {exc}")
+
+    # --- Wall-clock throttling (PAL/NTSC) unless turbo ---
+    #
+    # Future direction (major refactor): drive the core from a *priority queue of events*
+    # (CIA ticks, VIC raster IRQs, disk sector, etc.), each tagged with emulated cycle time.
+    # The host wakes at min(next_event) using a monotonic clock; run CPU until that cycle
+    # count, dispatch devices, repeat. You still batch 6502 instructions between events;
+    # you cannot get a true 985 kHz POSIX signal, but frame/audio callbacks (~50–44100 Hz)
+    # can anchor wall time. See also: audio callback pacing, asyncio call_later.
+    #
+    _SPEED_THROTTLE_INTERVAL = 50_000
+    # Learn mean sleep overshoot (actual − requested) per host; subtract from next request.
+    _SPEED_THROTTLE_OVERSHOOT_EMA_ALPHA = 0.12
+    _SPEED_THROTTLE_OVERSHOOT_EMA_MAX = 0.018  # clamp ± (seconds)
+    # Below this, time.sleep() precision is dominated by the OS; skip and let deadline absorb.
+    _SPEED_THROTTLE_MIN_SLEEP_SEC = 0.0002
+    # Once per second: if measured Hz is off nominal, nudge overshoot EMA (closed loop).
+    _SPEED_THROTTLE_HZ_NUDGE_SLOW = 0.00035  # add to EMA when too slow (sleep less next times)
+    _SPEED_THROTTLE_HZ_NUDGE_FAST = 0.00022  # subtract when too fast
+
+    @property
+    def target_cpu_hz(self) -> float:
+        std = (self.memory.video_standard or "pal").lower()
+        return float(CPU_CLOCK_PAL_HZ) if std == "pal" else float(CPU_CLOCK_NTSC_HZ)
+
+    def reset_speed_throttle(self) -> None:
+        """Call when starting a new emulation run (resets wall-clock baseline)."""
+        wall = time.perf_counter()
+        self._speed_throttle_run_wall_start = wall
+        self._speed_throttle_checkpoint = 0
+        # Ideal wall-clock time at which the current checkpoint should have been reached.
+        self._speed_throttle_deadline = wall
+        self._speed_sleep_overshoot_ema = 0.0
+        self._speed_throttle_sec_anchor_wall = None
+        self._speed_throttle_sec_anchor_cycles = 0
+
+    def _speed_throttle_per_second_log_and_tune(self, cycles: int) -> None:
+        """Every ~1 s wall: log achieved MHz, EMA, and nudge EMA if off nominal."""
+        now = time.perf_counter()
+        anchor_w = self._speed_throttle_sec_anchor_wall
+        if anchor_w is None:
+            self._speed_throttle_sec_anchor_wall = now
+            self._speed_throttle_sec_anchor_cycles = cycles
+            return
+        dt = now - anchor_w
+        if dt < 1.0:
+            return
+        dc = cycles - self._speed_throttle_sec_anchor_cycles
+        self._speed_throttle_sec_anchor_wall = now
+        self._speed_throttle_sec_anchor_cycles = cycles
+        if dc <= 0:
+            return
+        hz_ach = dc / dt
+        tgt = self.target_cpu_hz
+        ema = getattr(self, "_speed_sleep_overshoot_ema", 0.0)
+        mx = self._SPEED_THROTTLE_OVERSHOOT_EMA_MAX
+        if getattr(self, "debug", False):
+            msg = (
+                f"⏱ throttle: ~{hz_ach / 1e6:.3f} MHz actual vs {tgt / 1e6:.3f} MHz target; "
+                f"sleep_overshoot_ema={ema * 1000:.3f} ms"
+            )
+            iface = getattr(self, "interface", None) or getattr(self, "rich_interface", None)
+            if iface and hasattr(iface, "add_debug_log"):
+                iface.add_debug_log(msg)
+            else:
+                print(msg, flush=True)
+        if hz_ach < tgt * 0.995:
+            ema = min(mx, ema + self._SPEED_THROTTLE_HZ_NUDGE_SLOW)
+        elif hz_ach > tgt * 1.005:
+            ema = max(-mx, ema - self._SPEED_THROTTLE_HZ_NUDGE_FAST)
+        self._speed_sleep_overshoot_ema = max(-mx, min(mx, ema))
+
+    def throttle_emulation_if_needed(self, cycles: int) -> None:
+        """Sleep if we're ahead of real time for the configured CPU clock (no-op if turbo).
+
+        Cumulative *deadline* (+= span/hz) sets the target wall time. Each ``time.sleep`` is
+        shortened by an EMA of (actual_sleep − requested_sleep) so different OS/schedulers
+        converge toward ~100% of nominal PAL/NTSC MHz without per-machine constants.
+
+        """
+        if getattr(self, "turbo", False):
+            return
+        if not hasattr(self, "_speed_throttle_deadline"):
+            self.reset_speed_throttle()
+        self._speed_throttle_per_second_log_and_tune(cycles)
+        if cycles - self._speed_throttle_checkpoint < self._SPEED_THROTTLE_INTERVAL:
+            return
+        span = cycles - self._speed_throttle_checkpoint
+        dt_emulated = span / self.target_cpu_hz
+        self._speed_throttle_deadline += dt_emulated
+        now = time.perf_counter()
+        delay = self._speed_throttle_deadline - now
+        if delay > 0:
+            ema = getattr(self, "_speed_sleep_overshoot_ema", 0.0)
+            corrected = max(0.0, delay - ema)
+            mn = self._SPEED_THROTTLE_MIN_SLEEP_SEC
+            if corrected >= mn:
+                t0 = time.perf_counter()
+                time.sleep(corrected)
+                err = (time.perf_counter() - t0) - corrected
+                a = self._SPEED_THROTTLE_OVERSHOOT_EMA_ALPHA
+                mx = self._SPEED_THROTTLE_OVERSHOOT_EMA_MAX
+                ema = (1.0 - a) * ema + a * err
+                ema = max(-mx, min(mx, ema))
+                self._speed_sleep_overshoot_ema = ema
+        self._speed_throttle_checkpoint = cycles
 
     def load_roms(self, rom_dir: str, *, require_char_rom: bool = True) -> None:
         """Load C64 ROM files
@@ -421,6 +555,17 @@ class C64:
 
         if self.rich_interface:
             self.rich_interface.add_debug_log("🎮 C64 initialized")
+
+    def set_video_standard(self, standard: str) -> None:
+        self.memory.video_standard = standard
+        if self.sid:
+            self.sid.set_video_standard(standard)
+
+    def shutdown(self) -> None:
+        if self.sid:
+            self.sid.close()
+            self.sid = None
+            self.memory.sid = None
 
     def load_prg(self, prg_path: str) -> None:
         """Load a PRG file into memory"""
@@ -873,6 +1018,7 @@ class C64:
     def run(self, max_cycles: Optional[int] = None) -> None:
         """Run the emulator"""
         self.running = True
+        self.reset_speed_throttle()
         cycles = 0
         last_pc = None
         stuck_count = 0
@@ -946,6 +1092,7 @@ class C64:
             step_cycles = self.cpu.step(self.udp_debug, cycles)
             cycles += step_cycles
             self.current_cycles = cycles
+            self.throttle_emulation_if_needed(cycles)
 
             # Check if we've reached max cycles
             if max_cycles is not None and cycles >= max_cycles:
@@ -976,15 +1123,31 @@ class C64:
                         self.rich_interface.add_debug_log(debug_msg)
                 break
             elif self.cpu.state.pc == last_pc:
+                # Check if we're in a graphics mode wait loop
+                mode_info = self.memory.get_display_mode()
+                in_graphics_mode = mode_info['bitmap_mode'] or self.memory.is_sprite_enabled(0)
+                
                 # When the KERNAL ROM is running, input waits can loop inside the ROM.
                 if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
                     stuck_count = 0
                 # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
                 elif self.cpu.state.pc != 0xFFCF:
-                    stuck_count += 1
+                    # Check if it's a simple wait loop (JMP to self or nearby)
+                    opcode = self.memory.read(self.cpu.state.pc)
+                    if opcode == 0x4C:  # JMP absolute
+                        target_low = self.memory.read(self.cpu.state.pc + 1)
+                        target_high = self.memory.read(self.cpu.state.pc + 2)
+                        target = target_low | (target_high << 8)
+                        # Allow JMP * in graphics mode (infinite wait loop)
+                        if in_graphics_mode and abs(target - self.cpu.state.pc) <= 10:
+                            stuck_count = 0
+                        else:
+                            stuck_count += 1
+                    else:
+                        stuck_count += 1
+                    
                     if stuck_count > 1000:
                         if self.debug:
-                            opcode = self.memory.read(self.cpu.state.pc)
                             debug_msg1 = f"⚠️ PC stuck at ${self.cpu.state.pc:04X} (opcode ${opcode:02X}) for {stuck_count} steps"
                             debug_msg2 = "  This usually means an opcode is not implemented or not advancing PC correctly"
                             if self.rich_interface:
@@ -1186,11 +1349,20 @@ class C64:
         
         Returns True if screen was updated, False if unchanged (dirty-check optimization).
         Uses NumPy for fast operations when available, falls back to pure Python.
+        Supports bitmap mode rendering as ASCII art.
         """
+        # Check if we're in bitmap mode
+        mode_info = self.memory.get_display_mode()
+        
+        if mode_info['bitmap_mode']:
+            # Render bitmap mode as ASCII art
+            return self._update_bitmap_screen_ascii(mode_info)
+        
+        # Text mode rendering (original code)
         # Ensure lookup table is initialized
         self._init_screen_code_table()
         
-        screen_base = SCREEN_MEM
+        screen_base = mode_info['screen_base']
         color_base = COLOR_MEM
         
         # Fast dirty-check using bytes comparison
@@ -1243,6 +1415,73 @@ class C64:
                         self.text_screen[row][col] = lookup[char_code]
         
         return True  # Screen was updated
+    
+    def _update_bitmap_screen_ascii(self, mode_info: dict) -> bool:
+        """Render bitmap mode as ASCII art (simplified).
+        
+        Uses Unicode block characters to represent bitmap pixels.
+        Each 8x8 bitmap cell is converted to a 2x2 character block.
+        """
+        # Unicode block characters for different pixel densities
+        BLOCKS = [' ', '░', '▒', '▓', '█']
+        
+        bitmap_base = mode_info['bitmap_base']
+        screen_base = mode_info['screen_base']
+        
+        # For dirty checking, we'll sample the bitmap
+        # (full check would be too expensive for 8000 bytes)
+        sample_bytes = bytes(self.memory.ram[bitmap_base:bitmap_base + 100])
+        if hasattr(self, '_prev_bitmap_sample') and sample_bytes == self._prev_bitmap_sample:
+            return False
+        self._prev_bitmap_sample = sample_bytes
+        
+        with self.screen_lock:
+            # Process 40x25 character blocks
+            # Each block represents an 8x8 pixel area
+            # We'll convert to 2x2 character representation (4x4 pixels per char)
+            for char_row in range(25):
+                for char_col in range(40):
+                    char_index = char_row * 40 + char_col
+                    
+                    # Get bitmap data for this 8x8 block
+                    bitmap_offset = bitmap_base + char_index * 8
+                    
+                    # Sample pixels: count set pixels in top-left 4x4 quadrant
+                    # This gives us a rough density for ASCII representation
+                    # pixel_count ranges from 0 (no pixels) to 16 (all pixels)
+                    # We map this to 5 density levels: 0-3, 4-7, 8-11, 12-15, 16
+                    pixel_count = 0
+                    for y in range(4):
+                        if bitmap_offset + y < len(self.memory.ram):
+                            byte = self.memory.ram[bitmap_offset + y]
+                            # Count bits in upper nibble (left 4 pixels)
+                            pixel_count += bin(byte >> 4).count('1')
+                    
+                    # Map pixel count to block character
+                    # 0 pixels = ' ', 16 pixels = '█'
+                    density = min(4, pixel_count // 4)
+                    char = BLOCKS[density]
+                    
+                    # Get colors from screen RAM
+                    color_data = self.memory.ram[screen_base + char_index]
+                    if mode_info['multicolor']:
+                        # In multicolor mode, use lower nibble for foreground
+                        fg_color = color_data & 0x0F
+                    else:
+                        # In hires mode, use upper nibble for foreground
+                        fg_color = (color_data >> 4) & 0x0F
+                    
+                    # Update text screen
+                    if HAS_NUMPY:
+                        self.text_screen[char_row, char_col] = char
+                        self.text_colors[char_row, char_col] = fg_color
+                        self.text_reversed[char_row, char_col] = False
+                    else:
+                        self.text_screen[char_row][char_col] = char
+                        self.text_colors[char_row][char_col] = fg_color
+                        self.text_reversed[char_row][char_col] = False
+        
+        return True
 
     @classmethod
     def _c64_color_to_rich_rgb(cls, color_code: int) -> str:

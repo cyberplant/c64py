@@ -1,14 +1,24 @@
 # C64 Emulator (Python)
 
-A Commodore 64 emulator implemented in Python with a text-based interface. This emulator focuses on text mode operation and can load and run PRG files, dump memory, and communicate via TCP/UDP.
+A Commodore 64 emulator implemented in Python with both text-based and graphical interfaces. This emulator supports text mode, bitmap graphics modes, sprites, and can load and run PRG files.
 
 ## Features
 
 - **6502 CPU Emulation**: Full 6502 instruction set implementation
 - **Memory Management**: Complete C64 memory map with ROM/RAM mapping
-- **I/O Devices**: VIC, SID, CIA1, CIA2 emulation
+- **I/O Devices**: VIC-II, SID, CIA1, CIA2 emulation
+- **SID Audio Output**: Optional pygame-ce-based SID sound (`--enable-sid`), or higher-accuracy reSID via ctypes (`--enable-resid`; build `resid_c` from `src/resid_wrapper/`)
 - **Text Mode Interface**: Beautiful textual UI using Rich and Textual libraries
-- **Graphics Mode**: Optional pygame window for C64 display output
+- **Graphics Modes**: Full VIC-II graphics mode support
+  - Standard text mode (40x25 characters)
+  - Bitmap mode (320x200 pixels)
+  - Multicolor bitmap mode (160x200 pixels)
+  - Multicolor text mode
+  - Extended color mode
+  - Hardware sprites (8 sprites, 24x21 pixels)
+- **Dual Rendering**:
+  - **--graphics mode**: Full-resolution pygame window with bitmap and sprite support
+  - **Text mode**: ASCII art representation of graphics using Unicode block characters
 - **PRG File Loading**: Load and auto-run Commodore 64 programs
 - **Server Mode**: TCP/UDP server for remote control
 - **Debug Support**: UDP debug logging and detailed debug output
@@ -74,6 +84,8 @@ c64py
 - `--graphics-scale N`: Scale factor for graphics window (default: 2)
 - `--graphics-fps N`: Target FPS for graphics window (default: 30)
 - `--graphics-border N`: Border size in pixels for graphics window (default: 32)
+- `--enable-sid`: Enable SID audio output via pygame-ce
+- `--enable-resid`: Enable reSID-based SID audio (requires building/installing `resid_c.so` / `resid_c.dylib`; see `src/resid_wrapper/README.md`)
 
 ### Examples
 
@@ -102,7 +114,91 @@ Dump memory after execution:
 c64py program.prg --dump-memory memory.prg
 ```
 
-### Server Mode Commands
+Run with graphics window:
+```bash
+c64py program.prg --graphics --graphics-scale 3
+```
+
+## Graphics Mode Support
+
+The emulator supports all VIC-II graphics modes:
+
+### Display Modes
+
+1. **Standard Text Mode** (40x25 characters)
+   - Default mode, 8x8 character cells
+   - 16 colors per character
+   - Controlled by VIC-II registers
+
+2. **Bitmap Mode** (320x200 pixels)
+   - Hi-resolution bitmap graphics
+   - Each pixel can be one of two colors per 8x8 block
+   - Enabled via $D011 bit 5
+
+3. **Multicolor Bitmap Mode** (160x200 pixels)
+   - Lower resolution with 4 colors per 4x8 block
+   - Enabled via $D011 bit 5 + $D016 bit 4
+
+4. **Extended Color Mode**
+   - Text mode with 4 selectable background colors
+   - Enabled via $D011 bit 6
+
+5. **Multicolor Text Mode**
+   - Text mode with multicolor characters
+   - Enabled via $D016 bit 4
+
+### Sprite Support
+
+- 8 hardware sprites (24x21 pixels each)
+- Hi-res and multicolor sprite modes
+- Sprite positioning and colors
+- Sprite enable/disable via $D015
+- Sprite data from memory pointers
+
+### Graphics Rendering
+
+**Pygame Window (--graphics mode):**
+- Full-resolution rendering (320x200 pixels)
+- Proper bitmap and sprite rendering
+- Accurate C64 color palette
+- Scalable window (--graphics-scale option)
+
+**Text Mode (default):**
+- ASCII art representation using Unicode block characters
+- Samples bitmap data to create approximate visualization
+- Uses characters: ░▒▓█ for different pixel densities
+- Maintains color information from C64 palette
+
+### VIC-II Registers
+
+The emulator implements key VIC-II registers:
+- `$D011`: Control Register 1 (bitmap mode, extended color mode)
+- `$D016`: Control Register 2 (multicolor mode)
+- `$D018`: Memory Control (screen/bitmap base addresses)
+- `$D020`: Border color
+- `$D021-$D024`: Background colors
+- `$D015`: Sprite enable
+- `$D027-$D02E`: Sprite colors
+
+### Programming Graphics
+
+Example BASIC program to enable bitmap mode:
+
+```basic
+10 REM ENABLE BITMAP MODE
+20 POKE 53265, PEEK(53265) OR 32
+30 POKE 53272, 8
+40 REM CLEAR BITMAP
+50 FOR I=8192 TO 16191:POKE I,0:NEXT
+60 REM SET COLORS
+70 FOR I=1024 TO 2023:POKE I,16:NEXT
+80 REM DRAW PIXELS
+90 POKE 8192,255
+```
+
+See `programs/bitmap_test.prg` and `programs/graphics_test.bas` for examples.
+
+## Server Mode Commands
 
 When running in server mode (with `--tcp-port` or `--udp-port`), you can send commands:
 
