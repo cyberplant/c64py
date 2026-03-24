@@ -68,7 +68,7 @@ class C64:
         (0xBB, 0xBB, 0xBB),  # 15 light gray
     )
 
-    def __init__(self, interface_factory=None, enable_sid: bool = False):
+    def __init__(self, interface_factory=None, enable_sid: bool = False, enable_resid: bool = False):
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -107,7 +107,20 @@ class C64:
         # Backward compatibility
         self.rich_interface = self.interface
 
-        if enable_sid:
+        if enable_resid:
+            try:
+                from .resid import ReSIDEmulator
+                self.sid = ReSIDEmulator(video_standard=self.memory.video_standard)
+                self.memory.sid = self.sid
+                if self.interface:
+                    self.interface.add_debug_log("🔊 reSID audio enabled (VICE-Team reSID)")
+            except ImportError as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ reSID library not found: {exc}")
+            except Exception as exc:
+                if self.interface:
+                    self.interface.add_debug_log(f"⚠️ reSID initialisation failed: {exc}")
+        elif enable_sid:
             try:
                 from .sid import SidEmulator
                 self.sid = SidEmulator(video_standard=self.memory.video_standard)

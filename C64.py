@@ -95,6 +95,14 @@ def main():
     ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
     ap.add_argument("--enable-sid", action="store_true", help="Enable SID audio output via pygame")
+    ap.add_argument(
+        "--enable-resid",
+        action="store_true",
+        help=(
+            "Enable high-accuracy SID audio via the VICE-Team reSID C++ library "
+            "(requires resid_c.so – see src/resid_wrapper/README.md)"
+        ),
+    )
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
 
@@ -133,7 +141,7 @@ def main():
             border_size=args.graphics_border,
         )
 
-    emu = C64(interface_factory=interface_factory, enable_sid=args.enable_sid)
+    emu = C64(interface_factory=interface_factory, enable_sid=args.enable_sid, enable_resid=args.enable_resid)
     emu.debug = args.debug
     emu.autoquit = args.autoquit
     emu.turbo = args.turbo
