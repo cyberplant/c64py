@@ -3,17 +3,18 @@ FROM pypy:3.10-slim
 
 WORKDIR /app
 
-# Install SDL development libraries and build tools for pygame
+# Install SDL development libraries and build tools for pygame-ce
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev \
+    libportmidi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
 # Note: Skip numpy for PyPy - it has compatibility issues and PyPy's native
 # arrays are often faster anyway due to JIT compilation
 COPY requirements.txt .
-RUN pip install --no-cache-dir rich textual pygame
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application
 COPY . .
