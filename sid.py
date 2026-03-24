@@ -4,6 +4,7 @@ Simplified SID audio emulation with pygame output.
 
 from __future__ import annotations
 
+import signal
 import threading
 import time
 import warnings
@@ -39,6 +40,8 @@ class SidEmulator:
         self._channel = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._current_sound = None  # keep Sound alive while playing
+        self._queued_sound = None   # keep queued Sound alive
 
         self._init_audio(mixer_buffer)
 
@@ -115,6 +118,14 @@ class SidEmulator:
         self._thread.start()
 
     def _audio_worker(self) -> None:
+        # Block all signals in this thread so termination signals are only
+        # handled by the main thread.  pygame installs a signal handler
+        # (pygame_parachute) that calls pygame.quit(), which destroys windows
+        # via Cocoa — that must only happen on the main thread.
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        except (AttributeError, OSError):
+            pass
         while self._running:
             if not self._pygame or not self._pygame.mixer.get_init():
                 break
@@ -138,8 +149,10 @@ class SidEmulator:
             buffer = self._render_buffer()
             sound = self._pygame.mixer.Sound(buffer=buffer)
             if not self._channel.get_busy():
+                self._current_sound = sound
                 self._channel.play(sound)
             else:
+                self._queued_sound = sound
                 self._channel.queue(sound)
 
     def _has_active_output(self) -> bool:
