@@ -28,6 +28,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import signal
 import sys
 import threading
 import time
@@ -240,6 +241,8 @@ class ReSIDEmulator:
 
         # PCM output buffer (shared between audio worker and _render_buffer)
         self._pcm_buf = (ctypes.c_int16 * self._buffer_samples)()
+        self._current_sound = None  # keep Sound alive while playing
+        self._queued_sound = None   # keep queued Sound alive
 
         # pygame mixer
         self._pygame = None
@@ -345,6 +348,14 @@ class ReSIDEmulator:
 
     def _audio_worker(self) -> None:
         """Background thread: render reSID output and feed pygame mixer."""
+        # Block all signals in this thread so termination signals are only
+        # handled by the main thread.  pygame installs a signal handler
+        # (pygame_parachute) that calls pygame.quit(), which destroys windows
+        # via Cocoa — that must only happen on the main thread.
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        except (AttributeError, OSError):
+            pass
         while self._running:
             if not self._pygame or not self._pygame.mixer.get_init():
                 break
@@ -362,8 +373,10 @@ class ReSIDEmulator:
             pcm_bytes = self._render_buffer()
             sound = self._pygame.mixer.Sound(buffer=pcm_bytes)
             if not self._channel.get_busy():
+                self._current_sound = sound
                 self._channel.play(sound)
             else:
+                self._queued_sound = sound
                 self._channel.queue(sound)
 
     def _render_buffer(self) -> bytes:
