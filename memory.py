@@ -3,7 +3,7 @@ C64 Memory Map
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Union
 
 from .constants import (
     ROM_BASIC_START, ROM_BASIC_END,
@@ -18,6 +18,8 @@ from .cpu_state import CIATimer
 
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
+    from .resid import ReSIDEmulator
+    from .sid import SidEmulator
 
 
 @dataclass
@@ -28,6 +30,7 @@ class MemoryMap:
     kernal_rom: Optional[bytes] = None
     char_rom: Optional[bytes] = None
     udp_debug: Optional['UdpDebugLogger'] = None
+    sid: Optional[Union['SidEmulator', 'ReSIDEmulator']] = None
     cia1_timer_a: CIATimer = field(default_factory=CIATimer)
     cia1_timer_b: CIATimer = field(default_factory=CIATimer)
     cia1_icr: int = 0  # Interrupt Control Register
@@ -159,7 +162,9 @@ class MemoryMap:
 
         # SID registers
         if SID_BASE <= addr < SID_BASE + 0x20:
-            return 0  # SID not implemented yet
+            if self.sid:
+                return self.sid.read_register(addr - SID_BASE)
+            return 0
 
         # CIA1
         if CIA1_BASE <= addr < CIA1_BASE + 0x10:
@@ -185,7 +190,9 @@ class MemoryMap:
 
         # SID registers
         if SID_BASE <= addr < SID_BASE + 0x20:
-            return  # SID not implemented yet
+            if self.sid:
+                self.sid.write_register(addr - SID_BASE, value)
+            return
 
         # CIA1
         if CIA1_BASE <= addr < CIA1_BASE + 0x10:

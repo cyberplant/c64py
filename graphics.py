@@ -113,7 +113,24 @@ class PygameInterface:
             raise RuntimeError("Pygame is required for --graphics mode") from exc
 
         self._pygame = pygame
-        pygame.init()
+        # Preserve any mixer settings already applied by the SID emulator.
+        # pygame.init() would reset the mixer to stereo defaults otherwise.
+        mixer = getattr(pygame, "mixer", None)
+        if mixer is None:
+            pygame.init()
+        else:
+            try:
+                mixer_initialized = mixer.get_init()
+            except Exception:
+                mixer_initialized = None
+            if not mixer_initialized:
+                pygame.init()
+            else:
+                for mod in (pygame.display, pygame.font, pygame.joystick, pygame.event):
+                    try:
+                        mod.init()
+                    except Exception:
+                        pass
         pygame.display.set_caption("C64 Emulator (Graphics)")
         self._setup_surfaces()
 
@@ -145,6 +162,9 @@ class PygameInterface:
             self.running = False
             if self.emulator:
                 self.emulator.running = False
+                # Explicitly shutdown SID and other background tasks before pygame.quit()
+                # to avoid race conditions with audio threads calling into a deinitialized mixer.
+                self.emulator.shutdown()
             if self.emulator_thread and self.emulator_thread.is_alive():
                 self.emulator_thread.join()
             pygame.quit()
@@ -202,6 +222,7 @@ class PygameInterface:
         """Run the emulator CPU loop on a background thread."""
         try:
             self.emulator.running = True
+            self.emulator.reset_speed_throttle()
             cycles = 0
             max_cycles = self.max_cycles
             last_pc = None
@@ -230,6 +251,7 @@ class PygameInterface:
                 step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles)
                 cycles += step_cycles
                 self.emulator.current_cycles = cycles
+                self.emulator.throttle_emulation_if_needed(cycles)
 
                 pc = self.emulator.cpu.state.pc
                 if pc == last_pc:

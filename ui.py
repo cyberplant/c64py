@@ -173,6 +173,7 @@ class TextualInterface(App):
         """Run the emulator in background thread"""
         try:
             self.emulator.running = True
+            self.emulator.reset_speed_throttle()
             cycles = 0
             max_cycles = self.max_cycles
             last_pc = None
@@ -203,6 +204,7 @@ class TextualInterface(App):
                 step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles)
                 cycles += step_cycles
                 self.emulator.current_cycles = cycles
+                self.emulator.throttle_emulation_if_needed(cycles)
 
                 # Stuck detection
                 pc = self.emulator.cpu.state.pc
@@ -374,6 +376,7 @@ class TextualInterface(App):
         self.running = False
         if self.emulator:
             self.emulator.running = False
+            self.emulator.shutdown()
         self.exit()
 
     def action_random_screen(self):
