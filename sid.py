@@ -118,17 +118,19 @@ class SidEmulator:
         # Block pygame's C-level signal handlers BEFORE creating the thread so
         # the new thread inherits the mask with no race window.  pygame registers
         # pygame_parachute (which calls pygame.quit → SDL_DestroyWindow → Cocoa)
-        # for SIGTERM/SIGINT/SIGQUIT/SIGHUP; those must only run on the main thread.
+        # for a wide range of signals; those must only run on the main thread.
         _SIG_BLOCK = getattr(signal, 'SIG_BLOCK', None)
         _PYGAME_SIGS = {
-            getattr(signal, s) for s in ('SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP')
-            if hasattr(signal, s)
+            getattr(signal, s) for s in (
+                'SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP',
+                'SIGSEGV', 'SIGILL', 'SIGFPE', 'SIGBUS'
+            ) if hasattr(signal, s)
         }
         _old_mask = None
         if _SIG_BLOCK is not None and _PYGAME_SIGS:
             try:
                 _old_mask = signal.pthread_sigmask(_SIG_BLOCK, _PYGAME_SIGS)
-            except OSError:
+            except (OSError, ValueError):
                 pass
         self._thread = threading.Thread(target=self._audio_worker, daemon=True)
         self._thread.start()

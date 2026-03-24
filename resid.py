@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 import warnings
-from typing import List, Optional
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +188,8 @@ class ReSIDEmulator:
         *,
         video_standard: str = "pal",
         sample_rate: int = 44100,
-        buffer_ms: int = 50,
-        mixer_buffer: int = 512,
+        buffer_ms: int = 80,
+        mixer_buffer: int = 1024,
         chip_model: Optional[str] = None,
         sampling_method: int = SAMPLE_INTERPOLATE,
     ) -> None:
@@ -197,6 +197,19 @@ class ReSIDEmulator:
         self._sid_ptr = self._lib.resid_create()
         if not self._sid_ptr:
             raise RuntimeError("resid_create() returned NULL – out of memory?")
+
+        raw_bm = os.environ.get("RESID_BUFFER_MS")
+        if raw_bm is not None:
+            try:
+                buffer_ms = max(32, int(raw_bm.strip()))
+            except ValueError:
+                pass
+        raw_mb = os.environ.get("RESID_MIXER_BUFFER")
+        if raw_mb is not None:
+            try:
+                mixer_buffer = max(256, int(raw_mb.strip()))
+            except ValueError:
+                pass
 
         self._lock = threading.Lock()
         self._sample_rate = int(sample_rate)
@@ -233,13 +246,10 @@ class ReSIDEmulator:
                 RuntimeWarning,
             )
 
-        # Fractional clock cycle accumulator: cycles owed but not yet fed
-        # to reSID.  We accumulate CPU cycles here and drain in the audio
-        # worker thread.
-        self._cycle_acc: float = 0.0
+        # Fixed chunk of C64 clock cycles per audio buffer (audio thread only).
         self._cycles_per_buffer = self._clock_hz * self._buffer_seconds
 
-        # PCM output buffer (shared between audio worker and _render_buffer)
+        # PCM output buffer (audio thread + resid_clock)
         self._pcm_buf = (ctypes.c_int16 * self._buffer_samples)()
         self._current_sound = None  # keep Sound alive while playing
         self._queued_sound = None   # keep queued Sound alive
@@ -264,6 +274,7 @@ class ReSIDEmulator:
         """Update the SID clock frequency for the given video standard."""
         self._clock_hz = self._clock_for_standard(video_standard)
         with self._lock:
+            self._cycles_per_buffer = self._clock_hz * self._buffer_seconds
             self._lib.resid_set_sampling_parameters(
                 self._sid_ptr,
                 float(self._clock_hz),
@@ -343,17 +354,19 @@ class ReSIDEmulator:
         # Block pygame's C-level signal handlers BEFORE creating the thread so
         # the new thread inherits the mask with no race window.  pygame registers
         # pygame_parachute (which calls pygame.quit → SDL_DestroyWindow → Cocoa)
-        # for SIGTERM/SIGINT/SIGQUIT/SIGHUP; those must only run on the main thread.
+        # for a wide range of signals; those must only run on the main thread.
         _SIG_BLOCK = getattr(signal, 'SIG_BLOCK', None)
         _PYGAME_SIGS = {
-            getattr(signal, s) for s in ('SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP')
-            if hasattr(signal, s)
+            getattr(signal, s) for s in (
+                'SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP',
+                'SIGSEGV', 'SIGILL', 'SIGFPE', 'SIGBUS'
+            ) if hasattr(signal, s)
         }
         _old_mask = None
         if _SIG_BLOCK is not None and _PYGAME_SIGS:
             try:
                 _old_mask = signal.pthread_sigmask(_SIG_BLOCK, _PYGAME_SIGS)
-            except OSError:
+            except (OSError, ValueError):
                 pass
         self._thread = threading.Thread(target=self._audio_worker, daemon=True)
         self._thread.start()
@@ -394,10 +407,8 @@ class ReSIDEmulator:
 
     def _render_buffer(self) -> bytes:
         """Advance reSID by one buffer's worth of clock cycles and return PCM."""
-        # Number of C64 clock cycles to emulate for this buffer
         delta_cycles = int(self._cycles_per_buffer)
         if delta_cycles < 1:
-            # Extremely low sample rate – return silence
             return bytes(self._buffer_samples * 2)
 
         delta_t = ctypes.c_int(delta_cycles)
@@ -415,9 +426,6 @@ class ReSIDEmulator:
         if n <= 0:
             return bytes(self._buffer_samples * 2)
 
-        # Cast the PCM buffer to an array of exactly `n` samples and convert
-        # to bytes, zero-padding to fill the full buffer if reSID produced
-        # fewer samples than requested (can happen at buffer boundaries).
         produced = ctypes.cast(
             self._pcm_buf,
             ctypes.POINTER(ctypes.c_int16 * n),
