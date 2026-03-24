@@ -731,6 +731,8 @@ class CPU6502:
         # Arithmetic
         elif opcode == 0x69:  # ADC imm
             return self._adc_imm()
+        elif opcode == 0x61:  # ADC (zp,X)
+            return self._adc_indx()
         elif opcode == 0x65:  # ADC zp
             return self._adc_zp()
         elif opcode == 0x6D:  # ADC abs
@@ -739,6 +741,8 @@ class CPU6502:
             return self._adc_absy()
         elif opcode == 0x7D:  # ADC abs,X
             return self._adc_absx()
+        elif opcode == 0x71:  # ADC (zp),Y
+            return self._adc_indy()
         elif opcode == 0xE9:  # SBC imm
             return self._sbc_imm()
         elif opcode == 0xE5:  # SBC zp
@@ -818,12 +822,16 @@ class CPU6502:
             return self._and_zp()
         elif opcode == 0x2D:  # AND abs
             return self._and_abs()
+        elif opcode == 0x3D:  # AND abs,X
+            return self._and_absx()
         elif opcode == 0x09:  # ORA imm
             return self._ora_imm()
         elif opcode == 0x05:  # ORA zp
             return self._ora_zp()
         elif opcode == 0x0D:  # ORA abs
             return self._ora_abs()
+        elif opcode == 0x1D:  # ORA abs,X
+            return self._ora_absx()
         elif opcode == 0x19:  # ORA abs,Y
             return self._ora_absy()
         elif opcode == 0x49:  # EOR imm
@@ -832,6 +840,8 @@ class CPU6502:
             return self._eor_zp()
         elif opcode == 0x4D:  # EOR abs
             return self._eor_abs()
+        elif opcode == 0x51:  # EOR (zp),Y
+            return self._eor_indy()
 
         # Compare
         elif opcode == 0xC9:  # CMP imm
@@ -902,6 +912,8 @@ class CPU6502:
             return self._dec_zp()
         elif opcode == 0xCE:  # DEC abs
             return self._dec_abs()
+        elif opcode == 0xDE:  # DEC abs,X
+            return self._dec_absx()
         elif opcode == 0xE8:  # INX
             return self._inx()
         elif opcode == 0xC8:  # INY
@@ -1411,6 +1423,37 @@ class CPU6502:
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
+    def _adc_indx(self) -> int:
+        """ADC ($zp,X) — indexed indirect"""
+        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
+        addr_low = self.memory.read(zp_addr)
+        addr_high = self.memory.read((zp_addr + 1) & 0xFF)
+        addr = addr_low | (addr_high << 8)
+        value = self.memory.read(addr)
+        carry = 1 if self._get_flag(0x01) else 0
+        result = self.state.a + value + carry
+        self._set_flag(0x01, result > 0xFF)
+        self.state.a = result & 0xFF
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6
+
+    def _adc_indy(self) -> int:
+        """ADC ($zp),Y — indirect indexed"""
+        zp_ptr = self.memory.read(self.state.pc + 1)
+        addr_low = self.memory.read(zp_ptr)
+        addr_high = self.memory.read((zp_ptr + 1) & 0xFF)
+        base = addr_low | (addr_high << 8)
+        addr = (base + self.state.y) & 0xFFFF
+        value = self.memory.read(addr)
+        carry = 1 if self._get_flag(0x01) else 0
+        result = self.state.a + value + carry
+        self._set_flag(0x01, result > 0xFF)
+        self.state.a = result & 0xFF
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 5  # +1 if page crossed (not modeled)
+
     def _adc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
         value = self.memory.read(addr)
@@ -1505,6 +1548,14 @@ class CPU6502:
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
+    def _and_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        self.state.a &= self.memory.read(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 4  # +1 if page crossed (not modeled)
+
     def _ora_imm(self) -> int:
         self.state.a |= self.memory.read(self.state.pc + 1)
         self._update_flags(self.state.a)
@@ -1533,6 +1584,14 @@ class CPU6502:
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
+    def _ora_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        self.state.a |= self.memory.read(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 4  # +1 if page crossed (not modeled)
+
     def _eor_imm(self) -> int:
         self.state.a ^= self.memory.read(self.state.pc + 1)
         self._update_flags(self.state.a)
@@ -1552,6 +1611,17 @@ class CPU6502:
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
+
+    def _eor_indy(self) -> int:
+        zp_ptr = self.memory.read(self.state.pc + 1)
+        addr_low = self.memory.read(zp_ptr)
+        addr_high = self.memory.read((zp_ptr + 1) & 0xFF)
+        base = addr_low | (addr_high << 8)
+        addr = (base + self.state.y) & 0xFFFF
+        self.state.a ^= self.memory.read(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 5  # +1 if page crossed (not modeled)
 
     # Compare operations
     def _cmp_imm(self) -> int:
@@ -1664,6 +1734,15 @@ class CPU6502:
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
+
+    def _dec_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        value = (self.memory.read(addr) - 1) & 0xFF
+        self.memory.write(addr, value)
+        self._update_flags(value)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 7  # same as INC abs,X; page-cross penalty not modeled
 
     def _inx(self) -> int:
         self.state.x = (self.state.x + 1) & 0xFF
