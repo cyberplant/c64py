@@ -202,7 +202,7 @@ def main():
 
     try:
         # Set video standard
-        emu.memory.video_standard = args.video_standard
+        emu.set_video_standard(args.video_standard)
         if show_ui_logs:
             emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
