@@ -209,12 +209,29 @@ class TextualInterface(App):
                 # Stuck detection
                 pc = self.emulator.cpu.state.pc
                 if pc == last_pc:
+                    # Check if we're in a graphics mode wait loop
+                    mode_info = self.emulator.memory.get_display_mode()
+                    in_graphics_mode = mode_info['bitmap_mode'] or self.emulator.memory.is_sprite_enabled(0)
+                    
                     # When the KERNAL ROM is running, input waits can loop inside the ROM.
                     if self.emulator.memory.kernal_rom and ROM_KERNAL_START <= pc < ROM_KERNAL_END:
                         stuck_count = 0
                     # CHRIN ($FFCF) blocks when keyboard buffer is empty - this is expected behavior
                     elif pc != 0xFFCF:
-                        stuck_count += 1
+                        # Check if it's a simple wait loop (JMP to self or nearby)
+                        opcode = self.emulator.memory.read(pc)
+                        if opcode == 0x4C:  # JMP absolute
+                            target_low = self.emulator.memory.read(pc + 1)
+                            target_high = self.emulator.memory.read(pc + 2)
+                            target = target_low | (target_high << 8)
+                            # Allow JMP * in graphics mode (infinite wait loop)
+                            if in_graphics_mode and abs(target - pc) <= 10:
+                                stuck_count = 0
+                            else:
+                                stuck_count += 1
+                        else:
+                            stuck_count += 1
+                        
                         if stuck_count > 1000:
                             self.add_debug_log(f"⚠️ PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
                             self.emulator.running = False
