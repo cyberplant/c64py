@@ -188,8 +188,8 @@ class ReSIDEmulator:
         *,
         video_standard: str = "pal",
         sample_rate: int = 44100,
-        buffer_ms: int = 80,
-        mixer_buffer: int = 1024,
+        buffer_ms: int = 50,
+        mixer_buffer: int = 512,
         chip_model: Optional[str] = None,
         sampling_method: int = SAMPLE_INTERPOLATE,
     ) -> None:
@@ -197,19 +197,6 @@ class ReSIDEmulator:
         self._sid_ptr = self._lib.resid_create()
         if not self._sid_ptr:
             raise RuntimeError("resid_create() returned NULL – out of memory?")
-
-        raw_bm = os.environ.get("RESID_BUFFER_MS")
-        if raw_bm is not None:
-            try:
-                buffer_ms = max(32, int(raw_bm.strip()))
-            except ValueError:
-                pass
-        raw_mb = os.environ.get("RESID_MIXER_BUFFER")
-        if raw_mb is not None:
-            try:
-                mixer_buffer = max(256, int(raw_mb.strip()))
-            except ValueError:
-                pass
 
         self._lock = threading.Lock()
         self._sample_rate = int(sample_rate)

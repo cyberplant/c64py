@@ -2,6 +2,10 @@
 C64 Memory Map and I/O Constants
 """
 
+# 6510 CPU / system Φ₂ clock (matches VICE/reSID; used for real-time throttling)
+CPU_CLOCK_PAL_HZ = 985_248
+CPU_CLOCK_NTSC_HZ = 1_022_727
+
 # C64 Memory Map Constants
 ROM_BASIC_START = 0xA000
 ROM_BASIC_END = 0xC000
