@@ -71,12 +71,13 @@ class SidEmulator:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
-        if self._pygame and self._pygame.mixer.get_init():
+        if self._channel:
             try:
-                self._pygame.mixer.stop()
-                self._pygame.mixer.quit()
+                self._channel.stop()
             except Exception:
                 pass
+        self._current_sound = None
+        self._queued_sound = None
 
     def _init_audio(self, mixer_buffer: int) -> None:
         try:
@@ -114,20 +115,30 @@ class SidEmulator:
             )
         self._channel = pygame.mixer.find_channel(True)
         self._running = True
+        # Block pygame's C-level signal handlers BEFORE creating the thread so
+        # the new thread inherits the mask with no race window.  pygame registers
+        # pygame_parachute (which calls pygame.quit → SDL_DestroyWindow → Cocoa)
+        # for SIGTERM/SIGINT/SIGQUIT/SIGHUP; those must only run on the main thread.
+        _SIG_BLOCK = getattr(signal, 'SIG_BLOCK', None)
+        _PYGAME_SIGS = {
+            getattr(signal, s) for s in ('SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP')
+            if hasattr(signal, s)
+        }
+        _old_mask = None
+        if _SIG_BLOCK is not None and _PYGAME_SIGS:
+            try:
+                _old_mask = signal.pthread_sigmask(_SIG_BLOCK, _PYGAME_SIGS)
+            except OSError:
+                pass
         self._thread = threading.Thread(target=self._audio_worker, daemon=True)
         self._thread.start()
+        if _old_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, _old_mask)
+            except OSError:
+                pass
 
     def _audio_worker(self) -> None:
-        # Block signals that trigger pygame's parachute handler (pygame_parachute).
-        # That C-level handler calls pygame.quit() → SDL_DestroyWindow via Cocoa,
-        # which must only happen on the main thread.  We only block the signals
-        # pygame registers: SIGTERM, SIGINT, SIGQUIT, SIGHUP.
-        try:
-            signal.pthread_sigmask(signal.SIG_BLOCK, {
-                signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGHUP,
-            })
-        except (AttributeError, OSError):
-            pass
         while self._running:
             if not self._pygame or not self._pygame.mixer.get_init():
                 break
