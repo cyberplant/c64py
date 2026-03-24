@@ -13,6 +13,7 @@
  */
 
 #include "resid_c.h"
+#include <new>
 
 /*
  * Include the reSID public header.  The exact path depends on how reSID was

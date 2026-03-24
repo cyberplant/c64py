@@ -45,7 +45,8 @@ ifeq ($(RESID_SYSTEM),1)
 else ifneq ($(RESID_SRCDIR),)
     # Headers from a VICE source checkout
     CXXFLAGS += -I$(RESID_SRCDIR)
-    RESID_LIB ?= $(RESID_SRCDIR)/.libs/libresid.a
+    # Prefer a standalone build (libresid.a in the src dir), fall back to VICE's .libs/
+    RESID_LIB := $(or $(wildcard $(RESID_SRCDIR)/libresid.a),$(RESID_SRCDIR)/.libs/libresid.a)
 else
     $(warning Neither RESID_SYSTEM nor RESID_SRCDIR is set.)
     $(warning Using a local 'sid.h' – make sure the reSID source is present.)
@@ -59,6 +60,9 @@ UNAME := $(shell uname)
 ifeq ($(UNAME),Darwin)
     SOEXT    = dylib
     SOFLAGS  = -dynamiclib
+    # On modern macOS, C++ standard library headers live inside the SDK,
+    # not in the toolchain's default include path.
+    CXXFLAGS += -I$(shell xcrun --show-sdk-path)/usr/include/c++/v1
 else
     SOEXT    = so
     SOFLAGS  = -shared
