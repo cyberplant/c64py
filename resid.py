@@ -348,12 +348,14 @@ class ReSIDEmulator:
 
     def _audio_worker(self) -> None:
         """Background thread: render reSID output and feed pygame mixer."""
-        # Block all signals in this thread so termination signals are only
-        # handled by the main thread.  pygame installs a signal handler
-        # (pygame_parachute) that calls pygame.quit(), which destroys windows
-        # via Cocoa — that must only happen on the main thread.
+        # Block signals that trigger pygame's parachute handler (pygame_parachute).
+        # That C-level handler calls pygame.quit() → SDL_DestroyWindow via Cocoa,
+        # which must only happen on the main thread.  We only block the signals
+        # pygame registers: SIGTERM, SIGINT, SIGQUIT, SIGHUP.
         try:
-            signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+            signal.pthread_sigmask(signal.SIG_BLOCK, {
+                signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGHUP,
+            })
         except (AttributeError, OSError):
             pass
         while self._running:
