@@ -274,7 +274,7 @@ class PygameInterface:
                     # SAVE was handled, skip this CPU instruction
                     continue
 
-                step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles)
+                step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles, self.emulator.vice_trace)
                 cycles += step_cycles
                 self.emulator.current_cycles = cycles
                 self.emulator.throttle_emulation_if_needed(cycles)

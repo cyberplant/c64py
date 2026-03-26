@@ -97,6 +97,7 @@ class C64:
         self.debug = False
         self.no_colors = False  # ANSI color output enabled by default
         self.udp_debug = None  # Will be set if UDP debugging is enabled
+        self.vice_trace = None  # Will be set if VICE-compatible tracing is enabled
         self.screen_update_thread = None
         self.screen_update_interval = 0.0167  # Update screen every 16.7ms (60Hz)
         self.screen_lock = threading.Lock()
@@ -1089,7 +1090,7 @@ class C64:
                 # SAVE was handled, skip this CPU instruction
                 continue
 
-            step_cycles = self.cpu.step(self.udp_debug, cycles)
+            step_cycles = self.cpu.step(self.udp_debug, cycles, self.vice_trace)
             cycles += step_cycles
             self.current_cycles = cycles
             self.throttle_emulation_if_needed(cycles)

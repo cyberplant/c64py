@@ -6,6 +6,11 @@ from __future__ import annotations
 
 from typing import Optional, TYPE_CHECKING
 
+try:
+    from .debug import OPCODE_SIZES
+except ImportError:
+    from debug import OPCODE_SIZES
+
 from .constants import (
     SCREEN_MEM,
     COLOR_MEM,
@@ -109,6 +114,10 @@ class CPU6502:
         self._set_flag(0x02, value == 0)  # Z flag
         self._set_flag(0x80, (value & 0x80) != 0)  # N flag
 
+    def _page_crossed(self, base: int, offset: int) -> bool:
+        """Check if adding offset to base crosses a page boundary"""
+        return (base & 0xFF00) != ((base + offset) & 0xFF00)
+
     def _adc_finish(self, old_a: int, value: int, wide_result: int) -> None:
         """Set C, V, Z, N and A from ADC wide sum (old A + memory + carry-in)."""
         self._set_flag(0x01, wide_result > 0xFF)
@@ -141,7 +150,8 @@ class CPU6502:
             if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
                 self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
-    def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0) -> int:
+    def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0, 
+             vice_trace: Optional['ViceTraceLogger'] = None) -> int:
         """Execute one instruction, return cycles"""
         self.current_cycles = current_cycles
         if self.state.stopped:
@@ -157,10 +167,8 @@ class CPU6502:
         # Note: cycles haven't been incremented yet, so we log the current cycle count
         # The actual cycles for this instruction will be returned and added later
         if udp_debug and udp_debug.enabled:
-            # Sample logging to avoid queue overflow (log every 100 cycles or important events)
-            should_log = (self.state.cycles % 100 == 0) or (opcode == 0x00)  # Log BRK instructions
-
-            should_log = (self.state.cycles > 2020000)
+            # Sample logging to avoid queue overflow (log every 1000 cycles or important events)
+            should_log = (self.state.cycles % 1000 == 0) or (opcode == 0x00)  # Log BRK instructions
 
             if should_log:
                 # Minimal data to reduce JSON/serialization overhead
@@ -169,6 +177,16 @@ class CPU6502:
                     'opcode': opcode,
                     'cycles': self.state.cycles
                 })
+        
+        # Log to VICE-compatible trace file if enabled
+        if vice_trace and vice_trace.enabled:
+            size = OPCODE_SIZES.get(opcode, 1)
+            operand_bytes = [self.memory.read(pc + i) for i in range(1, size)]
+            vice_trace.log_instruction(
+                pc, opcode, operand_bytes,
+                self.state.a, self.state.x, self.state.y, self.state.sp,
+                self.state.p, self.state.cycles
+            )
 
 
         # Special handling for CINT when no KERNAL ROM is loaded.
@@ -650,7 +668,7 @@ class CPU6502:
             self.state.a = self.memory.read(addr)
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
-            return 4
+            return 5 if self._page_crossed(base, self.state.x) else 4
         elif opcode == 0xB9:  # LDA absy
             return self._lda_absy()
         elif opcode == 0xA1:  # LDA indx
@@ -675,7 +693,7 @@ class CPU6502:
             self.state.x = self.memory.read(addr)
             self._update_flags(self.state.x)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
-            return 4
+            return 5 if self._page_crossed(base, self.state.y) else 4
         elif opcode == 0xA0:  # LDY imm
             return self._ldy_imm()
         elif opcode == 0xA4:  # LDY zp
@@ -795,7 +813,7 @@ class CPU6502:
             self.state.a = result & 0xFF
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
-            return 5  # +1 if page crossed (ignored)
+            return 6 if self._page_crossed(base, self.state.y) else 5
         elif opcode == 0xED:  # SBC abs
             return self._sbc_abs()
         elif opcode == 0xFD:  # SBC absx
@@ -809,7 +827,7 @@ class CPU6502:
             self.state.a = result & 0xFF
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
-            return 4
+            return 5 if self._page_crossed(base, self.state.x) else 4
         elif opcode == 0xF9:  # SBC absy
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.y) & 0xFFFF
@@ -821,7 +839,7 @@ class CPU6502:
             self.state.a = result & 0xFF
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
-            return 4  # +1 cycle if page boundary crossed, but we'll ignore for simplicity
+            return 5 if self._page_crossed(base, self.state.y) else 4
 
         # Logic
         elif opcode == 0x29:  # AND imm
@@ -866,7 +884,7 @@ class CPU6502:
             self._set_flag(0x01, self.state.a >= value)
             self._update_flags(result)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
-            return 4
+            return 5 if self._page_crossed(base, self.state.x) else 4
         elif opcode == 0xD9:  # CMP absy
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.y) & 0xFFFF
@@ -909,7 +927,7 @@ class CPU6502:
             self._set_flag(0x01, self.state.a >= value)
             self._update_flags(result)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
-            return 5
+            return 6 if self._page_crossed(base, self.state.y) else 5
 
         # Increment/Decrement
         elif opcode == 0xE6:  # INC zp
@@ -1054,7 +1072,7 @@ class CPU6502:
             self.state.x = self.state.a
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
-            return 4
+            return 5 if self._page_crossed(base, self.state.y) else 4
         elif opcode == 0xFF:  # ISC absx (undocumented - increment memory, then subtract with carry)
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
@@ -1268,7 +1286,7 @@ class CPU6502:
         self.state.a = self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4
+        return 5 if self._page_crossed(base, self.state.x) else 4
 
     def _lda_absy(self) -> int:
         base = self._read_word(self.state.pc + 1)
@@ -1276,7 +1294,7 @@ class CPU6502:
         self.state.a = self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4
+        return 5 if self._page_crossed(base, self.state.y) else 4
 
     def _lda_indx(self) -> int:
         zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
@@ -1293,7 +1311,7 @@ class CPU6502:
         self.state.a = self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
-        return 5
+        return 6 if self._page_crossed(base, self.state.y) else 5
 
     def _ldx_imm(self) -> int:
         self.state.x = self.memory.read(self.state.pc + 1)
@@ -1456,7 +1474,7 @@ class CPU6502:
         result = old_a + value + carry
         self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
-        return 5  # +1 if page crossed (not modeled)
+        return 6 if self._page_crossed(base, self.state.y) else 5
 
     def _adc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
@@ -1478,7 +1496,7 @@ class CPU6502:
         result = old_a + value + carry
         self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4  # +1 cycle if page boundary crossed, but we'll ignore for simplicity
+        return 5 if self._page_crossed(base, self.state.x) else 4
 
     def _adc_absy(self) -> int:
         """ADC (Add with Carry) absolute,Y"""
@@ -1490,7 +1508,7 @@ class CPU6502:
         result = old_a + value + carry
         self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4  # +1 cycle if page boundary crossed, but we'll ignore for simplicity
+        return 5 if self._page_crossed(base, self.state.y) else 4
 
     def _sbc_imm(self) -> int:
         value = self.memory.read(self.state.pc + 1)
@@ -1555,7 +1573,7 @@ class CPU6502:
         self.state.a &= self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4  # +1 if page crossed (not modeled)
+        return 5 if self._page_crossed(base, self.state.x) else 4
 
     def _ora_imm(self) -> int:
         self.state.a |= self.memory.read(self.state.pc + 1)
@@ -1583,7 +1601,7 @@ class CPU6502:
         self.state.a |= self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4
+        return 5 if self._page_crossed(base, self.state.y) else 4
 
     def _ora_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
@@ -1591,7 +1609,7 @@ class CPU6502:
         self.state.a |= self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
-        return 4  # +1 if page crossed (not modeled)
+        return 5 if self._page_crossed(base, self.state.x) else 4
 
     def _eor_imm(self) -> int:
         self.state.a ^= self.memory.read(self.state.pc + 1)
@@ -1622,7 +1640,7 @@ class CPU6502:
         self.state.a ^= self.memory.read(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
-        return 5  # +1 if page crossed (not modeled)
+        return 6 if self._page_crossed(base, self.state.y) else 5
 
     # Compare operations
     def _cmp_imm(self) -> int:
@@ -1955,8 +1973,11 @@ class CPU6502:
         if offset & 0x80:
             offset = offset - 256
         if condition:
-            self.state.pc = (self.state.pc + 2 + offset) & 0xFFFF
-            return 3
+            old_pc = self.state.pc + 2
+            new_pc = (old_pc + offset) & 0xFFFF
+            self.state.pc = new_pc
+            # +1 for branch taken, +1 more if page crossed
+            return 4 if (old_pc & 0xFF00) != (new_pc & 0xFF00) else 3
         else:
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 2

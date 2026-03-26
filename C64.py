@@ -22,7 +22,7 @@ from typing import Optional
 
 # Handle both direct execution and module import
 try:
-    from .debug import UdpDebugLogger
+    from .debug import UdpDebugLogger, ViceTraceLogger
     from .emulator import C64
     from .server import EmulatorServer
     from .constants import (
@@ -39,7 +39,7 @@ try:
 except ImportError:
     # When run directly, add parent directory to path
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from c64py.debug import UdpDebugLogger
+    from c64py.debug import UdpDebugLogger, ViceTraceLogger
     from c64py.emulator import C64
     from c64py.server import EmulatorServer
     from c64py.constants import (
@@ -130,6 +130,7 @@ def main():
     )
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
+    ap.add_argument("--vice-trace", type=str, metavar="FILE", help="Write VICE-compatible CPU trace to FILE for comparison debugging")
 
     args = ap.parse_args()
     
@@ -200,6 +201,15 @@ def main():
     # Pass UDP debug logger to memory
     if emu.udp_debug:
         emu.memory.udp_debug = emu.udp_debug
+
+    # Setup VICE-compatible trace logging if requested
+    vice_trace = None
+    if args.vice_trace:
+        vice_trace = ViceTraceLogger(filename=args.vice_trace)
+        vice_trace.enable()
+        emu.vice_trace = vice_trace
+        if show_ui_logs:
+            emu.interface.add_debug_log(f"📝 VICE trace logging to: {args.vice_trace}")
 
     try:
         # Video standard (memory + SID/reSID clock when audio is enabled)
@@ -417,6 +427,11 @@ def main():
         # Close UDP debug logger (flush all pending messages)
         if emu.udp_debug:
             emu.udp_debug.close()
+        
+        # Close VICE trace logger
+        if vice_trace:
+            vice_trace.close()
+            print(f"VICE trace written to: {args.vice_trace}")
     finally:
         emu.shutdown()
 
