@@ -1114,14 +1114,9 @@ class CPU6502:
             self.state.pc = (self.state.pc + 1) & 0xFFFF
             return 2
         elif opcode == 0x58:  # CLI
-            # Clear any pending interrupts before enabling
-            self.memory.pending_irq = False
+            # Enable interrupts - if there's a pending IRQ, it will trigger on next cycle
             self._set_flag(0x04, False)
             self.state.pc = (self.state.pc + 1) & 0xFFFF
-            # Increment CLI counter instead of logging each time
-            if not hasattr(self, 'cli_count'):
-                self.cli_count = 0
-            self.cli_count += 1
             return 2
         elif opcode == 0x78:  # SEI
             self._set_flag(0x04, True)
