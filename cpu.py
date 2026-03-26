@@ -566,26 +566,26 @@ class CPU6502:
             return 20  # Approximate cycles for CHROUT
 
         cycles = self._execute_opcode(opcode)
+        
+        # Update VIC-II raster line first (may generate badline cycles)
+        self._advance_raster(cycles)
+        
+        # Add badline cycles (VIC steals CPU cycles on badlines)
+        if self.memory.badline_cycles > 0:
+            cycles += self.memory.badline_cycles
+            self.memory.badline_cycles = 0
+        
+        # Now update total cycle count with badline cycles included
         self.state.cycles += cycles
 
-        # Update CIA timers
+        # Update CIA timers with total cycles (including badlines)
         self._update_cia_timers(cycles)
-
-        # Update VIC-II raster line (simulate video timing)
-        self._advance_raster(cycles)
-
-        # Jiffy clock is now handled by CIA timer interrupts
 
         # Check for pending IRQ (only if interrupts are enabled)
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
             # Only handle CIA interrupts for now, skip VIC
             if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
                 self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
-
-        # Add badline cycles (VIC steals CPU cycles on badlines)
-        if self.memory.badline_cycles > 0:
-            cycles += self.memory.badline_cycles
-            self.memory.badline_cycles = 0
 
         return cycles
 
