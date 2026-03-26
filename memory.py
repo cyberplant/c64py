@@ -242,8 +242,14 @@ class MemoryMap:
 
     def _read_cia1(self, reg: int) -> int:
         """Read CIA1 register"""
+        # Port A (directly connected to keyboard columns and joystick 2)
+        if reg == 0x00:
+            return 0xFF  # No keys pressed / joystick idle
+        # Port B (keyboard rows and joystick 1)
+        elif reg == 0x01:
+            return 0xFF  # No keys pressed / joystick idle
         # Timer A low byte
-        if reg == 0x04:
+        elif reg == 0x04:
             return self.cia1_timer_a.counter & 0xFF
         # Timer A high byte
         elif reg == 0x05:
