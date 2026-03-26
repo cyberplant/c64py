@@ -160,6 +160,8 @@ class ViceTraceLogger:
     def _format_operand(self, opcode: int, operand_bytes: list) -> str:
         """Format operand based on addressing mode"""
         mode = OPCODE_MODES.get(opcode, 'imp')
+        if mode == 'acc':
+            return 'A'
         if not operand_bytes:
             return ''
         
@@ -195,8 +197,6 @@ class ViceTraceLogger:
                 offset -= 0x100  # Convert to signed
             target = (self._current_pc + 2 + offset) & 0xFFFF
             return f'${target:04X}'
-        elif mode == 'acc':
-            return 'A'
         return ''
     
     def close(self) -> None:
