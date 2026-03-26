@@ -39,6 +39,7 @@ class MemoryMap:
     video_standard: str = "pal"  # "pal" or "ntsc"
     raster_line: int = 300  # Current raster line (start high so it wraps to 0)
     raster_cycles: int = 0  # Cycle counter for raster timing
+    badline_cycles: int = 0  # Extra cycles stolen by VIC on badlines
     vic_interrupt_state: int = 0  # VIC interrupt state for D019
     jiffy_cycles: int = 0  # Cycle counter for jiffy clock
     _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))

@@ -133,7 +133,26 @@ class CPU6502:
         self.memory.raster_cycles += step_cycles
         while self.memory.raster_cycles >= cycles_per_line:
             self.memory.raster_cycles -= cycles_per_line
+            old_line = self.memory.raster_line
             self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+            # Check for badline on the new line
+            new_line = self.memory.raster_line
+            if self._is_badline(new_line):
+                # VIC steals ~40 cycles on badlines
+                self.memory.badline_cycles += 40
+    
+    def _is_badline(self, line: int) -> bool:
+        """Check if the current raster line is a badline"""
+        # Badlines only occur in visible area (lines 48-247 for PAL)
+        if line < 48 or line > 247:
+            return False
+        # Check if display is enabled (DEN bit in $D011)
+        d011 = self.memory.peek_vic(0x11)
+        if not (d011 & 0x10):  # DEN bit
+            return False
+        # Badline when lower 3 bits of raster match YSCROLL
+        yscroll = d011 & 0x07
+        return (line & 0x07) == yscroll
 
     def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Advance timers/video/IRQs even if CPU is 'blocked'."""
@@ -562,6 +581,11 @@ class CPU6502:
             # Only handle CIA interrupts for now, skip VIC
             if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
                 self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
+
+        # Add badline cycles (VIC steals CPU cycles on badlines)
+        if self.memory.badline_cycles > 0:
+            cycles += self.memory.badline_cycles
+            self.memory.badline_cycles = 0
 
         return cycles
 
