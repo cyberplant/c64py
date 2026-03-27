@@ -39,6 +39,16 @@ _BUS_WRITE = 2
 # 6502 relative branch opcodes (all bus cycles are reads; 2/3/4 cycles).
 _BRANCH_OPCODES = frozenset({0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0})
 
+# Indexed read / ALU path (not RMW, not store): every cycle is a bus read.
+_ABS_X_READ = frozenset({
+    0x1D, 0x3D, 0x5D, 0x7D, 0xBD, 0xDD, 0xFD, 0xBC,
+})  # ORA/AND/EOR/ADC/LDA/CMP/SBC abs,X ; LDY abs,X
+_ABS_Y_READ = frozenset({
+    0x19, 0x39, 0x59, 0x79, 0xB9, 0xD9, 0xF9, 0xBE,
+})  # ORA/AND/EOR/ADC/LDA/CMP/SBC abs,Y ; LDX abs,Y
+_IND_Y_READ = frozenset({0x11, 0x31, 0x51, 0x71, 0xB1, 0xD1, 0xF1})
+_IND_X_READ = frozenset({0x01, 0x21, 0x41, 0x61, 0xA1, 0xC1, 0xE1})
+
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
 
@@ -75,6 +85,7 @@ class CPU6502:
         d012 = self.memory.peek_vic(0x12)
         self.vic.set_d011(d011, (self.memory.raster_line >> 8) & 1)
         self.vic.set_d012(d012)
+        self.vic.sprite_enable_mask = self.memory.peek_vic(0x15) & 0xFF
 
         ba_low, ba_blocks_cpu, irq_edge = self.vic.tick()
 
@@ -136,8 +147,8 @@ class CPU6502:
                 pass  # Executor cycle count is authoritative (IRQ / self-modify).
             return [_BUS_READ] * cycles
 
-        # LDA abs,X / abs,Y and LDA (zp),Y — all cycles are reads (4/5 or 5/6 with page cross).
-        if opcode == 0xBD and cycles in (4, 5):  # LDA abs,X
+        # ORA/AND/EOR/ADC/LDA/CMP/SBC/LDY abs,X ; LDX abs,Y ; (zp),Y ; (zp,X) — all reads.
+        if opcode in _ABS_X_READ and cycles in (4, 5):
             lo = self.memory.read((pc0 + 1) & 0xFFFF)
             hi = self.memory.read((pc0 + 2) & 0xFFFF)
             base = lo | (hi << 8)
@@ -146,7 +157,7 @@ class CPU6502:
             if expect != cycles:
                 pass
             return [_BUS_READ] * cycles
-        if opcode == 0xB9 and cycles in (4, 5):  # LDA abs,Y
+        if opcode in _ABS_Y_READ and cycles in (4, 5):
             lo = self.memory.read((pc0 + 1) & 0xFFFF)
             hi = self.memory.read((pc0 + 2) & 0xFFFF)
             base = lo | (hi << 8)
@@ -155,7 +166,7 @@ class CPU6502:
             if expect != cycles:
                 pass
             return [_BUS_READ] * cycles
-        if opcode == 0xB1 and cycles in (5, 6):  # LDA (zp),Y
+        if opcode in _IND_Y_READ and cycles in (5, 6):
             zp = self.memory.read((pc0 + 1) & 0xFFFF)
             lo = self.memory.read(zp & 0xFFFF)
             hi = self.memory.read((zp + 1) & 0xFFFF)
@@ -165,7 +176,7 @@ class CPU6502:
             if expect != cycles:
                 pass
             return [_BUS_READ] * cycles
-        if opcode == 0xA1 and cycles == 6:  # LDA (zp,X)
+        if opcode in _IND_X_READ and cycles == 6:
             return [_BUS_READ] * cycles
 
         # Stores: last cycle is a write (simplified).

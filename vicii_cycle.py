@@ -105,6 +105,9 @@ class ViciiCycleEngine:
     first_dma_line: int = 48
     last_dma_line: int = 247
 
+    # $D015 sprite enable bits (set each tick from MemoryMap by CPU); 0 = no sprite BA.
+    sprite_enable_mask: int = 0
+
     def set_d011(self, d011: int, current_raster_msb: int) -> None:
         self.ysmooth = d011 & 0x07
         self.den = (d011 & 0x10) != 0
@@ -160,7 +163,9 @@ class ViciiCycleEngine:
 
         sprite_ba_mask, fetch_ba, _phi2_fetch_c, _visible = PAL_6569R3_CYCLE_TABLE[self.raster_cycle]
 
-        ba_low = bool(self.bad_line and fetch_ba)
+        ba_matrix = bool(self.bad_line and fetch_ba)
+        sprite_ba = (sprite_ba_mask & self.sprite_enable_mask) != 0
+        ba_low = ba_matrix or sprite_ba
 
         # Prefetch handling (VICE: BA transition low starts a 3-cycle delay before Phi2 access)
         if ba_low:
@@ -168,9 +173,6 @@ class ViciiCycleEngine:
                 self.prefetch_cycles -= 1
         else:
             self.prefetch_cycles = 4  # 3 + 1 (VICE comment)
-
-        # Sprite BA is not yet modeled (kept for future extension)
-        _ = sprite_ba_mask
 
         ba_blocks_cpu = ba_low and (self.prefetch_cycles == 0)
 
