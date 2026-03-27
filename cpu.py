@@ -31,6 +31,11 @@ from .constants import (
 from .cpu_state import CPUState
 from .memory import MemoryMap
 
+# Per 6502 instruction cycle: bus activity for BA vs CPU (VICE-style: stall only on reads).
+_BUS_INTERNAL = 0
+_BUS_READ = 1
+_BUS_WRITE = 2
+
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
 
@@ -79,13 +84,13 @@ class CPU6502:
 
         return ba_low, ba_blocks_cpu, irq_edge
 
-    def _bus_cycle_pattern(self, opcode: int, cycles: int) -> list[bool]:
-        """Return a per-cycle is_read pattern for BA-aware stalling.
+    def _bus_cycle_phases(self, opcode: int, cycles: int) -> list[int]:
+        """Per-cycle bus phase for BA-aware stalling: INTERNAL / READ / WRITE.
 
-        This is intentionally incomplete, but covers the hot opcodes seen in the Bruce Lee
-        trace loops (LDA/STA/branches/inc/rol/etc.). Unknown opcodes default to all-read.
+        Unknown opcodes default to all READ (conservative). VICE stalls the CPU when BA
+        blocks the bus and this cycle is a read (Phi2); writes and internal cycles do not stall.
         """
-        is_read = [True] * max(0, cycles)
+        ph = [_BUS_READ] * max(0, cycles)
 
         # Stores: last cycle is a write (simplified).
         store_opcodes = {
@@ -104,12 +109,12 @@ class CPU6502:
         }
 
         if opcode in store_opcodes and cycles >= 1:
-            is_read[-1] = False
+            ph[-1] = _BUS_WRITE
         elif opcode in rmw_opcodes and cycles >= 2:
-            is_read[-1] = False
-            is_read[-2] = False
+            ph[-1] = _BUS_WRITE
+            ph[-2] = _BUS_WRITE
 
-        # Implied/accumulator ops often have an internal (no-bus) cycle 2.
+        # Implied/accumulator 2-cycle ops: second cycle is internal (no bus).
         implied_internal_2 = {
             0xCA, 0x88, 0xE8, 0xC8,  # DEX/DEY/INX/INY
             0x18, 0x38, 0x58, 0x78,  # CLC/SEC/CLI/SEI
@@ -117,64 +122,43 @@ class CPU6502:
             0xEA,                    # NOP
             0xAA, 0xA8, 0x8A, 0x98,  # TAX/TAY/TXA/TYA
             0xBA, 0x9A,              # TSX/TXS
-            0x48, 0x68, 0x08, 0x28,  # PHA/PLA/PHP/PLP (approx; only the push/pull touches bus)
         }
         acc_shift_rotate = {0x0A, 0x2A, 0x4A, 0x6A}  # ASL/ROL/LSR/ROR A
         if cycles == 2 and (opcode in implied_internal_2 or opcode in acc_shift_rotate):
-            is_read[1] = False
-
-        # Branches: treat as reads (no writes); taken branches add internal reads.
-        # We leave as all-read.
+            ph[1] = _BUS_INTERNAL
 
         # JSR: cycles 4-5 are writes (push return address).
         if opcode == 0x20 and cycles >= 6:
-            is_read[3] = False
-            is_read[4] = False
+            ph[3] = _BUS_WRITE
+            ph[4] = _BUS_WRITE
 
         # RTS: first 3 cycles are reads, then reads; no writes (leave all-read).
         if opcode == 0x60 and cycles >= 6:
             # One internal cycle during return address increment.
-            is_read[4] = False
+            ph[4] = _BUS_INTERNAL
 
         # RTI: pulls P/PC (reads).
         if opcode == 0x40 and cycles >= 6:
             # One internal cycle after pulling PC.
-            is_read[4] = False
+            ph[4] = _BUS_INTERNAL
 
         # BRK: pushes PC/P (writes) on cycles 3-5 (7 cycles total).
         if opcode == 0x00 and cycles >= 7:
-            is_read[2] = False
-            is_read[3] = False
-            is_read[4] = False
+            ph[2] = _BUS_WRITE
+            ph[3] = _BUS_WRITE
+            ph[4] = _BUS_WRITE
 
         # PHA/PHP: last cycle write.
         if opcode in (0x48, 0x08) and cycles >= 3:
-            # Middle cycle is internal.
-            if cycles >= 2:
-                is_read[1] = False
-            is_read[-1] = False
+            ph[1] = _BUS_INTERNAL
+            ph[-1] = _BUS_WRITE
 
         # PLA/PLP: 4 cycles, with internal cycles around the stack read.
         if opcode in (0x68, 0x28) and cycles >= 4:
-            is_read[1] = False
-            is_read[3] = False
+            ph[1] = _BUS_INTERNAL
+            ph[3] = _BUS_INTERNAL
 
-        # JSR already handled above.
-
-        # Stack pulls are reads only (PLA/PLP).
-        # (No change needed, keep all reads.)
-
-        # Subroutine/interrupt returns are reads only (RTS/RTI).
-        # (No change needed, keep all reads.)
-
-        # Absolute indexed stores often perform a dummy read before the final write.
-        # We model this minimally by ensuring only the final cycle is treated as write
-        # (already done by store_opcodes), keeping the dummy cycle as a read.
-        # (No extra pattern info needed here.)
-
-        # Stack pushes in JSR/BRK/IRQ-like sequences are writes, but we keep them as reads
-        # here; it mainly affects BA timing on rare boundaries.
-        return is_read
+        return ph
 
     def enable_trace(self, size: int = 1024) -> None:
         self.trace_enabled = True
@@ -680,19 +664,19 @@ class CPU6502:
             return 20  # Approximate cycles for CHROUT
 
         cycles = self._execute_opcode(opcode)
-        pattern = self._bus_cycle_pattern(opcode, cycles)
+        pattern = self._bus_cycle_phases(opcode, cycles)
 
         elapsed = 0
         for i in range(cycles):
-            is_read = pattern[i] if i < len(pattern) else True
+            bus_phase = pattern[i] if i < len(pattern) else _BUS_READ
             while True:
-                ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
+                _ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
                 self.state.cycles += 1
                 self._update_cia_timers(1)
                 elapsed += 1
 
-                # Stall CPU only on read cycles while BA is low (VICE behavior).
-                if ba_blocks_cpu and is_read:
+                # Stall CPU only on read cycles while BA blocks (VICE behavior).
+                if ba_blocks_cpu and bus_phase == _BUS_READ:
                     continue
                 break
 
@@ -769,26 +753,26 @@ class CPU6502:
 
         vector = {"lo": 0, "hi": 0}
 
-        def _irq_cycle(is_read: bool, do_bus) -> None:
+        def _irq_cycle(bus_phase: int, do_bus) -> None:
             while True:
                 _ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
                 self.state.cycles += 1
                 self._update_cia_timers(1)
-                if ba_blocks_cpu and is_read:
+                if ba_blocks_cpu and bus_phase == _BUS_READ:
                     continue
                 break
             do_bus()
 
         # 1-2: dummy opcode fetches (we don't care what is read)
-        _irq_cycle(True, lambda: self.memory.read(self.state.pc))
-        _irq_cycle(True, lambda: self.memory.read(self.state.pc))
+        _irq_cycle(_BUS_READ, lambda: self.memory.read(self.state.pc))
+        _irq_cycle(_BUS_READ, lambda: self.memory.read(self.state.pc))
 
         # 3-5: stack pushes (writes are not stalled by BA in our model)
-        _irq_cycle(False, lambda: self.memory.write(0x100 + self.state.sp, pch))
+        _irq_cycle(_BUS_WRITE, lambda: self.memory.write(0x100 + self.state.sp, pch))
         self.state.sp = (self.state.sp - 1) & 0xFF
-        _irq_cycle(False, lambda: self.memory.write(0x100 + self.state.sp, pcl))
+        _irq_cycle(_BUS_WRITE, lambda: self.memory.write(0x100 + self.state.sp, pcl))
         self.state.sp = (self.state.sp - 1) & 0xFF
-        _irq_cycle(False, lambda: self.memory.write(0x100 + self.state.sp, status))
+        _irq_cycle(_BUS_WRITE, lambda: self.memory.write(0x100 + self.state.sp, status))
         self.state.sp = (self.state.sp - 1) & 0xFF
 
         # Set interrupt disable flag (effective after pushing P on real 6502; close enough here)
@@ -801,8 +785,8 @@ class CPU6502:
         def _read_vec_hi() -> None:
             vector["hi"] = self.memory.read((IRQ_VECTOR_HW + 1) & 0xFFFF)
 
-        _irq_cycle(True, _read_vec_lo)
-        _irq_cycle(True, _read_vec_hi)
+        _irq_cycle(_BUS_READ, _read_vec_lo)
+        _irq_cycle(_BUS_READ, _read_vec_hi)
 
         irq_addr = vector["lo"] | (vector["hi"] << 8)
         self.state.pc = irq_addr
