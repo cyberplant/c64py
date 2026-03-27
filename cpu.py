@@ -36,6 +36,9 @@ _BUS_INTERNAL = 0
 _BUS_READ = 1
 _BUS_WRITE = 2
 
+# 6502 relative branch opcodes (all bus cycles are reads; 2/3/4 cycles).
+_BRANCH_OPCODES = frozenset({0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0})
+
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
 
@@ -84,13 +87,86 @@ class CPU6502:
 
         return ba_low, ba_blocks_cpu, irq_edge
 
-    def _bus_cycle_phases(self, opcode: int, cycles: int) -> list[int]:
+    @staticmethod
+    def _branch_condition(opcode: int, p: int) -> bool:
+        """Whether a relative branch would be taken, from P before the instruction."""
+        c = p & 0x01
+        z = p & 0x02
+        n = p & 0x80
+        v = p & 0x40
+        if opcode == 0x90:  # BCC
+            return c == 0
+        if opcode == 0xB0:  # BCS
+            return c != 0
+        if opcode == 0xF0:  # BEQ
+            return z != 0
+        if opcode == 0xD0:  # BNE
+            return z == 0
+        if opcode == 0x10:  # BPL
+            return n == 0
+        if opcode == 0x30:  # BMI
+            return n != 0
+        if opcode == 0x50:  # BVC
+            return v == 0
+        if opcode == 0x70:  # BVS
+            return v != 0
+        return False
+
+    def _bus_cycle_phases(
+        self, opcode: int, cycles: int, pc0: int, p0: int, x0: int, y0: int
+    ) -> list[int]:
         """Per-cycle bus phase for BA-aware stalling: INTERNAL / READ / WRITE.
 
-        Unknown opcodes default to all READ (conservative). VICE stalls the CPU when BA
-        blocks the bus and this cycle is a read (Phi2); writes and internal cycles do not stall.
+        `pc0`, `p0`, `x0`, `y0` are CPU state *before* the instruction executes (used for
+        branch/indexed refinements). Unknown opcodes default to all READ (conservative).
         """
         ph = [_BUS_READ] * max(0, cycles)
+
+        # Relative branches: every cycle is a memory read (2 not taken, 3 taken, +1 page cross).
+        if opcode in _BRANCH_OPCODES and cycles in (2, 3, 4):
+            off = self.memory.read((pc0 + 1) & 0xFFFF)
+            rel = off - 256 if (off & 0x80) else off
+            npc = (pc0 + 2) & 0xFFFF
+            if self._branch_condition(opcode, p0):
+                dest = (npc + rel) & 0xFFFF
+                expect = 4 if (npc & 0xFF00) != (dest & 0xFF00) else 3
+            else:
+                expect = 2
+            if expect != cycles:
+                pass  # Executor cycle count is authoritative (IRQ / self-modify).
+            return [_BUS_READ] * cycles
+
+        # LDA abs,X / abs,Y and LDA (zp),Y — all cycles are reads (4/5 or 5/6 with page cross).
+        if opcode == 0xBD and cycles in (4, 5):  # LDA abs,X
+            lo = self.memory.read((pc0 + 1) & 0xFFFF)
+            hi = self.memory.read((pc0 + 2) & 0xFFFF)
+            base = lo | (hi << 8)
+            page_cross = (base & 0xFF00) != ((base + x0) & 0xFF00)
+            expect = 5 if page_cross else 4
+            if expect != cycles:
+                pass
+            return [_BUS_READ] * cycles
+        if opcode == 0xB9 and cycles in (4, 5):  # LDA abs,Y
+            lo = self.memory.read((pc0 + 1) & 0xFFFF)
+            hi = self.memory.read((pc0 + 2) & 0xFFFF)
+            base = lo | (hi << 8)
+            page_cross = (base & 0xFF00) != ((base + y0) & 0xFF00)
+            expect = 5 if page_cross else 4
+            if expect != cycles:
+                pass
+            return [_BUS_READ] * cycles
+        if opcode == 0xB1 and cycles in (5, 6):  # LDA (zp),Y
+            zp = self.memory.read((pc0 + 1) & 0xFFFF)
+            lo = self.memory.read(zp & 0xFFFF)
+            hi = self.memory.read((zp + 1) & 0xFFFF)
+            base = lo | (hi << 8)
+            page_cross = (base & 0xFF00) != ((base + y0) & 0xFF00)
+            expect = 6 if page_cross else 5
+            if expect != cycles:
+                pass
+            return [_BUS_READ] * cycles
+        if opcode == 0xA1 and cycles == 6:  # LDA (zp,X)
+            return [_BUS_READ] * cycles
 
         # Stores: last cycle is a write (simplified).
         store_opcodes = {
@@ -663,8 +739,14 @@ class CPU6502:
 
             return 20  # Approximate cycles for CHROUT
 
+        # Pre-instruction state for bus-phase refinement (branches, indexed modes).
+        pc0 = pc
+        p0 = self.state.p
+        x0 = self.state.x
+        y0 = self.state.y
+
         cycles = self._execute_opcode(opcode)
-        pattern = self._bus_cycle_phases(opcode, cycles)
+        pattern = self._bus_cycle_phases(opcode, cycles, pc0, p0, x0, y0)
 
         elapsed = 0
         for i in range(cycles):
