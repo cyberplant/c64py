@@ -37,10 +37,13 @@ class MemoryMap:
     cia1_icr: int = 0  # Interrupt Control Register
     pending_irq: bool = False  # Pending IRQ flag
     video_standard: str = "pal"  # "pal" or "ntsc"
-    raster_line: int = 300  # Current raster line (start high so it wraps to 0)
+    raster_line: int = 0  # Current raster line
     raster_cycles: int = 0  # Cycle counter for raster timing
     badline_cycles: int = 0  # Extra cycles stolen by VIC on badlines
+    vic_badline_triggered_line: int = -1  # Last raster line where badline DMA was triggered
     vic_interrupt_state: int = 0  # VIC interrupt state for D019
+    vic_den_latched: bool = False  # DEN latched at start of frame (raster line 0)
+    vic_yscroll_latched: int = 0  # YSCROLL latched at start of current raster line
     jiffy_cycles: int = 0  # Cycle counter for jiffy clock
     _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))
     # IEC serial bus (optional, for 1541 drive emulation)
@@ -48,6 +51,20 @@ class MemoryMap:
     # CIA2 Port A state (for IEC bus control)
     cia2_pra: int = 0xFF  # Port A data register
     cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)
+
+    def _vic_irq_enabled_pending(self) -> bool:
+        """Return True when a VIC IRQ source is both pending and enabled."""
+        irq_mask = self._vic_regs[0x1A] & 0x0F
+        return (self.vic_interrupt_state & irq_mask) != 0
+
+    def recompute_pending_irq(self) -> None:
+        """Recompute CPU IRQ line from all currently modeled IRQ sources."""
+        self.pending_irq = bool((self.cia1_icr & 0x80) or self._vic_irq_enabled_pending())
+
+    def trigger_vic_irq(self, source_mask: int) -> None:
+        """Set VIC interrupt source bits and update IRQ line."""
+        self.vic_interrupt_state |= (source_mask & 0x0F)
+        self.recompute_pending_irq()
 
     def peek_vic(self, reg: int) -> int:
         """Return VIC-II register state, bypassing 6510 banking.
@@ -214,15 +231,19 @@ class MemoryMap:
     def _read_vic(self, reg: int) -> int:
         """Read VIC-II register"""
         if reg == 0x11:  # VIC control register 1
-            # Bit 7: Raster MSB
-            # Bit 3: 25/24 row mode (1 for 25 rows)
+            # Bit 7 is the current raster MSB on reads.
+            # Bits 0-6 reflect the stored register value (DEN/YSCROLL/etc.).
             raster_msb = (self.raster_line >> 8) & 0x01
-            return (raster_msb << 7) | (1 << 3)  # 25 rows, raster MSB
+            return (self._vic_regs[0x11] & 0x7F) | (raster_msb << 7)
         elif reg == 0x12:  # Raster line register
             return self.raster_line & 0xFF
         elif reg == 0x19:  # VIC interrupt register
-            # Disable VIC interrupts completely
-            return 0x00
+            value = self.vic_interrupt_state & 0x0F
+            if self._vic_irq_enabled_pending():
+                value |= 0x80
+            return value
+        elif reg == 0x1A:  # VIC interrupt enable register
+            return self._vic_regs[0x1A] & 0x0F
         elif reg == 0x20:  # Border color ($D020)
             return (self._vic_regs[0x20] if 0x20 < len(self._vic_regs) else 0x0E) & 0x0F  # Default light blue
         elif reg == 0x21:  # Background color 0 ($D021)
@@ -237,9 +258,15 @@ class MemoryMap:
 
         # Handle special register writes
         if reg == 0x19:  # VIC interrupt register
-            # Writing to D019 acknowledges interrupts
-            # For simulation, reset interrupt state
-            self.vic_interrupt_state = 0
+            # Writing 1 clears the corresponding pending source bits.
+            self.vic_interrupt_state &= ~(value & 0x0F)
+        elif reg == 0x1A:  # VIC interrupt enable register
+            # Only lower 4 bits are valid enables.
+            self._vic_regs[0x1A] = value & 0x0F
+        elif reg == 0x12:  # Raster compare low byte
+            self._vic_regs[0x12] = value & 0xFF
+
+        self.recompute_pending_irq()
 
     def _read_cia1(self, reg: int) -> int:
         """Read CIA1 register"""
@@ -266,7 +293,7 @@ class MemoryMap:
             # Reading ICR acknowledges interrupts
             result = self.cia1_icr
             self.cia1_icr = 0
-            self.pending_irq = False
+            self.recompute_pending_irq()
             return result
         # Control Register A
         elif reg == 0x0E:

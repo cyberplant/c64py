@@ -126,48 +126,81 @@ class CPU6502:
         self.state.a = r
         self._update_flags(self.state.a)
 
-    def _advance_raster(self, cycles: int) -> None:
+    def _advance_raster(self, cycles: int) -> int:
+        """Advance VIC raster state and return CPU cycles stolen by badlines."""
+        if cycles <= 0:
+            return 0
+
         raster_max = 312 if self.memory.video_standard == "pal" else 263
         cycles_per_line = 63 if self.memory.video_standard == "pal" else 65
-        step_cycles = max(1, cycles)
-        self.memory.raster_cycles += step_cycles
-        while self.memory.raster_cycles >= cycles_per_line:
+        badline_start_cycle = 14
+        badline_stall_cycles = 40
+        remaining = cycles
+        stolen_cycles = 0
+
+        while remaining > 0:
+            start_cycle = self.memory.raster_cycles
+            step_cycles = min(remaining, cycles_per_line - self.memory.raster_cycles)
+            self.memory.raster_cycles += step_cycles
+            remaining -= step_cycles
+
+            # Approximate BA/AEC behavior: on a badline, the VIC steals 40 cycles starting
+            # at a fixed raster-cycle position within the line (not on the line boundary).
+            if (
+                self.memory.vic_badline_triggered_line != self.memory.raster_line
+                and self._is_badline(self.memory.raster_line)
+                and start_cycle < badline_start_cycle <= self.memory.raster_cycles
+            ):
+                self.memory.vic_badline_triggered_line = self.memory.raster_line
+                stolen_cycles += badline_stall_cycles
+                remaining += badline_stall_cycles
+
+            if self.memory.raster_cycles < cycles_per_line:
+                continue
+
             self.memory.raster_cycles -= cycles_per_line
-            old_line = self.memory.raster_line
             self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
-            # Check for badline on the new line
-            new_line = self.memory.raster_line
-            if self._is_badline(new_line):
-                # VIC steals ~40 cycles on badlines
-                self.memory.badline_cycles += 40
+            # Latch $D011 bits that affect badlines.
+            self.memory.vic_yscroll_latched = self.memory.peek_vic(0x11) & 0x07
+            if self.memory.raster_line == 0:
+                self.memory.vic_den_latched = (self.memory.peek_vic(0x11) & 0x10) != 0
+            self._check_raster_irq(self.memory.raster_line)
+            if self.memory.raster_line != self.memory.vic_badline_triggered_line:
+                # Allow the next line to trigger its own badline window.
+                pass
+
+        return stolen_cycles
     
     def _is_badline(self, line: int) -> bool:
         """Check if the current raster line is a badline"""
         # Badlines only occur in visible area (lines 48-247 for PAL)
         if line < 48 or line > 247:
             return False
-        # Check if display is enabled (DEN bit in $D011)
-        d011 = self.memory.peek_vic(0x11)
-        if not (d011 & 0x10):  # DEN bit
+        # DEN is latched at raster line 0 on real VIC-II; use the latched value.
+        if not self.memory.vic_den_latched:
             return False
         # Badline when lower 3 bits of raster match YSCROLL
-        yscroll = d011 & 0x07
-        return (line & 0x07) == yscroll
+        return (line & 0x07) == (self.memory.vic_yscroll_latched & 0x07)
+
+    def _check_raster_irq(self, line: int) -> None:
+        """Trigger VIC raster IRQ source when the programmed line is reached."""
+        d011 = self.memory.peek_vic(0x11)
+        d012 = self.memory.peek_vic(0x12)
+        raster_target = d012 | ((d011 & 0x80) << 1)
+        if line == raster_target:
+            self.memory.trigger_vic_irq(0x01)
 
     def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Advance timers/video/IRQs even if CPU is 'blocked'."""
-        self.state.cycles += cycles
-
-        # Update CIA timers
-        self._update_cia_timers(cycles)
-
-        # Update VIC-II raster line (simulate video timing)
-        self._advance_raster(cycles)
+        stolen_cycles = self._advance_raster(cycles)
+        total_cycles = cycles + stolen_cycles
+        self.state.cycles += total_cycles
+        self._update_cia_timers(total_cycles)
+        self.memory.recompute_pending_irq()
 
         # Check for pending IRQ (only if interrupts are enabled)
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
-            if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
-                self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
+            self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
     def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0, 
              vice_trace: Optional['ViceTraceLogger'] = None) -> int:
@@ -567,27 +600,17 @@ class CPU6502:
 
         cycles = self._execute_opcode(opcode)
         
-        # Update VIC-II raster line first (may generate badline cycles)
-        self._advance_raster(cycles)
-        
-        # Add badline cycles (VIC steals CPU cycles on badlines)
-        if self.memory.badline_cycles > 0:
-            cycles += self.memory.badline_cycles
-            self.memory.badline_cycles = 0
-        
-        # Now update total cycle count with badline cycles included
-        self.state.cycles += cycles
-
-        # Update CIA timers with total cycles (including badlines)
-        self._update_cia_timers(cycles)
+        stolen_cycles = self._advance_raster(cycles)
+        total_cycles = cycles + stolen_cycles
+        self.state.cycles += total_cycles
+        self._update_cia_timers(total_cycles)
+        self.memory.recompute_pending_irq()
 
         # Check for pending IRQ (only if interrupts are enabled)
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
-            # Only handle CIA interrupts for now, skip VIC
-            if self.memory.cia1_icr & 0x80:  # CIA interrupt pending
-                self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
+            self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
-        return cycles
+        return total_cycles
 
     def _update_cia_timers(self, cycles: int) -> None:
         """Update CIA timers and check for IRQ"""
@@ -596,7 +619,6 @@ class CPU6502:
             if self.memory.cia1_timer_a.irq_enabled:
                 self.memory.cia1_icr |= 0x01  # Timer A interrupt
                 self.memory.cia1_icr |= 0x80  # IRQ flag
-                self.memory.pending_irq = True
             self.memory.cia1_timer_a.reset()
 
         # Update Timer B (can be clocked by Timer A underflow)
@@ -609,14 +631,14 @@ class CPU6502:
                 if self.memory.cia1_timer_b.update(1):  # Count by 1
                     self.memory.cia1_icr |= 0x02  # Timer B interrupt
                     self.memory.cia1_icr |= 0x80  # IRQ flag
-                    self.memory.pending_irq = True
                     self.memory.cia1_timer_b.reset()
         else:
             if self.memory.cia1_timer_b.update(cycles):
                 self.memory.cia1_icr |= 0x02  # Timer B interrupt
                 self.memory.cia1_icr |= 0x80  # IRQ flag
-                self.memory.pending_irq = True
                 self.memory.cia1_timer_b.reset()
+
+        self.memory.recompute_pending_irq()
 
     def _handle_cia_interrupt(self) -> None:
         """Handle CIA interrupts directly (bypass KERNAL for stability)"""
@@ -646,7 +668,7 @@ class CPU6502:
     def _handle_irq(self, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Handle IRQ interrupt - let KERNAL handle everything including cursor blink"""
         # Clear pending IRQ flag but NOT cia1_icr - KERNAL reads $DC0D to acknowledge
-        self.memory.pending_irq = False
+        self.memory.recompute_pending_irq()
 
         # Push PC and P to stack (6502 pushes high byte first, then low byte, then status)
         pc = self.state.pc
@@ -664,6 +686,12 @@ class CPU6502:
         # Jump to HARDWARE IRQ vector at $FFFE/$FFFF (points to KERNAL $FF48)
         irq_addr = self._read_word(IRQ_VECTOR_HW)
         self.state.pc = irq_addr
+        # 6502 IRQ entry costs 7 cycles (+ any VIC badline stall in that window).
+        irq_cycles = 7
+        stolen_cycles = self._advance_raster(irq_cycles)
+        self.state.cycles += irq_cycles + stolen_cycles
+        self._update_cia_timers(irq_cycles + stolen_cycles)
+        self.memory.recompute_pending_irq()
 
         if udp_debug and udp_debug.enabled:
             udp_debug.send('irq', {
