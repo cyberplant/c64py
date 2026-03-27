@@ -147,7 +147,7 @@ def get_file_size_mb(filename: str) -> float:
     return os.path.getsize(filename) / (1024 * 1024)
 
 
-def run_emulator(prg_file: str, max_cycles: int, trace_file: str) -> bool:
+def run_emulator(prg_file: str, max_cycles: int, trace_file: str, sync_pc: Optional[int] = None) -> bool:
     """Run our emulator and generate trace"""
     cmd = [
         sys.executable, 'C64.py',
@@ -155,8 +155,17 @@ def run_emulator(prg_file: str, max_cycles: int, trace_file: str) -> bool:
         '--vice-trace', trace_file,
         '--max-cycles', str(max_cycles),
         '--autoquit',
-        '--turbo'
+        '--turbo',
+        '--headless',
     ]
+
+    # When comparing against VICE we typically sync at a PC address. However, the VIC
+    # raster phase at that point can differ between runs due to power-on timing and
+    # boot path differences. If requested, set an env var so the emulator can reset
+    # raster phase at the sync PC, making drift analysis focus on badline logic.
+    env = os.environ.copy()
+    if sync_pc is not None:
+        env["C64PY_TRACE_SYNC_PC"] = f"{sync_pc:04X}"
     
     try:
         result = subprocess.run(
@@ -164,8 +173,16 @@ def run_emulator(prg_file: str, max_cycles: int, trace_file: str) -> bool:
             cwd=os.path.dirname(os.path.abspath(__file__)),
             capture_output=True,
             text=True,
+            env=env,
             timeout=300
         )
+        if result.returncode != 0:
+            if result.stderr:
+                print_msg("Emulator stderr:", "red")
+                print(result.stderr)
+            if result.stdout:
+                print_msg("Emulator stdout:", "red")
+                print(result.stdout)
         return result.returncode == 0
     except subprocess.TimeoutExpired:
         print_msg("❌ Emulator timed out", "red")
@@ -822,7 +839,7 @@ Examples:
         print_msg(f"   Max cycles: {args.max_cycles:,}", "dim")
         print()
         
-        if not run_emulator(args.program, args.max_cycles, our_trace):
+        if not run_emulator(args.program, args.max_cycles, our_trace, sync_pc=match_cycles_at):
             print_msg("❌ Failed to generate trace", "red")
             sys.exit(1)
         

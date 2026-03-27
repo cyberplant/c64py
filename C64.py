@@ -131,6 +131,7 @@ def main():
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
     ap.add_argument("--vice-trace", type=str, metavar="FILE", help="Write VICE-compatible CPU trace to FILE for comparison debugging")
+    ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
 
     args = ap.parse_args()
     
@@ -154,6 +155,8 @@ def main():
     start_time = time.perf_counter()
 
     interface_factory = None
+    if args.headless:
+        interface_factory = lambda _emu: None
     if args.graphics:
         try:
             from .graphics import PygameInterface
@@ -175,27 +178,27 @@ def main():
     emu.no_colors = args.no_colors
     if args.debug:
         emu.cpu.enable_trace(1024)
-    supports_ui_logs = hasattr(emu.interface, "fullscreen")
+    supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")
     if supports_ui_logs:
         emu.interface.fullscreen = args.fullscreen
-    show_ui_logs = (not args.fullscreen) if supports_ui_logs else True
-    if args.debug and show_ui_logs:
+    show_ui_logs = (not args.fullscreen) if supports_ui_logs else False
+    if args.debug and show_ui_logs and emu.interface is not None:
         emu.interface.add_debug_log("🐛 Debug mode enabled")
 
     # Setup UDP debug logging if requested
     if args.udp_debug:
         emu.udp_debug = UdpDebugLogger(port=args.udp_debug_port, host=args.udp_debug_host)
         emu.udp_debug.enable()
-        if show_ui_logs:
+        if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📡 UDP debug logging enabled: {args.udp_debug_host}:{args.udp_debug_port}")
         # Test UDP connection
         try:
             test_msg = {'type': 'test', 'message': 'UDP debug initialized'}
             emu.udp_debug.send('test', test_msg)
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("✅ UDP test message sent successfully")
         except Exception as e:
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"❌ UDP test failed: {e}")
 
     # Pass UDP debug logger to memory
@@ -208,13 +211,13 @@ def main():
         vice_trace = ViceTraceLogger(filename=args.vice_trace)
         vice_trace.enable()
         emu.vice_trace = vice_trace
-        if show_ui_logs:
+        if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📝 VICE trace logging to: {args.vice_trace}")
 
     try:
         # Video standard (memory + SID/reSID clock when audio is enabled)
         emu.set_video_standard(args.video_standard)
-        if show_ui_logs:
+        if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
         # Load ROMs (auto-detect common locations if not provided).
@@ -238,7 +241,7 @@ def main():
                 require_char_rom=args.graphics,
             )
             emu.load_roms(str(rom_dir_path), require_char_rom=args.graphics)
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"💾 ROM directory: {rom_dir_path}")
         except Exception as e:
             # Ensure UI is not left running, then show a clear error.
@@ -253,22 +256,22 @@ def main():
         # Store PRG file path for loading after boot (BASIC boot clears $0801-$0802)
         if args.prg_file:
             emu.prg_file_path = args.prg_file
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {args.prg_file}")
 
         # Store D64 disk image path for attaching after boot
         if args.disk:
             emu.disk_image_path = args.disk
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"💾 D64 disk will be attached after BASIC boot: {args.disk}")
 
         # Initialize CPU (use _read_word to ensure correct byte order and ROM mapping)
         reset_vector = emu.cpu._read_word(0xFFFC)
         emu.cpu.state.pc = reset_vector
-        if show_ui_logs:
+        if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"🔄 Reset vector: ${reset_vector:04X}")
 
-        if args.debug and show_ui_logs:
+        if args.debug and show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(
                 f"🖥️ Initial CPU state: PC=${emu.cpu.state.pc:04X}, A=${emu.cpu.state.a:02X}, "
                 f"X=${emu.cpu.state.x:02X}, Y=${emu.cpu.state.y:02X}"
@@ -280,10 +283,10 @@ def main():
 
         # Start server if requested (runs in parallel with UI)
         server = None
-        if args.tcp_port or args.udp_port:
+        if (args.tcp_port or args.udp_port) and emu.interface is not None:
             server = EmulatorServer(emu, tcp_port=args.tcp_port, udp_port=args.udp_port)
             server.start()
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("📡 TCP/UDP server started")
                 emu.interface.add_debug_log("📡 Server commands: STATUS, STEP, RUN, MEMORY, DUMP, SCREEN, LOAD")
             print("Server started on port(s): ", end="")
@@ -296,9 +299,9 @@ def main():
             print()
 
         # Start graphics interface if requested
-        if args.graphics:
+        if args.graphics and emu.interface is not None:
             emu.interface.max_cycles = args.max_cycles
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("🎨 Graphics interface active")
             try:
                 emu.interface.run()
@@ -316,7 +319,7 @@ def main():
             return
 
         # Start Textual interface (unless explicitly disabled with --no-colors)
-        if not args.no_colors:
+        if (not args.no_colors) and (emu.interface is not None):
             emu.interface.max_cycles = args.max_cycles
             # fullscreen flag already set earlier
             if show_ui_logs:

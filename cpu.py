@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import Optional, TYPE_CHECKING
+
+from .vicii_cycle import ViciiCycleEngine
 
 try:
     from .debug import OPCODE_SIZES
@@ -47,6 +51,130 @@ class CPU6502:
         self.trace_index = 0
         self.trace_count = 0
         self.jiffy_clock = 0  # Initialize jiffy_clock as an attribute of CPU6502
+        self._trace_sync_pc: Optional[int] = None
+        try:
+            v = os.environ.get("C64PY_TRACE_SYNC_PC")
+            self._trace_sync_pc = int(v, 16) if v else None
+        except Exception:
+            self._trace_sync_pc = None
+
+        # VICE-aligned VIC-II cycle engine (PAL 6569R3 for now).
+        self.vic = ViciiCycleEngine()
+
+    def _vic_tick_one(self) -> tuple[bool, bool, bool]:
+        """Advance VIC by one CPU cycle. Returns (ba_low, ba_blocks_cpu, raster_irq_edge)."""
+        d011 = self.memory.peek_vic(0x11)
+        d012 = self.memory.peek_vic(0x12)
+        self.vic.set_d011(d011, (self.memory.raster_line >> 8) & 1)
+        self.vic.set_d012(d012)
+
+        ba_low, ba_blocks_cpu, irq_edge = self.vic.tick()
+
+        # Mirror VIC raster state into MemoryMap for $D011/$D012 reads.
+        self.memory.raster_line = self.vic.raster_line
+        self.memory.raster_cycles = self.vic.raster_cycle
+
+        if irq_edge:
+            self.memory.trigger_vic_irq(0x01)
+
+        return ba_low, ba_blocks_cpu, irq_edge
+
+    def _bus_cycle_pattern(self, opcode: int, cycles: int) -> list[bool]:
+        """Return a per-cycle is_read pattern for BA-aware stalling.
+
+        This is intentionally incomplete, but covers the hot opcodes seen in the Bruce Lee
+        trace loops (LDA/STA/branches/inc/rol/etc.). Unknown opcodes default to all-read.
+        """
+        is_read = [True] * max(0, cycles)
+
+        # Stores: last cycle is a write (simplified).
+        store_opcodes = {
+            0x85, 0x95, 0x8D, 0x9D, 0x99, 0x81, 0x91,  # STA
+            0x86, 0x8E, 0x96,  # STX
+            0x84, 0x8C, 0x94,  # STY
+        }
+        # RMW: last two cycles are writes on 6502 (simplified).
+        rmw_opcodes = {
+            0x06, 0x16, 0x0E, 0x1E,  # ASL
+            0x26, 0x36, 0x2E, 0x3E,  # ROL
+            0x46, 0x56, 0x4E, 0x5E,  # LSR
+            0x66, 0x76, 0x6E, 0x7E,  # ROR
+            0xC6, 0xD6, 0xCE, 0xDE,  # DEC
+            0xE6, 0xF6, 0xEE, 0xFE,  # INC
+        }
+
+        if opcode in store_opcodes and cycles >= 1:
+            is_read[-1] = False
+        elif opcode in rmw_opcodes and cycles >= 2:
+            is_read[-1] = False
+            is_read[-2] = False
+
+        # Implied/accumulator ops often have an internal (no-bus) cycle 2.
+        implied_internal_2 = {
+            0xCA, 0x88, 0xE8, 0xC8,  # DEX/DEY/INX/INY
+            0x18, 0x38, 0x58, 0x78,  # CLC/SEC/CLI/SEI
+            0xB8, 0xD8, 0xF8,        # CLV/CLD/SED
+            0xEA,                    # NOP
+            0xAA, 0xA8, 0x8A, 0x98,  # TAX/TAY/TXA/TYA
+            0xBA, 0x9A,              # TSX/TXS
+            0x48, 0x68, 0x08, 0x28,  # PHA/PLA/PHP/PLP (approx; only the push/pull touches bus)
+        }
+        acc_shift_rotate = {0x0A, 0x2A, 0x4A, 0x6A}  # ASL/ROL/LSR/ROR A
+        if cycles == 2 and (opcode in implied_internal_2 or opcode in acc_shift_rotate):
+            is_read[1] = False
+
+        # Branches: treat as reads (no writes); taken branches add internal reads.
+        # We leave as all-read.
+
+        # JSR: cycles 4-5 are writes (push return address).
+        if opcode == 0x20 and cycles >= 6:
+            is_read[3] = False
+            is_read[4] = False
+
+        # RTS: first 3 cycles are reads, then reads; no writes (leave all-read).
+        if opcode == 0x60 and cycles >= 6:
+            # One internal cycle during return address increment.
+            is_read[4] = False
+
+        # RTI: pulls P/PC (reads).
+        if opcode == 0x40 and cycles >= 6:
+            # One internal cycle after pulling PC.
+            is_read[4] = False
+
+        # BRK: pushes PC/P (writes) on cycles 3-5 (7 cycles total).
+        if opcode == 0x00 and cycles >= 7:
+            is_read[2] = False
+            is_read[3] = False
+            is_read[4] = False
+
+        # PHA/PHP: last cycle write.
+        if opcode in (0x48, 0x08) and cycles >= 3:
+            # Middle cycle is internal.
+            if cycles >= 2:
+                is_read[1] = False
+            is_read[-1] = False
+
+        # PLA/PLP: 4 cycles, with internal cycles around the stack read.
+        if opcode in (0x68, 0x28) and cycles >= 4:
+            is_read[1] = False
+            is_read[3] = False
+
+        # JSR already handled above.
+
+        # Stack pulls are reads only (PLA/PLP).
+        # (No change needed, keep all reads.)
+
+        # Subroutine/interrupt returns are reads only (RTS/RTI).
+        # (No change needed, keep all reads.)
+
+        # Absolute indexed stores often perform a dummy read before the final write.
+        # We model this minimally by ensuring only the final cycle is treated as write
+        # (already done by store_opcodes), keeping the dummy cycle as a read.
+        # (No extra pattern info needed here.)
+
+        # Stack pushes in JSR/BRK/IRQ-like sequences are writes, but we keep them as reads
+        # here; it mainly affects BA timing on rare boundaries.
+        return is_read
 
     def enable_trace(self, size: int = 1024) -> None:
         self.trace_enabled = True
@@ -126,84 +254,30 @@ class CPU6502:
         self.state.a = r
         self._update_flags(self.state.a)
 
-    def _advance_raster(self, cycles: int) -> int:
-        """Advance VIC raster state and return CPU cycles stolen by badlines."""
-        if cycles <= 0:
-            return 0
-
-        raster_max = 312 if self.memory.video_standard == "pal" else 263
-        cycles_per_line = 63 if self.memory.video_standard == "pal" else 65
-        badline_start_cycle = 14
-        badline_stall_cycles = 40
-        remaining = cycles
-        stolen_cycles = 0
-
-        while remaining > 0:
-            start_cycle = self.memory.raster_cycles
-            step_cycles = min(remaining, cycles_per_line - self.memory.raster_cycles)
-            self.memory.raster_cycles += step_cycles
-            remaining -= step_cycles
-
-            # Approximate BA/AEC behavior: on a badline, the VIC steals 40 cycles starting
-            # at a fixed raster-cycle position within the line (not on the line boundary).
-            if (
-                self.memory.vic_badline_triggered_line != self.memory.raster_line
-                and self._is_badline(self.memory.raster_line)
-                and start_cycle < badline_start_cycle <= self.memory.raster_cycles
-            ):
-                self.memory.vic_badline_triggered_line = self.memory.raster_line
-                stolen_cycles += badline_stall_cycles
-                remaining += badline_stall_cycles
-
-            if self.memory.raster_cycles < cycles_per_line:
-                continue
-
-            self.memory.raster_cycles -= cycles_per_line
-            self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
-            # Latch $D011 bits that affect badlines.
-            self.memory.vic_yscroll_latched = self.memory.peek_vic(0x11) & 0x07
-            if self.memory.raster_line == 0:
-                self.memory.vic_den_latched = (self.memory.peek_vic(0x11) & 0x10) != 0
-            self._check_raster_irq(self.memory.raster_line)
-            if self.memory.raster_line != self.memory.vic_badline_triggered_line:
-                # Allow the next line to trigger its own badline window.
-                pass
-
-        return stolen_cycles
-    
-    def _is_badline(self, line: int) -> bool:
-        """Check if the current raster line is a badline"""
-        # Badlines only occur in visible area (lines 48-247 for PAL)
-        if line < 48 or line > 247:
-            return False
-        # DEN is latched at raster line 0 on real VIC-II; use the latched value.
-        if not self.memory.vic_den_latched:
-            return False
-        # Badline when lower 3 bits of raster match YSCROLL
-        return (line & 0x07) == (self.memory.vic_yscroll_latched & 0x07)
-
-    def _check_raster_irq(self, line: int) -> None:
-        """Trigger VIC raster IRQ source when the programmed line is reached."""
-        d011 = self.memory.peek_vic(0x11)
-        d012 = self.memory.peek_vic(0x12)
-        raster_target = d012 | ((d011 & 0x80) << 1)
-        if line == raster_target:
-            self.memory.trigger_vic_irq(0x01)
-
     def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Advance timers/video/IRQs even if CPU is 'blocked'."""
-        stolen_cycles = self._advance_raster(cycles)
-        total_cycles = cycles + stolen_cycles
-        self.state.cycles += total_cycles
-        self._update_cia_timers(total_cycles)
+        for _ in range(max(0, cycles)):
+            self._vic_tick_one()
+            self.state.cycles += 1
+            self._update_cia_timers(1)
         self.memory.recompute_pending_irq()
 
         # Check for pending IRQ (only if interrupts are enabled)
         if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
             self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
-    def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0, 
-             vice_trace: Optional['ViceTraceLogger'] = None) -> int:
+    def _step_cycles(self, cycles: int) -> None:
+        """Advance emulated time by *cycles* CPU cycles (VIC-driven)."""
+        for _ in range(max(0, cycles)):
+            self._vic_tick_one()
+            self.state.cycles += 1
+            self._update_cia_timers(1)
+        self.memory.recompute_pending_irq()
+        if self.memory.pending_irq and not self._get_flag(0x04):
+            self._handle_irq()
+
+    def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0,
+             vice_trace=None) -> int:
         """Execute one instruction, return cycles"""
         self.current_cycles = current_cycles
         if self.state.stopped:
@@ -214,6 +288,13 @@ class CPU6502:
         pc = self.state.pc
         opcode = self.memory.read(pc)
         self._record_trace(pc, opcode)
+
+        # Trace-only aid: force VIC raster phase to a known point at the sync PC so
+        # drift analysis focuses on badline/IRQ logic rather than boot-time phase.
+        if self._trace_sync_pc is not None and pc == self._trace_sync_pc:
+            self.vic = ViciiCycleEngine()
+            self.memory.raster_line = 0
+            self.memory.raster_cycles = 0
 
         # Log instruction execution if UDP debug is enabled
         # Note: cycles haven't been incremented yet, so we log the current cycle count
@@ -599,18 +680,27 @@ class CPU6502:
             return 20  # Approximate cycles for CHROUT
 
         cycles = self._execute_opcode(opcode)
-        
-        stolen_cycles = self._advance_raster(cycles)
-        total_cycles = cycles + stolen_cycles
-        self.state.cycles += total_cycles
-        self._update_cia_timers(total_cycles)
+        pattern = self._bus_cycle_pattern(opcode, cycles)
+
+        elapsed = 0
+        for i in range(cycles):
+            is_read = pattern[i] if i < len(pattern) else True
+            while True:
+                ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
+                self.state.cycles += 1
+                self._update_cia_timers(1)
+                elapsed += 1
+
+                # Stall CPU only on read cycles while BA is low (VICE behavior).
+                if ba_blocks_cpu and is_read:
+                    continue
+                break
+
         self.memory.recompute_pending_irq()
+        if self.memory.pending_irq and not self._get_flag(0x04):
+            self._handle_irq()
 
-        # Check for pending IRQ (only if interrupts are enabled)
-        if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
-            self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
-
-        return total_cycles
+        return elapsed
 
     def _update_cia_timers(self, cycles: int) -> None:
         """Update CIA timers and check for IRQ"""
@@ -670,27 +760,52 @@ class CPU6502:
         # Clear pending IRQ flag but NOT cia1_icr - KERNAL reads $DC0D to acknowledge
         self.memory.recompute_pending_irq()
 
-        # Push PC and P to stack (6502 pushes high byte first, then low byte, then status)
+        # Cycle-accurate-ish IRQ entry with BA-aware stalls:
+        # 7 cycles total: dummy read, dummy read, push PCH, push PCL, push P, fetch vector low, fetch vector high.
         pc = self.state.pc
-        self.memory.write(0x100 + self.state.sp, (pc >> 8) & 0xFF)
+        pch = (pc >> 8) & 0xFF
+        pcl = pc & 0xFF
+        status = (self.state.p | 0x20) & ~0x10  # B clear, bit 5 set
+
+        vector = {"lo": 0, "hi": 0}
+
+        def _irq_cycle(is_read: bool, do_bus) -> None:
+            while True:
+                _ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
+                self.state.cycles += 1
+                self._update_cia_timers(1)
+                if ba_blocks_cpu and is_read:
+                    continue
+                break
+            do_bus()
+
+        # 1-2: dummy opcode fetches (we don't care what is read)
+        _irq_cycle(True, lambda: self.memory.read(self.state.pc))
+        _irq_cycle(True, lambda: self.memory.read(self.state.pc))
+
+        # 3-5: stack pushes (writes are not stalled by BA in our model)
+        _irq_cycle(False, lambda: self.memory.write(0x100 + self.state.sp, pch))
         self.state.sp = (self.state.sp - 1) & 0xFF
-        self.memory.write(0x100 + self.state.sp, pc & 0xFF)
+        _irq_cycle(False, lambda: self.memory.write(0x100 + self.state.sp, pcl))
         self.state.sp = (self.state.sp - 1) & 0xFF
-        # Push status with B flag clear (IRQ, not BRK) and bit 5 always set
-        self.memory.write(0x100 + self.state.sp, (self.state.p | 0x20) & ~0x10)
+        _irq_cycle(False, lambda: self.memory.write(0x100 + self.state.sp, status))
         self.state.sp = (self.state.sp - 1) & 0xFF
 
-        # Set interrupt disable flag
+        # Set interrupt disable flag (effective after pushing P on real 6502; close enough here)
         self._set_flag(0x04, True)
 
-        # Jump to HARDWARE IRQ vector at $FFFE/$FFFF (points to KERNAL $FF48)
-        irq_addr = self._read_word(IRQ_VECTOR_HW)
+        # 6-7: vector fetch
+        def _read_vec_lo() -> None:
+            vector["lo"] = self.memory.read(IRQ_VECTOR_HW)
+
+        def _read_vec_hi() -> None:
+            vector["hi"] = self.memory.read((IRQ_VECTOR_HW + 1) & 0xFFFF)
+
+        _irq_cycle(True, _read_vec_lo)
+        _irq_cycle(True, _read_vec_hi)
+
+        irq_addr = vector["lo"] | (vector["hi"] << 8)
         self.state.pc = irq_addr
-        # 6502 IRQ entry costs 7 cycles (+ any VIC badline stall in that window).
-        irq_cycles = 7
-        stolen_cycles = self._advance_raster(irq_cycles)
-        self.state.cycles += irq_cycles + stolen_cycles
-        self._update_cia_timers(irq_cycles + stolen_cycles)
         self.memory.recompute_pending_irq()
 
         if udp_debug and udp_debug.enabled:
