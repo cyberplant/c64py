@@ -77,6 +77,19 @@ class MemoryMap:
         """
         return self._read_vic(reg & 0x3F)
 
+    def vic_stored_reg(self, reg: int) -> int:
+        """CPU-written VIC register value (no raster/composite read side effects).
+
+        Used by the cycle engine to avoid peek_vic per tick for $D011/$D012/$D015 etc.
+        """
+        r = reg & 0x3F
+        return self._vic_regs[r] if r < len(self._vic_regs) else 0
+
+    def vic_stored_regs_d011_d012_d015(self) -> tuple[int, int, int]:
+        """Single read of shadow bytes for ViciiCycleEngine (hot path; no composite bits)."""
+        m = self._vic_regs
+        return (m[0x11], m[0x12], m[0x15] & 0xFF)
+
     def poke_vic(self, reg: int, value: int) -> None:
         """Update VIC-II register state, bypassing 6510 banking.
 

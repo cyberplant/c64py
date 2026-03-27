@@ -78,14 +78,23 @@ class CPU6502:
 
         # VICE-aligned VIC-II cycle engine (PAL 6569R3 for now).
         self.vic = ViciiCycleEngine()
+        # Last (D011, D012, D015) shadow tuple applied to ViciiCycleEngine (hot path).
+        self._vic_shadow_tuple: Optional[tuple[int, int, int]] = None
+
+    def _vic_sync_engine_shadow_regs(self) -> None:
+        """Apply MemoryMap VIC shadow regs to ViciiCycleEngine only when they change."""
+        t = self.memory.vic_stored_regs_d011_d012_d015()
+        if t == self._vic_shadow_tuple:
+            return
+        self._vic_shadow_tuple = t
+        r11, r12, sp = t
+        self.vic.set_d011(r11, 0)
+        self.vic.set_d012(r12)
+        self.vic.sprite_enable_mask = sp
 
     def _vic_tick_one(self) -> tuple[bool, bool, bool]:
         """Advance VIC by one CPU cycle. Returns (ba_low, ba_blocks_cpu, raster_irq_edge)."""
-        d011 = self.memory.peek_vic(0x11)
-        d012 = self.memory.peek_vic(0x12)
-        self.vic.set_d011(d011, (self.memory.raster_line >> 8) & 1)
-        self.vic.set_d012(d012)
-        self.vic.sprite_enable_mask = self.memory.peek_vic(0x15) & 0xFF
+        self._vic_sync_engine_shadow_regs()
 
         ba_low, ba_blocks_cpu, irq_edge = self.vic.tick()
 
@@ -124,18 +133,20 @@ class CPU6502:
         return False
 
     def _bus_cycle_phases(
-        self, opcode: int, cycles: int, pc0: int, p0: int, x0: int, y0: int
+        self, opcode: int, cycles: int, pc0: int, p0: int, x0: int, y0: int, op1: int, op2: int
     ) -> list[int]:
         """Per-cycle bus phase for BA-aware stalling: INTERNAL / READ / WRITE.
 
         `pc0`, `p0`, `x0`, `y0` are CPU state *before* the instruction executes (used for
-        branch/indexed refinements). Unknown opcodes default to all READ (conservative).
+        branch/indexed refinements). `op1`/`op2` are the bytes at PC+1 and PC+2 as read
+        before execute (avoids duplicate bus reads for phase tables). Unknown opcodes
+        default to all READ (conservative).
         """
         ph = [_BUS_READ] * max(0, cycles)
 
         # Relative branches: every cycle is a memory read (2 not taken, 3 taken, +1 page cross).
         if opcode in _BRANCH_OPCODES and cycles in (2, 3, 4):
-            off = self.memory.read((pc0 + 1) & 0xFFFF)
+            off = op1 & 0xFF
             rel = off - 256 if (off & 0x80) else off
             npc = (pc0 + 2) & 0xFFFF
             if self._branch_condition(opcode, p0):
@@ -149,25 +160,21 @@ class CPU6502:
 
         # ORA/AND/EOR/ADC/LDA/CMP/SBC/LDY abs,X ; LDX abs,Y ; (zp),Y ; (zp,X) — all reads.
         if opcode in _ABS_X_READ and cycles in (4, 5):
-            lo = self.memory.read((pc0 + 1) & 0xFFFF)
-            hi = self.memory.read((pc0 + 2) & 0xFFFF)
-            base = lo | (hi << 8)
+            base = op1 | (op2 << 8)
             page_cross = (base & 0xFF00) != ((base + x0) & 0xFF00)
             expect = 5 if page_cross else 4
             if expect != cycles:
                 pass
             return [_BUS_READ] * cycles
         if opcode in _ABS_Y_READ and cycles in (4, 5):
-            lo = self.memory.read((pc0 + 1) & 0xFFFF)
-            hi = self.memory.read((pc0 + 2) & 0xFFFF)
-            base = lo | (hi << 8)
+            base = op1 | (op2 << 8)
             page_cross = (base & 0xFF00) != ((base + y0) & 0xFF00)
             expect = 5 if page_cross else 4
             if expect != cycles:
                 pass
             return [_BUS_READ] * cycles
         if opcode in _IND_Y_READ and cycles in (5, 6):
-            zp = self.memory.read((pc0 + 1) & 0xFFFF)
+            zp = op1 & 0xFF
             lo = self.memory.read(zp & 0xFFFF)
             hi = self.memory.read((zp + 1) & 0xFFFF)
             base = lo | (hi << 8)
@@ -330,7 +337,7 @@ class CPU6502:
         for _ in range(max(0, cycles)):
             self._vic_tick_one()
             self.state.cycles += 1
-            self._update_cia_timers(1)
+            self._update_cia_timers(1, recompute_irq=False)
         self.memory.recompute_pending_irq()
 
         # Check for pending IRQ (only if interrupts are enabled)
@@ -342,7 +349,7 @@ class CPU6502:
         for _ in range(max(0, cycles)):
             self._vic_tick_one()
             self.state.cycles += 1
-            self._update_cia_timers(1)
+            self._update_cia_timers(1, recompute_irq=False)
         self.memory.recompute_pending_irq()
         if self.memory.pending_irq and not self._get_flag(0x04):
             self._handle_irq()
@@ -755,9 +762,11 @@ class CPU6502:
         p0 = self.state.p
         x0 = self.state.x
         y0 = self.state.y
+        op1 = self.memory.read((pc + 1) & 0xFFFF)
+        op2 = self.memory.read((pc + 2) & 0xFFFF)
 
         cycles = self._execute_opcode(opcode)
-        pattern = self._bus_cycle_phases(opcode, cycles, pc0, p0, x0, y0)
+        pattern = self._bus_cycle_phases(opcode, cycles, pc0, p0, x0, y0, op1, op2)
 
         elapsed = 0
         for i in range(cycles):
@@ -765,13 +774,11 @@ class CPU6502:
             while True:
                 _ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
                 self.state.cycles += 1
-                self._update_cia_timers(1)
+                self._update_cia_timers(1, recompute_irq=False)
                 elapsed += 1
-
                 # Stall CPU only on read cycles while BA blocks (VICE behavior).
-                if ba_blocks_cpu and bus_phase == _BUS_READ:
-                    continue
-                break
+                if not (ba_blocks_cpu and bus_phase == _BUS_READ):
+                    break
 
         self.memory.recompute_pending_irq()
         if self.memory.pending_irq and not self._get_flag(0x04):
@@ -779,8 +786,8 @@ class CPU6502:
 
         return elapsed
 
-    def _update_cia_timers(self, cycles: int) -> None:
-        """Update CIA timers and check for IRQ"""
+    def _update_cia_timers(self, cycles: int, recompute_irq: bool = True) -> None:
+        """Update CIA timers and optionally recompute pending IRQ (defer in hot inner loops)."""
         # Update Timer A
         if self.memory.cia1_timer_a.update(cycles):
             if self.memory.cia1_timer_a.irq_enabled:
@@ -805,7 +812,8 @@ class CPU6502:
                 self.memory.cia1_icr |= 0x80  # IRQ flag
                 self.memory.cia1_timer_b.reset()
 
-        self.memory.recompute_pending_irq()
+        if recompute_irq:
+            self.memory.recompute_pending_irq()
 
     def _handle_cia_interrupt(self) -> None:
         """Handle CIA interrupts directly (bypass KERNAL for stability)"""
@@ -850,10 +858,9 @@ class CPU6502:
             while True:
                 _ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
                 self.state.cycles += 1
-                self._update_cia_timers(1)
-                if ba_blocks_cpu and bus_phase == _BUS_READ:
-                    continue
-                break
+                self._update_cia_timers(1, recompute_irq=False)
+                if not (ba_blocks_cpu and bus_phase == _BUS_READ):
+                    break
             do_bus()
 
         # 1-2: dummy opcode fetches (we don't care what is read)

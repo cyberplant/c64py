@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Performance note: tick() runs once per emulated CPU cycle on the hot path. A future
+# optional Cython/C extension module exposing the same ViciiCycleEngine.tick() contract
+# would preserve semantics while improving host throughput (no Python interpreter per tick).
 
 # Ported from VICE `vice/src/viciisc/vicii-chip-model.h` and the PAL `cycle_tab_pal`
 # assembly in `vice/src/viciisc/vicii-chip-model.c`. We only keep the fields needed

@@ -227,6 +227,11 @@ class C64:
         shortened by an EMA of (actual_sleep − requested_sleep) so different OS/schedulers
         converge toward ~100% of nominal PAL/NTSC MHz without per-machine constants.
 
+        Event queues / high-resolution host timers are useful for *wall-clock* sync (audio,
+        vsync, UI). They do not replace per-cycle CPU/VIC stepping when modeling BA stalls
+        and IRQ phase; that still requires advancing the chip model each emulated cycle
+        (or a proven fast-forward with equivalent state).
+
         """
         if getattr(self, "turbo", False):
             return
