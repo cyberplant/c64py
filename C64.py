@@ -137,6 +137,11 @@ def main():
         help="With --vice-trace: append '; w <seconds>' lines (monotonic) for host profiling between instructions",
     )
     ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
+    ap.add_argument(
+        "--accurate-vic",
+        action="store_true",
+        help="Enable cycle-accurate VIC/BA timing (slower, more accurate). Default is fast coarse VIC timing.",
+    )
 
     args = ap.parse_args()
     
@@ -175,12 +180,19 @@ def main():
             border_size=args.graphics_border,
         )
 
-    emu = C64(interface_factory=interface_factory, enable_sid=args.enable_sid, enable_resid=args.enable_resid)
+    emu = C64(
+        interface_factory=interface_factory,
+        enable_sid=args.enable_sid,
+        enable_resid=args.enable_resid,
+        accurate_vic=args.accurate_vic,
+    )
     emu.debug = args.debug
     emu.autoquit = args.autoquit
     emu.turbo = args.turbo
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
+    vic_mode_name = "accurate" if args.accurate_vic else "fast"
+    print(f"VIC mode: {vic_mode_name}")
     if args.debug:
         emu.cpu.enable_trace(1024)
     supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")

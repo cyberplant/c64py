@@ -55,9 +55,10 @@ if TYPE_CHECKING:
 class CPU6502:
     """6502 CPU emulator"""
 
-    def __init__(self, memory: MemoryMap, interface=None):
+    def __init__(self, memory: MemoryMap, interface=None, accurate_vic: bool = False):
         self.memory = memory
         self.interface = interface
+        self.accurate_vic = accurate_vic
         self.state = CPUState()
         # PC will be set from reset vector after ROMs are loaded
         # Don't read it here as ROMs might not be loaded yet
@@ -91,6 +92,16 @@ class CPU6502:
         self.vic.set_d011(r11, 0)
         self.vic.set_d012(r12)
         self.vic.sprite_enable_mask = sp
+
+    def _advance_raster(self, cycles: int) -> None:
+        """Coarse raster advance used by fast VIC mode."""
+        raster_max = 312 if self.memory.video_standard == "pal" else 263
+        cycles_per_line = 63 if self.memory.video_standard == "pal" else 65
+        step_cycles = max(1, cycles)
+        self.memory.raster_cycles += step_cycles
+        while self.memory.raster_cycles >= cycles_per_line:
+            self.memory.raster_cycles -= cycles_per_line
+            self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
 
     def _vic_tick_one(self) -> tuple[bool, bool, bool]:
         """Advance VIC by one CPU cycle. Returns (ba_low, ba_blocks_cpu, raster_irq_edge)."""
@@ -334,10 +345,15 @@ class CPU6502:
 
     def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Advance timers/video/IRQs even if CPU is 'blocked'."""
-        for _ in range(max(0, cycles)):
-            self._vic_tick_one()
-            self.state.cycles += 1
-            self._update_cia_timers(1, recompute_irq=False)
+        if self.accurate_vic:
+            for _ in range(max(0, cycles)):
+                self._vic_tick_one()
+                self.state.cycles += 1
+                self._update_cia_timers(1, recompute_irq=False)
+        else:
+            self.state.cycles += cycles
+            self._update_cia_timers(cycles)
+            self._advance_raster(cycles)
         self.memory.recompute_pending_irq()
 
         # Check for pending IRQ (only if interrupts are enabled)
@@ -346,10 +362,15 @@ class CPU6502:
 
     def _step_cycles(self, cycles: int) -> None:
         """Advance emulated time by *cycles* CPU cycles (VIC-driven)."""
-        for _ in range(max(0, cycles)):
-            self._vic_tick_one()
-            self.state.cycles += 1
-            self._update_cia_timers(1, recompute_irq=False)
+        if self.accurate_vic:
+            for _ in range(max(0, cycles)):
+                self._vic_tick_one()
+                self.state.cycles += 1
+                self._update_cia_timers(1, recompute_irq=False)
+        else:
+            self.state.cycles += cycles
+            self._update_cia_timers(cycles)
+            self._advance_raster(cycles)
         self.memory.recompute_pending_irq()
         if self.memory.pending_irq and not self._get_flag(0x04):
             self._handle_irq()
@@ -370,7 +391,8 @@ class CPU6502:
         # Trace-only aid: force VIC raster phase to a known point at the sync PC so
         # drift analysis focuses on badline/IRQ logic rather than boot-time phase.
         if self._trace_sync_pc is not None and pc == self._trace_sync_pc:
-            self.vic = ViciiCycleEngine()
+            if self.accurate_vic:
+                self.vic = ViciiCycleEngine()
             self.memory.raster_line = 0
             self.memory.raster_cycles = 0
 
@@ -766,28 +788,38 @@ class CPU6502:
         op2 = self.memory.read((pc + 2) & 0xFFFF)
 
         cycles = self._execute_opcode(opcode)
-        pattern = self._bus_cycle_phases(opcode, cycles, pc0, p0, x0, y0, op1, op2)
+        if self.accurate_vic:
+            pattern = self._bus_cycle_phases(opcode, cycles, pc0, p0, x0, y0, op1, op2)
+            elapsed = 0
+            vic_tick_one = self._vic_tick_one
+            update_cia = self._update_cia_timers
+            st = self.state
+            for i in range(cycles):
+                bus_phase = pattern[i] if i < len(pattern) else _BUS_READ
+                while True:
+                    _ba_low, ba_blocks_cpu, _irq_edge = vic_tick_one()
+                    st.cycles += 1
+                    update_cia(1, recompute_irq=False)
+                    elapsed += 1
+                    # Stall CPU only on read cycles while BA blocks (VICE behavior).
+                    if not (ba_blocks_cpu and bus_phase == _BUS_READ):
+                        break
 
-        elapsed = 0
-        vic_tick_one = self._vic_tick_one
-        update_cia = self._update_cia_timers
-        st = self.state
-        for i in range(cycles):
-            bus_phase = pattern[i] if i < len(pattern) else _BUS_READ
-            while True:
-                _ba_low, ba_blocks_cpu, _irq_edge = vic_tick_one()
-                st.cycles += 1
-                update_cia(1, recompute_irq=False)
-                elapsed += 1
-                # Stall CPU only on read cycles while BA blocks (VICE behavior).
-                if not (ba_blocks_cpu and bus_phase == _BUS_READ):
-                    break
+            self.memory.recompute_pending_irq()
+            if self.memory.pending_irq and not self._get_flag(0x04):
+                self._handle_irq()
+            return elapsed
 
+        # Fast/coarse mode: no BA-prefetch stall loop, approximate VIC timing by raster advance.
+        self.state.cycles += cycles
+        self._update_cia_timers(cycles)
+        self._advance_raster(cycles)
         self.memory.recompute_pending_irq()
         if self.memory.pending_irq and not self._get_flag(0x04):
-            self._handle_irq()
-
-        return elapsed
+            # Coarse mode: follow historical behavior and service CIA-driven IRQ path.
+            if self.memory.cia1_icr & 0x80:
+                self._handle_irq()
+        return cycles
 
     def _update_cia_timers(self, cycles: int, recompute_irq: bool = True) -> None:
         """Update CIA timers and optionally recompute pending IRQ (defer in hot inner loops)."""
@@ -850,6 +882,28 @@ class CPU6502:
 
     def _handle_irq(self, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Handle IRQ interrupt - let KERNAL handle everything including cursor blink"""
+        if not self.accurate_vic:
+            # Coarse/fast mode IRQ entry (historical behavior before BA-accurate IRQ sequencing).
+            self.memory.pending_irq = False
+            pc = self.state.pc
+            self.memory.write(0x100 + self.state.sp, (pc >> 8) & 0xFF)
+            self.state.sp = (self.state.sp - 1) & 0xFF
+            self.memory.write(0x100 + self.state.sp, pc & 0xFF)
+            self.state.sp = (self.state.sp - 1) & 0xFF
+            self.memory.write(0x100 + self.state.sp, (self.state.p | 0x20) & ~0x10)
+            self.state.sp = (self.state.sp - 1) & 0xFF
+            self._set_flag(0x04, True)
+            irq_addr = self._read_word(IRQ_VECTOR_HW)
+            self.state.pc = irq_addr
+            if udp_debug and udp_debug.enabled:
+                udp_debug.send('irq', {
+                    'irq_addr': irq_addr,
+                    'irq_addr_hex': f'${irq_addr:04X}',
+                    'old_pc': pc,
+                    'old_pc_hex': f'${pc:04X}'
+                })
+            return
+
         # Clear pending IRQ flag but NOT cia1_icr - KERNAL reads $DC0D to acknowledge
         self.memory.recompute_pending_irq()
 

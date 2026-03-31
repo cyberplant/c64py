@@ -73,7 +73,13 @@ class C64:
         (0xBB, 0xBB, 0xBB),  # 15 light gray
     )
 
-    def __init__(self, interface_factory=None, enable_sid: bool = False, enable_resid: bool = False):
+    def __init__(
+        self,
+        interface_factory=None,
+        enable_sid: bool = False,
+        enable_resid: bool = False,
+        accurate_vic: bool = False,
+    ):
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -81,7 +87,8 @@ class C64:
             self.interface = interface_factory(self)
 
         # Create CPU with interface reference
-        self.cpu = CPU6502(self.memory, self.interface)
+        self.cpu = CPU6502(self.memory, self.interface, accurate_vic=accurate_vic)
+        self.accurate_vic = accurate_vic
         self.sid = None
 
         self.running = False
