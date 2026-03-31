@@ -84,6 +84,9 @@ class TraceLine:
 def parse_trace_line(line: str, line_num: int = 0) -> Optional[TraceLine]:
     """Parse a VICE-format trace line"""
     line = line.strip()
+    # Comment / metadata lines (e.g. "; w <seconds>") are intentionally ignored.
+    if line.startswith(";"):
+        return None
     if not line or not line.startswith('.C:'):
         return None
 
@@ -121,6 +124,49 @@ def parse_trace_line(line: str, line_num: int = 0) -> Optional[TraceLine]:
         )
     except Exception:
         return None
+
+
+# Default PC ranges for --skip-interrupt-divergences (stock KERNAL / IRQ path).
+# Custom IRQ routines in RAM are not covered; use --irq-skip-pc-range for those.
+DEFAULT_IRQ_SKIP_PC_RANGES: Tuple[Tuple[int, int], ...] = (
+    (0xEA00, 0xFFFF),
+)
+
+
+def parse_hex_irq_range(s: str) -> Tuple[int, int]:
+    """Parse ``START:END`` (16-bit hex, inclusive)."""
+    s = s.strip()
+    if ":" not in s:
+        raise ValueError("expected START:END hex range")
+    a, b = s.split(":", 1)
+    lo, hi = int(a.strip(), 16), int(b.strip(), 16)
+    if lo > hi:
+        lo, hi = hi, lo
+    lo &= 0xFFFF
+    hi &= 0xFFFF
+    return lo, hi
+
+
+def pc_xor_irq_skip_ranges(pc_a: int, pc_b: int, ranges: List[Tuple[int, int]]) -> bool:
+    """True when exactly one PC is in a skip range (typical game vs KERNAL IRQ slip).
+
+    If both PCs are inside the range, we do not skip (could be a real KERNAL bug or
+    unrelated boot mismatch). If neither is in range, do not skip (application code).
+    """
+
+    def in_any(pc: int) -> bool:
+        return any(lo <= pc <= hi for lo, hi in ranges)
+
+    a_in = in_any(pc_a)
+    b_in = in_any(pc_b)
+    return a_in != b_in
+
+
+def _parse_irq_range_arg(s: str) -> Tuple[int, int]:
+    try:
+        return parse_hex_irq_range(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def count_lines(filename: str) -> int:
@@ -350,14 +396,15 @@ def find_resync(
     our_iter: "Iterator[Tuple[int, TraceLine]]",
     vice_iter: "Iterator[Tuple[int, TraceLine]]",
     lookahead: int,
-) -> "Tuple[List[Optional[TraceLine]], List[Optional[TraceLine]], Optional[Tuple[TraceLine, TraceLine]], List[TraceLine], List[TraceLine]]":
+) -> "Tuple[List[Optional[TraceLine]], List[Optional[TraceLine]], Optional[Tuple[TraceLine, TraceLine]], List[TraceLine], List[TraceLine], int]":
     """Look ahead in both iterators to find the next matching line.
 
-    Returns ``(ours_gap, vice_gap, resync_pair, our_tail, vice_tail)`` where:
+    Returns ``(ours_gap, vice_gap, resync_pair, our_tail, vice_tail, resync_cost)`` where:
     - gaps are parallel lists of the same length with ``None`` for missing sides
     - *resync_pair* is ``None`` if no match found within lookahead
     - *our_tail* / *vice_tail* are the unconsumed buffer items after the resync
       point; prepend these back to the iterators with ``itertools.chain``
+    - *resync_cost* is (i+j) for the chosen resync, or a large sentinel when none found
     """
     our_buf: List[TraceLine] = []
     vice_buf: List[TraceLine] = []
@@ -399,7 +446,7 @@ def find_resync(
         max_len = max(len(our_buf), len(vice_buf), 1)
         ours_gap: List[Optional[TraceLine]] = list(our_buf) + [None] * (max_len - len(our_buf))
         vice_gap: List[Optional[TraceLine]] = list(vice_buf) + [None] * (max_len - len(vice_buf))
-        return ours_gap, vice_gap, None, [], []
+        return ours_gap, vice_gap, None, [], [], best_cost
 
     # Build parallel gap lists with None where one side is shorter
     ours_raw = our_buf[:best_i]
@@ -410,7 +457,7 @@ def find_resync(
     resync_pair = (our_buf[best_i], vice_buf[best_j])
     our_tail = our_buf[best_i + 1:]
     vice_tail = vice_buf[best_j + 1:]
-    return ours_gap, vice_gap, resync_pair, our_tail, vice_tail
+    return ours_gap, vice_gap, resync_pair, our_tail, vice_tail, best_cost
 def _show_cycle_drift_inline(
     before_lines: "List[Tuple[TraceLine, TraceLine]]",
     our_line: "TraceLine",
@@ -487,6 +534,14 @@ def compare_traces_streaming(
     diffmode: str = "sidebyside",
     resync_lookahead: int = 50,
     drift_context: int = 3,
+    skip_drift_report: bool = False,
+    quiet_drift_summary: bool = False,
+    stop_after_first_divergence: bool = False,
+    skip_interrupt_divergences: bool = False,
+    irq_skip_pc_ranges: Optional[List[Tuple[int, int]]] = None,
+    min_resync_cost_to_report: int = 0,
+    squash_repeated_divergences: bool = False,
+    find_first_stable_divergence: bool = False,
 ) -> None:
     """Compare two trace files using streaming (memory efficient)"""
     
@@ -546,6 +601,8 @@ def compare_traces_streaming(
     total_matches = 0     # cumulative matches across all segments
     divergence_count = 0
     drift_event_count = 0
+    irq_skipped_count = 0
+    squashed_divergence_count = 0
     lines_compared = 0
     our_exhausted = False
     vice_exhausted = False
@@ -553,6 +610,34 @@ def compare_traces_streaming(
     last_divergence_resynced = True  # True until proven otherwise
 
     print_msg("🔄 Comparing traces...", "yellow")
+
+    irq_ranges_eff: Optional[List[Tuple[int, int]]] = None
+    if skip_interrupt_divergences:
+        irq_ranges_eff = (
+            list(irq_skip_pc_ranges)
+            if irq_skip_pc_ranges
+            else list(DEFAULT_IRQ_SKIP_PC_RANGES)
+        )
+
+    # Divergence squashing stats (used when IRQ timing jitter causes frequent short-lived mismatches)
+    repeated_divergence_counts: dict[tuple, int] = {}
+    repeated_divergence_squashed: dict[tuple, int] = {}
+
+    def apply_resync(
+        rp: Tuple[TraceLine, TraceLine],
+        our_tail: List[TraceLine],
+        vice_tail: List[TraceLine],
+    ) -> None:
+        nonlocal our_iter, vice_iter, cycle_delta, context_before, segment_matches, last_divergence_resynced
+        our_r, vice_r = rp
+        cycle_delta = vice_r.cycles - our_r.cycles
+        if our_tail or vice_tail:
+            our_iter = itertools.chain(((0, tl) for tl in our_tail), our_iter)
+            vice_iter = itertools.chain(((0, tl) for tl in vice_tail), vice_iter)
+        context_before = deque(maxlen=max(1, context_lines // 2))
+        context_before.append((our_r, vice_r))
+        segment_matches = 1
+        last_divergence_resynced = True
 
     with open(our_trace, 'r') as f_our, open(vice_trace, 'r') as f_vice:
         our_iter: "Iterator[Tuple[int, TraceLine]]" = iterate_trace_file(
@@ -602,6 +687,50 @@ def compare_traces_streaming(
 
             if our_cmp != vice_cmp:
                 # ── Divergence found ──────────────────────────────────────
+                before_list = list(context_before)
+
+                ours_gap, vice_gap, resync_pair, our_tail, vice_tail, resync_cost = find_resync(
+                    our_iter, vice_iter, resync_lookahead
+                )
+
+                sig = (our_line.pc, our_line.opcode, vice_line.pc, vice_line.opcode)
+                repeated_divergence_counts[sig] = repeated_divergence_counts.get(sig, 0) + 1
+
+                irq_skippable = (
+                    irq_ranges_eff is not None
+                    and resync_pair is not None
+                    and pc_xor_irq_skip_ranges(our_line.pc, vice_line.pc, irq_ranges_eff)
+                )
+                if irq_skippable:
+                    total_matches += segment_matches
+                    irq_skipped_count += 1
+                    apply_resync(resync_pair, our_tail, vice_tail)
+                    continue
+
+                # Short-lived divergence squashing: if a re-sync exists and it is "cheap" (few lines),
+                # treat it as phase noise (often IRQ-related) and avoid printing the full block.
+                short_lived = (resync_pair is not None) and (resync_cost < min_resync_cost_to_report)
+
+                if resync_pair is not None and (short_lived or squash_repeated_divergences):
+                    if squash_repeated_divergences:
+                        already_seen = repeated_divergence_counts[sig] > 1
+                        if already_seen or short_lived:
+                            repeated_divergence_squashed[sig] = repeated_divergence_squashed.get(sig, 0) + 1
+                            squashed_divergence_count += 1
+                            if repeated_divergence_counts[sig] == 2:
+                                print_msg(
+                                    f"… squashing repeated divergence at OURS ${our_line.pc:04X} / VICE ${vice_line.pc:04X} (opcode {our_line.opcode:02X}/{vice_line.opcode:02X})",
+                                    "dim",
+                                )
+                            total_matches += segment_matches
+                            apply_resync(resync_pair, our_tail, vice_tail)
+                            continue
+                    if short_lived:
+                        squashed_divergence_count += 1
+                        total_matches += segment_matches
+                        apply_resync(resync_pair, our_tail, vice_tail)
+                        continue
+
                 divergence_count += 1
                 total_matches += segment_matches
 
@@ -612,12 +741,6 @@ def compare_traces_streaming(
                 print()
                 print_msg(f"❌ Divergence #{divergence_count} at line {lines_compared:,}:", "red bold")
                 print()
-
-                before_list = list(context_before)
-
-                ours_gap, vice_gap, resync_pair, our_tail, vice_tail = find_resync(
-                    our_iter, vice_iter, resync_lookahead
-                )
 
                 resync_annotation = ""
                 if resync_pair:
@@ -662,24 +785,15 @@ def compare_traces_streaming(
                         print_msg(f"      VICE:  {vice_r.raw.strip()}", "dim")
                     print_msg("  " + "=" * 90, "dim")
 
+                if stop_after_first_divergence:
+                    print_msg(
+                        "⏹️  Stopping after first divergence (--stop-after-first-divergence).",
+                        "yellow bold",
+                    )
+                    sys.exit(1)
+
                 if resync_pair:
-                    # Restore unconsumed buffer items and treat resync line as
-                    # first match of the next segment.
-                    our_r, vice_r = resync_pair
-                    # Update cycle baseline to whatever the resync line shows
-                    cycle_delta = vice_r.cycles - our_r.cycles
-                    if our_tail or vice_tail:
-                        # Wrap tail lists as fake (line_num, TraceLine) tuples
-                        our_iter = itertools.chain(
-                            ((0, tl) for tl in our_tail), our_iter
-                        )
-                        vice_iter = itertools.chain(
-                            ((0, tl) for tl in vice_tail), vice_iter
-                        )
-                    context_before = deque(maxlen=max(1, context_lines // 2))
-                    context_before.append((our_r, vice_r))
-                    segment_matches = 1
-                    last_divergence_resynced = True
+                    apply_resync(resync_pair, our_tail, vice_tail)
                 else:
                     last_divergence_resynced = False
                     done = True
@@ -694,32 +808,33 @@ def compare_traces_streaming(
                     cycle_delta = current_delta
                 elif current_delta != cycle_delta:
                     drift_event_count += 1
-                    # Gather before-context from buffer (drift line is the last entry)
-                    buf_list = list(context_before)
-                    before_ctx = buf_list[:-1][-drift_context:] if drift_context > 0 else []
-                    # Gather after-context by reading ahead, then restoring
-                    after_ctx: List[Tuple[TraceLine, TraceLine]] = []
-                    after_our: List[TraceLine] = []
-                    after_vice: List[TraceLine] = []
-                    for _ in range(drift_context):
-                        try:
-                            _, ao = next(our_iter)
-                            _, av = next(vice_iter)
-                            after_ctx.append((ao, av))
-                            after_our.append(ao)
-                            after_vice.append(av)
-                        except StopIteration:
-                            break
-                    # Put the after lines back so the main loop sees them
-                    if after_our or after_vice:
-                        our_iter = itertools.chain(((0, tl) for tl in after_our), our_iter)
-                        vice_iter = itertools.chain(((0, tl) for tl in after_vice), vice_iter)
-                    _show_cycle_drift_inline(
-                        before_ctx, our_line, vice_line, after_ctx,
-                        old_delta=cycle_delta,
-                        new_delta=current_delta,
-                        line_num=lines_compared,
-                    )
+                    if not skip_drift_report:
+                        # Gather before-context from buffer (drift line is the last entry)
+                        buf_list = list(context_before)
+                        before_ctx = buf_list[:-1][-drift_context:] if drift_context > 0 else []
+                        # Gather after-context by reading ahead, then restoring
+                        after_ctx: List[Tuple[TraceLine, TraceLine]] = []
+                        after_our: List[TraceLine] = []
+                        after_vice: List[TraceLine] = []
+                        for _ in range(drift_context):
+                            try:
+                                _, ao = next(our_iter)
+                                _, av = next(vice_iter)
+                                after_ctx.append((ao, av))
+                                after_our.append(ao)
+                                after_vice.append(av)
+                            except StopIteration:
+                                break
+                        # Put the after lines back so the main loop sees them
+                        if after_our or after_vice:
+                            our_iter = itertools.chain(((0, tl) for tl in after_our), our_iter)
+                            vice_iter = itertools.chain(((0, tl) for tl in after_vice), vice_iter)
+                        _show_cycle_drift_inline(
+                            before_ctx, our_line, vice_line, after_ctx,
+                            old_delta=cycle_delta,
+                            new_delta=current_delta,
+                            line_num=lines_compared,
+                        )
                     cycle_delta = current_delta
                     # Reset context so subsequent before-lines use the new delta
                     context_before = deque(maxlen=max(1, context_lines // 2))
@@ -742,10 +857,18 @@ def compare_traces_streaming(
             if drift_event_count == 0:
                 print_msg("🎉 Traces are identical!", "green bold")
             else:
-                print_msg(
-                    f"✅ Instruction stream identical — {drift_event_count} cycle drift event(s) detected",
-                    "yellow bold",
-                )
+                if quiet_drift_summary:
+                    print_msg("✅ Instruction stream identical!", "yellow bold")
+                else:
+                    print_msg(
+                        f"✅ Instruction stream identical — {drift_event_count} cycle drift event(s) detected",
+                        "yellow bold",
+                    )
+        if irq_skipped_count:
+            print_msg(
+                f"   ({irq_skipped_count} IRQ-skipped re-sync(s); timing mismatch in KERNAL/IRQ vs VICE)",
+                "dim",
+            )
         return
 
     # At least one divergence
@@ -765,10 +888,18 @@ def compare_traces_streaming(
         )
 
     print()
-    drift_suffix = f" | {drift_event_count} cycle drift event(s)" if drift_event_count else ""
+    drift_suffix = ""
+    if drift_event_count and not quiet_drift_summary:
+        drift_suffix = f" | {drift_event_count} cycle drift event(s)"
+    irq_suffix = ""
+    if irq_skipped_count:
+        irq_suffix = f" | {irq_skipped_count} IRQ-skipped re-sync(s)"
+    squash_suffix = ""
+    if squashed_divergence_count:
+        squash_suffix = f" | {squashed_divergence_count} squashed short-lived/repeated divergence(s)"
     print_msg(
         f"📊 Summary: {divergence_count} divergence{'s' if divergence_count != 1 else ''} found | "
-        f"{total_matches:,} total lines matched{drift_suffix}",
+        f"{total_matches:,} total lines matched{drift_suffix}{irq_suffix}{squash_suffix}",
         "cyan bold",
     )
 
@@ -778,12 +909,26 @@ def main():
         description='Compare C64 emulator traces with VICE',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Cycle drift vs real bugs:
+  When instruction text matches but the running offset (VICE cycles minus ours) changes,
+  the tool reports "cycle drift" — that means phase slip vs VICE, not necessarily a wrong
+  opcode at that line. Loader/IRQ issues may need traces narrowed around IRQ vectors or
+  $D019, or future logs of raster line/cycle at IRQ.
+
+IRQ skip (--skip-interrupt-divergences):
+  When a mismatch re-syncs within --resync-lookahead and exactly one PC is in the
+  KERNAL range (default $EA00–$FFFF) — typical "game code here vs IRQ there" —
+  the tool can treat it as interrupt-phase noise and not count it as a divergence.
+  If both PCs are in range, we still report (KERNAL vs KERNAL may be a real bug).
+  Use --irq-skip-pc-range for custom IRQ handlers in RAM (repeatable).
+
 Examples:
   %(prog)s game.prg --vice-trace vice.txt
   %(prog)s game.prg --vice-trace vice.txt --match-cycles-at 0100
   %(prog)s game.prg --vice-trace vice.txt --ignore-cycles
   %(prog)s --our-trace ours.txt --vice-trace vice.txt
   %(prog)s --our-trace ours.txt --vice-trace vice.txt --max-lines 1000000
+  %(prog)s --our-trace ours.txt --vice-trace vice.txt --skip-drift-report --quiet-drift-summary
         """
     )
     
@@ -802,6 +947,46 @@ Examples:
                         help='Lines to scan when searching for re-sync after divergence (default: 50)')
     parser.add_argument('--drift-context', type=int, default=3, metavar='N',
                         help='Context lines to show before/after a cycle drift event (default: 3)')
+    parser.add_argument('--skip-drift-report', action='store_true',
+                        help='Count cycle drift but do not print drift blocks or read ahead (faster)')
+    parser.add_argument('--quiet-drift-summary', action='store_true',
+                        help='Omit drift counts from final summary (focus on instruction divergences)')
+    parser.add_argument('--stop-after-first-divergence', action='store_true',
+                        help='Exit with status 1 after printing the first instruction divergence')
+    parser.add_argument(
+        '--min-resync-cost-to-report',
+        type=int,
+        default=0,
+        metavar='N',
+        help='If a mismatch re-syncs within N total lookahead steps (i+j), squash it (default: 0 = report all)',
+    )
+    parser.add_argument(
+        '--squash-repeated-divergences',
+        action='store_true',
+        help='If the same (pc/opcode) divergence repeats and re-syncs, suppress repeated full blocks',
+    )
+    parser.add_argument(
+        '--find-first-stable-divergence',
+        action='store_true',
+        help='Triage mode: skip drift + IRQ-phase noise and stop at first non-squashed divergence',
+    )
+    parser.add_argument(
+        '--skip-interrupt-divergences',
+        action='store_true',
+        help=(
+            'If a mismatch re-syncs within lookahead and exactly one PC is in KERNAL '
+            '($EA00–FFFF default), do not report it (game vs IRQ phase heuristic)'
+        ),
+    )
+    parser.add_argument(
+        '--irq-skip-pc-range',
+        action='append',
+        dest='irq_skip_pc_ranges',
+        metavar='START:END',
+        type=_parse_irq_range_arg,
+        help='With --skip-interrupt-divergences: extra inclusive hex PC range (repeatable); '
+        'defaults to EA00:FFFF if omitted',
+    )
     parser.add_argument('--nocolor', action='store_true',
                         help='Disable ANSI colours (by default colour is forced for use with less -R)')
     
@@ -856,6 +1041,18 @@ Examples:
         diffmode=args.diffmode,
         resync_lookahead=args.resync_lookahead,
         drift_context=args.drift_context,
+        skip_drift_report=(args.skip_drift_report or args.find_first_stable_divergence),
+        quiet_drift_summary=args.quiet_drift_summary,
+        stop_after_first_divergence=(args.stop_after_first_divergence or args.find_first_stable_divergence),
+        skip_interrupt_divergences=(args.skip_interrupt_divergences or args.find_first_stable_divergence),
+        irq_skip_pc_ranges=args.irq_skip_pc_ranges,
+        min_resync_cost_to_report=(
+            args.min_resync_cost_to_report
+            if (args.min_resync_cost_to_report != 0 or not args.find_first_stable_divergence)
+            else 16
+        ),
+        squash_repeated_divergences=args.squash_repeated_divergences,
+        find_first_stable_divergence=args.find_first_stable_divergence,
     )
     
     if not args.our_trace and os.path.exists(our_trace):

@@ -769,12 +769,15 @@ class CPU6502:
         pattern = self._bus_cycle_phases(opcode, cycles, pc0, p0, x0, y0, op1, op2)
 
         elapsed = 0
+        vic_tick_one = self._vic_tick_one
+        update_cia = self._update_cia_timers
+        st = self.state
         for i in range(cycles):
             bus_phase = pattern[i] if i < len(pattern) else _BUS_READ
             while True:
-                _ba_low, ba_blocks_cpu, _irq_edge = self._vic_tick_one()
-                self.state.cycles += 1
-                self._update_cia_timers(1, recompute_irq=False)
+                _ba_low, ba_blocks_cpu, _irq_edge = vic_tick_one()
+                st.cycles += 1
+                update_cia(1, recompute_irq=False)
                 elapsed += 1
                 # Stall CPU only on read cycles while BA blocks (VICE behavior).
                 if not (ba_blocks_cpu and bus_phase == _BUS_READ):
@@ -788,32 +791,37 @@ class CPU6502:
 
     def _update_cia_timers(self, cycles: int, recompute_irq: bool = True) -> None:
         """Update CIA timers and optionally recompute pending IRQ (defer in hot inner loops)."""
+        mem = self.memory
+        tA = mem.cia1_timer_a
+        tB = mem.cia1_timer_b
+        if not recompute_irq and (not tA.running) and (not tB.running):
+            return
         # Update Timer A
-        if self.memory.cia1_timer_a.update(cycles):
-            if self.memory.cia1_timer_a.irq_enabled:
-                self.memory.cia1_icr |= 0x01  # Timer A interrupt
-                self.memory.cia1_icr |= 0x80  # IRQ flag
-            self.memory.cia1_timer_a.reset()
+        if tA.update(cycles):
+            if tA.irq_enabled:
+                mem.cia1_icr |= 0x01  # Timer A interrupt
+                mem.cia1_icr |= 0x80  # IRQ flag
+            tA.reset()
 
         # Update Timer B (can be clocked by Timer A underflow)
         timer_a_underflow = False
-        if self.memory.cia1_timer_a.counter <= 0 and self.memory.cia1_timer_a.running:
+        if tA.counter <= 0 and tA.running:
             timer_a_underflow = True
 
-        if self.memory.cia1_timer_b.input_mode == 2:  # Timer A underflow mode
+        if tB.input_mode == 2:  # Timer A underflow mode
             if timer_a_underflow:
-                if self.memory.cia1_timer_b.update(1):  # Count by 1
-                    self.memory.cia1_icr |= 0x02  # Timer B interrupt
-                    self.memory.cia1_icr |= 0x80  # IRQ flag
-                    self.memory.cia1_timer_b.reset()
+                if tB.update(1):  # Count by 1
+                    mem.cia1_icr |= 0x02  # Timer B interrupt
+                    mem.cia1_icr |= 0x80  # IRQ flag
+                    tB.reset()
         else:
-            if self.memory.cia1_timer_b.update(cycles):
-                self.memory.cia1_icr |= 0x02  # Timer B interrupt
-                self.memory.cia1_icr |= 0x80  # IRQ flag
-                self.memory.cia1_timer_b.reset()
+            if tB.update(cycles):
+                mem.cia1_icr |= 0x02  # Timer B interrupt
+                mem.cia1_icr |= 0x80  # IRQ flag
+                tB.reset()
 
         if recompute_irq:
-            self.memory.recompute_pending_irq()
+            mem.recompute_pending_irq()
 
     def _handle_cia_interrupt(self) -> None:
         """Handle CIA interrupts directly (bypass KERNAL for stability)"""

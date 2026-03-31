@@ -131,6 +131,11 @@ def main():
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
     ap.add_argument("--vice-trace", type=str, metavar="FILE", help="Write VICE-compatible CPU trace to FILE for comparison debugging")
+    ap.add_argument(
+        "--vice-trace-wall",
+        action="store_true",
+        help="With --vice-trace: append '; w <seconds>' lines (monotonic) for host profiling between instructions",
+    )
     ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
 
     args = ap.parse_args()
@@ -208,7 +213,7 @@ def main():
     # Setup VICE-compatible trace logging if requested
     vice_trace = None
     if args.vice_trace:
-        vice_trace = ViceTraceLogger(filename=args.vice_trace)
+        vice_trace = ViceTraceLogger(filename=args.vice_trace, wall_time=args.vice_trace_wall)
         vice_trace.enable()
         emu.vice_trace = vice_trace
         if show_ui_logs and emu.interface is not None:

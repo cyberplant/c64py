@@ -94,14 +94,16 @@ OPCODE_SIZES = {
 
 class ViceTraceLogger:
     """File-based trace logger with VICE-compatible format for comparison debugging"""
-    
-    def __init__(self, filename: str = "c64py_trace.log"):
+
+    def __init__(self, filename: str = "c64py_trace.log", wall_time: bool = False):
         self.filename = filename
         self.file: Optional[TextIO] = None
         self.enabled = False
         self._line_count = 0
         self._max_lines = 10000000  # 10M lines for debugging
-    
+        self._wall_time = wall_time
+        self._wall_last: float = 0.0
+
     def enable(self) -> None:
         """Enable trace logging to file"""
         try:
@@ -109,6 +111,11 @@ class ViceTraceLogger:
             self.enabled = True
             self.file.write("; c64py trace (VICE-compatible format)\n")
             self.file.write("; Format: .C:addr  bytes  mnemonic  - A:xx X:xx Y:xx SP:xx flags  cycles\n")
+            if self._wall_time:
+                self._wall_last = time.monotonic()
+                self.file.write(
+                    "; wall: each following '; w' line is seconds since previous trace line (monotonic clock)\n"
+                )
         except Exception as e:
             print(f"Warning: Failed to open trace file: {e}", file=sys.stderr)
             self.enabled = False
@@ -149,10 +156,15 @@ class ViceTraceLogger:
         
         # VICE format: .C:0813  99 FB 00    STA $00FB,Y    - A:D8 X:00 Y:00 SP:f6 N.-..I..  2112858
         line = f".C:{pc:04x}  {bytes_str} {instr_str} - A:{a:02X} X:{x:02X} Y:{y:02X} SP:{sp:02x} {flags_str}  {cycles}\n"
-        
+
         self.file.write(line)
         self._line_count += 1
-        
+        if self._wall_time:
+            now = time.monotonic()
+            dt = now - self._wall_last
+            self._wall_last = now
+            self.file.write(f"; w {dt:.9f}\n")
+
         # Flush periodically
         if self._line_count % 10000 == 0:
             self.file.flush()
