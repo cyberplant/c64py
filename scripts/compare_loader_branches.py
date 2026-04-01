@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Iterator
 
@@ -173,6 +174,11 @@ def main() -> int:
             "before mismatch, and vice_trace_to_inject.py stub"
         ),
     )
+    ap.add_argument(
+        "--prefix-pc-counts",
+        action="store_true",
+        help="On first pc/take/z mismatch, print per-PC event counts for the matched prefix (c64py vs VICE)",
+    )
     args = ap.parse_args()
 
     c_anchor, c_list = parse_c64py_branches(args.c64py_log)
@@ -193,6 +199,7 @@ def main() -> int:
 
     it = iter_vice_branches(args.vice_trace, v_anchor)
     diffs = 0
+    v_prefix: list[tuple[str, int, int, int, str, str, str]] = []
     for i, c_ev in enumerate(c_list):
         try:
             v_ev = next(it)
@@ -205,7 +212,21 @@ def main() -> int:
             print(f"  c64py: pc={c_ev[0]} cyc={c_ev[1]} take={c_ev[2]} z={c_ev[3]} a={c_ev[4]} x={c_ev[5]} y={c_ev[6]}")
             print(f"  vice:  pc={v_ev[0]} cyc={v_ev[1]} take={v_ev[2]} z={v_ev[3]} a={v_ev[4]} x={v_ev[5]} y={v_ev[6]}")
             if (c_ev[2], c_ev[3]) == (v_ev[2], v_ev[3]):
-                print("  note: take/z agree — likely one extra/missing visit to a watched PC (phase slip vs VICE).")
+                print(
+                    "  note: take/z agree but PC differs (phase slip vs VICE). "
+                    "Use --prefix-pc-counts: if per-PC totals match in the prefix, slip is ordering/timing, "
+                    "not an extra branch at those PCs."
+                )
+            if args.prefix_pc_counts and diffs == 0:
+                assert len(v_prefix) == i
+                c_pc = Counter(e[0] for e in c_list[:i])
+                v_pc = Counter(e[0] for e in v_prefix)
+                print("--- prefix-pc-counts (matched events only, idx 0..i-1) ---")
+                all_pcs = sorted(set(c_pc) | set(v_pc))
+                for pc in all_pcs:
+                    dc = c_pc.get(pc, 0) - v_pc.get(pc, 0)
+                    extra = f"  delta_c64_minus_vice={dc:+d}" if dc else ""
+                    print(f"  pc={pc}  c64py={c_pc.get(pc, 0):6d}  vice={v_pc.get(pc, 0):6d}{extra}")
             if args.inject_hint and diffs == 0:
                 vc = v_ev[1]
                 cc = c_ev[1]
@@ -247,9 +268,11 @@ def main() -> int:
             if diffs >= args.max_diff:
                 print(f"(stopped after {args.max_diff} mismatches)")
                 return 1
-        elif (c_ev[4], c_ev[5], c_ev[6]) != (v_ev[4], v_ev[5], v_ev[6]):
-            # Same branch outcome; registers differ (still interesting)
-            pass
+        else:
+            v_prefix.append(v_ev)
+            if (c_ev[4], c_ev[5], c_ev[6]) != (v_ev[4], v_ev[5], v_ev[6]):
+                # Same branch outcome; registers differ (still interesting)
+                pass
 
     rest = sum(1 for _ in it)
     if rest:
