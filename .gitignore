@@ -27,6 +27,19 @@ htmlcov/
 .tox/
 .nox/
 
+# Local debug traces (large)
+bruce_fresh.log
+bruce_inject*.log
+c64py_full_trace*.log
+vice_full_trace.log
+tmp_stack*.inject
+vice_capture_*.jsonl
+vice_capture_*.log
+vice_monitor_capture*.jsonl
+vice_monitor_capture*.log
+vice_cap_*.jsonl
+vice_cap_*.log
+
 # Editors / OS
 .DS_Store
 .idea/

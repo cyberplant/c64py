@@ -18,6 +18,7 @@ import functools
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 # Handle both direct execution and module import
@@ -90,6 +91,48 @@ def _show_speed(
             print(f"Speed:  {mhz:.2f} MHz")
 
 
+def _parse_debug_inject_pair(lhs_s: str, val_s: str, *, source: str) -> tuple[int | str, int]:
+    val = int(val_s.strip(), 16)
+    if lhs_s in ("a", "x", "y", "p", "flags"):
+        return (lhs_s if lhs_s != "flags" else "p", val)
+    return (int(lhs_s, 16), val)
+
+
+def _parse_debug_inject_map_string(map_str: str) -> list[tuple[int | str, int]]:
+    pairs: list[tuple[int | str, int]] = []
+    for part in map_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            print(
+                f"ERROR: bad --debug-inject-map fragment {part!r} (want addr=val)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        lhs, rhs = part.split("=", 1)
+        pairs.append(_parse_debug_inject_pair(lhs.strip().lower(), rhs, source="--debug-inject-map"))
+    return pairs
+
+
+def _parse_debug_inject_file(path: str) -> list[tuple[int | str, int]]:
+    p = Path(path)
+    if not p.is_file():
+        print(f"ERROR: --debug-inject-file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    pairs: list[tuple[int | str, int]] = []
+    for lineno, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "=" not in s:
+            print(f"ERROR: {path}:{lineno}: expected addr=value or reg=value", file=sys.stderr)
+            sys.exit(1)
+        lhs, rhs = s.split("=", 1)
+        pairs.append(_parse_debug_inject_pair(lhs.strip().lower(), rhs, source=f"{path}:{lineno}"))
+    return pairs
+
+
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -159,17 +202,35 @@ def main():
         metavar="MAP",
         help=(
             "With --debug-inject-at-cycle: comma-separated pairs. RAM: hex addr=value (e.g. 2f=53,30=e7). "
-            "CPU regs: a=, x=, y=, p= (e.g. a=d6,x=da to match a VICE snapshot)."
+            "CPU regs: a=, x=, y=, p= (e.g. a=d6,x=da to match a VICE snapshot). "
+            "Optional if --debug-inject-file is set."
+        ),
+    )
+    ap.add_argument(
+        "--debug-inject-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "With --debug-inject-at-cycle: text file of addr=value lines (hex), # comments OK. "
+            "Useful for stack page from VICE (m 0100 01ff). Applied before --debug-inject-map (map overrides)."
         ),
     )
 
     args = ap.parse_args()
 
-    if args.debug_inject_at_cycle is not None and not args.debug_inject_map:
-        print("ERROR: --debug-inject-map is required with --debug-inject-at-cycle", file=sys.stderr)
+    has_inject_src = bool(args.debug_inject_map or args.debug_inject_file)
+    if args.debug_inject_at_cycle is not None and not has_inject_src:
+        print(
+            "ERROR: --debug-inject-map and/or --debug-inject-file is required with --debug-inject-at-cycle",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    if args.debug_inject_map is not None and args.debug_inject_at_cycle is None:
-        print("ERROR: --debug-inject-at-cycle is required with --debug-inject-map", file=sys.stderr)
+    if has_inject_src and args.debug_inject_at_cycle is None:
+        print(
+            "ERROR: --debug-inject-at-cycle is required with --debug-inject-map / --debug-inject-file",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # --benchmark implies other flags and loads benchmark PRG
@@ -215,20 +276,13 @@ def main():
     )
     if args.debug_inject_at_cycle is not None:
         inject_pairs: list[tuple[int | str, int]] = []
-        for part in args.debug_inject_map.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" not in part:
-                print(f"ERROR: bad --debug-inject-map fragment {part!r} (want addr=val)", file=sys.stderr)
-                sys.exit(1)
-            lhs, rhs = part.split("=", 1)
-            lhs_s = lhs.strip().lower()
-            val = int(rhs.strip(), 16)
-            if lhs_s in ("a", "x", "y", "p", "flags"):
-                inject_pairs.append((lhs_s if lhs_s != "flags" else "p", val))
-            else:
-                inject_pairs.append((int(lhs_s, 16), val))
+        if args.debug_inject_file:
+            inject_pairs.extend(_parse_debug_inject_file(args.debug_inject_file))
+        if args.debug_inject_map:
+            inject_pairs.extend(_parse_debug_inject_map_string(args.debug_inject_map))
+        if not inject_pairs:
+            print("ERROR: no inject entries after parsing file/map", file=sys.stderr)
+            sys.exit(1)
         emu.cpu.debug_inject_at_cycle = args.debug_inject_at_cycle
         emu.cpu.debug_inject_writes = inject_pairs
     emu.debug = args.debug
@@ -292,10 +346,8 @@ def main():
         try:
             explicit_rom_dir = args.rom_dir
             if explicit_rom_dir and not os.path.isabs(explicit_rom_dir):
-                # Backward-compatible: interpret relative paths relative to the repo root
-                # (this script lives in c64py/, so parent is project root).
-                parent_dir = os.path.dirname(script_dir)
-                explicit_rom_dir = os.path.normpath(os.path.join(parent_dir, explicit_rom_dir))
+                # Relative to the directory containing this script (repo root when C64.py is there).
+                explicit_rom_dir = os.path.normpath(os.path.join(script_dir, explicit_rom_dir))
 
             rom_dir_path = ensure_roms_available(
                 explicit_rom_dir,

@@ -104,6 +104,74 @@ def parse_stop_pcs(block: str) -> set[str]:
     return pcs
 
 
+def parse_last_trace_cycle(block: str) -> int | None:
+    """
+    Parse the last trailing cycle value from a VICE trace line in a monitor block.
+
+    Example line:
+      .C:010f  D0 02 ... - A:D6 X:DA Y:00 ...   90487723
+    """
+    cyc: int | None = None
+    for line in block.splitlines():
+        # Keep this permissive; monitor formatting varies by VICE build/options.
+        m = re.search(r"\.C:[0-9a-fA-F]{4}.*\s(-?\d+)\s*$", line)
+        if not m:
+            # Register dump format includes STOPWATCH as the last field, e.g.:
+            # .;00fc 20 e7 00 fd 2f 10 10100100 131 057   90819030
+            m2 = re.search(r"^\.;[0-9a-fA-F]{4}\s+.*\s(-?\d+)\s*$", line)
+            if not m2:
+                continue
+            try:
+                cyc = int(m2.group(1))
+            except ValueError:
+                continue
+            continue
+        try:
+            cyc = int(m.group(1))
+        except ValueError:
+            continue
+    return cyc
+
+
+def parse_last_trace_pc(block: str) -> str | None:
+    """Parse PC from the last .C:xxxx or .;xxxx monitor trace/register line."""
+    last_pc: str | None = None
+    for line in block.splitlines():
+        m = re.search(r"\.C:([0-9a-fA-F]{4})\b", line)
+        if m:
+            last_pc = m.group(1).lower()
+            continue
+        m2 = re.search(r"^\.;([0-9a-fA-F]{4})\b", line)
+        if m2:
+            last_pc = m2.group(1).lower()
+    return last_pc
+
+
+def _vice_ignore_decimal_to_arg(n: int) -> str:
+    """Format decimal hit-skip count as hex digits for the monitor (no 0x prefix)."""
+    n = max(0, int(n))
+    return f"{n:x}"
+
+
+def parse_last_checkpoint_id(block: str) -> int | None:
+    """
+    Parse latest VICE checkpoint id from monitor output.
+    Examples:
+      BREAK: 2  C:$0881 ...
+      WATCH: 1  C:$e5f0 ...
+    """
+    cid: int | None = None
+    for line in block.splitlines():
+        m = re.search(r"^(?:BREAK|WATCH):\s+(\d+)\b", line.strip())
+        if not m:
+            continue
+        try:
+            cid = int(m.group(1))
+        except ValueError:
+            continue
+    return cid
+
+
 def build_setup_commands(setup: str, watch_mode: str) -> list[str]:
     presets = {
         "custom": [],
@@ -278,9 +346,27 @@ def run_capture(
     max_empty_stops: int,
     minimal_poll: bool,
     exit_on_finish: bool,
+    stop_on_cycle: int | None,
+    stop_on_cycle_pc: str,
+    phase2_stop_on_cycle: int | None,
+    phase2_stop_on_cycle_pc: str,
+    phase2_setup_commands: list[str] | None,
+    auto_ignore_break_count: int,
+    poll_mem_each_stop: bool,
+    dynamic_ignore_phase1: bool,
+    phase1_ceiling_cycle: int | None,
+    phase1_margin_cycles: int,
+    phase1_max_ignore: int,
+    phase1_guess_cyc_per_hit: int,
+    phase1_bootstrap_ignore: int,
 ) -> None:
     jf = None
     empty_stop_streak = 0
+    phase2_armed = False
+    coarse_break_id: int | None = None
+    phase1_next_ignore_dec: int | None = None
+    phase1_prev_stop_cycle: int | None = None
+    phase1_last_applied_ignore_dec: int = 0
     try:
         with output_path.open("w", encoding="utf-8", buffering=1) as f:
             f.write("# VICE monitor capture\n")
@@ -309,6 +395,8 @@ def run_capture(
                     if show_progress:
                         console.print(f"[{ts()}] [cyan]setup>[/cyan] {cmd}")
                     out = client.send(cmd)
+                    if coarse_break_id is None and cmd.strip().lower().startswith("break"):
+                        coarse_break_id = parse_last_checkpoint_id(out)
                     f.write(f">>> {cmd}\n{out}\n")
                     f.flush()
                     if jf is not None:
@@ -320,9 +408,63 @@ def run_capture(
                             "pc": parse_pc(out),
                         }) + "\n")
                         jf.flush()
+                if (
+                    auto_ignore_break_count > 0
+                    and coarse_break_id is not None
+                    and not dynamic_ignore_phase1
+                ):
+                    ign_cmd = f"ignore {coarse_break_id} {auto_ignore_break_count}"
+                    if show_progress:
+                        console.print(f"[{ts()}] [cyan]setup>[/cyan] {ign_cmd}")
+                    ign_out = client.send(ign_cmd)
+                    f.write(f">>> {ign_cmd}\n{ign_out}\n")
+                    f.flush()
+                    if jf is not None:
+                        jf.write(json.dumps({
+                            "timestamp": ts(),
+                            "type": "setup",
+                            "command": ign_cmd,
+                            "response": ign_out,
+                            "pc": parse_pc(ign_out),
+                        }) + "\n")
+                        jf.flush()
 
             for i in range(1, iterations + 1):
-                batch = ["g"] if minimal_poll else ["g", "r", "m 002d 0030"]
+                if (
+                    dynamic_ignore_phase1
+                    and (not phase2_armed)
+                    and coarse_break_id is not None
+                    and phase1_ceiling_cycle is not None
+                ):
+                    if phase1_next_ignore_dec is None:
+                        phase1_next_ignore_dec = min(
+                            phase1_max_ignore,
+                            max(0, int(phase1_bootstrap_ignore)),
+                        )
+                    ign_arg = _vice_ignore_decimal_to_arg(phase1_next_ignore_dec)
+                    ign_cmd = f"ignore {coarse_break_id} {ign_arg}"
+                    if show_progress:
+                        console.print(
+                            f"[{ts()}] [cyan]dynamic-ignore>[/cyan] {ign_cmd} "
+                            f"(dec_skips={phase1_next_ignore_dec})"
+                        )
+                    ign_out = client.send(ign_cmd)
+                    f.write(f">>> {ign_cmd}\n{ign_out}\n")
+                    f.flush()
+                    phase1_last_applied_ignore_dec = phase1_next_ignore_dec
+                    if jf is not None:
+                        jf.write(json.dumps({
+                            "timestamp": ts(),
+                            "type": "dynamic_ignore",
+                            "index": i,
+                            "command": ign_cmd,
+                            "ignore_decimal": phase1_next_ignore_dec,
+                            "response": ign_out,
+                            "pc": parse_pc(ign_out),
+                        }) + "\n")
+                        jf.flush()
+
+                batch = ["g"] if minimal_poll else (["g", "r", "m 002d 0030"] if poll_mem_each_stop else ["g", "r"])
                 if (not minimal_poll) and disasm > 0:
                     batch.append(f"z {disasm}")
                 if show_progress:
@@ -331,6 +473,8 @@ def run_capture(
                 block = f">>> {' ; '.join(batch)}\n{batch_out}"
                 pc = parse_pc(batch_out)
                 stop_pcs = parse_stop_pcs(batch_out)
+                last_trace_cycle = parse_last_trace_cycle(batch_out)
+                trace_pc = parse_last_trace_pc(batch_out)
                 # Guard against monitor desync/no-output loops (pc=???? forever).
                 if (pc == "????") and not stop_pcs:
                     empty_stop_streak += 1
@@ -348,6 +492,7 @@ def run_capture(
                         "type": "stop",
                         "index": i,
                         "pc": pc,
+                        "trace_cycle": last_trace_cycle,
                         "commands": {
                             "batch": batch,
                         },
@@ -371,6 +516,11 @@ def run_capture(
                         jf.flush()
                     break
                 hit = (pc in stop_on_pcs) or bool(stop_pcs.intersection(stop_on_pcs))
+                cycle_hit = False
+                if stop_on_cycle is not None and last_trace_cycle is not None:
+                    pc_for_cycle = trace_pc if trace_pc is not None else pc
+                    if (not stop_on_cycle_pc) or (pc_for_cycle == stop_on_cycle_pc):
+                        cycle_hit = last_trace_cycle >= stop_on_cycle
                 if hit:
                     matched = sorted(({pc} | stop_pcs).intersection(stop_on_pcs))
                     console.print(
@@ -413,6 +563,112 @@ def run_capture(
                             }) + "\n")
                             jf.flush()
                     break
+                if cycle_hit:
+                    if (not phase2_armed) and (phase2_stop_on_cycle is not None):
+                        if show_progress:
+                            console.print(
+                                f"[{ts()}] [bold yellow]Phase1 reached cycle {last_trace_cycle}; switching to "
+                                f"phase2 stop cycle {phase2_stop_on_cycle} at pc=${phase2_stop_on_cycle_pc}.[/bold yellow]"
+                            )
+                        if phase2_setup_commands:
+                            f.write("=== phase2 setup ===\n")
+                            for cmd in phase2_setup_commands:
+                                if show_progress:
+                                    console.print(f"[{ts()}] [cyan]phase2>[/cyan] {cmd}")
+                                out = client.send(cmd)
+                                f.write(f">>> {cmd}\n{out}\n")
+                                f.flush()
+                                if jf is not None:
+                                    jf.write(json.dumps({
+                                        "timestamp": ts(),
+                                        "type": "phase2_setup",
+                                        "command": cmd,
+                                        "response": out,
+                                        "pc": parse_pc(out),
+                                    }) + "\n")
+                                    jf.flush()
+                        stop_on_cycle = phase2_stop_on_cycle
+                        stop_on_cycle_pc = phase2_stop_on_cycle_pc
+                        phase2_armed = True
+                        continue
+
+                    console.print(
+                        f"[{ts()}] [bold yellow]Reached stop-on cycle: {last_trace_cycle} >= {stop_on_cycle} "
+                        f"(pc=${pc}). Stopping early.[/bold yellow]"
+                    )
+                    detail_batch = ["r", "m 002d 0030"]
+                    detail_out = client.send_batch(detail_batch)
+                    detail_block = f">>> {' ; '.join(detail_batch)}\n{detail_out}"
+                    f.write(detail_block)
+                    if not detail_block.endswith("\n"):
+                        f.write("\n")
+                    f.flush()
+                    if jf is not None:
+                        jf.write(json.dumps({
+                            "timestamp": ts(),
+                            "type": "detail_on_cycle",
+                            "pc": pc,
+                            "trace_cycle": last_trace_cycle,
+                            "commands": {
+                                "batch": detail_batch,
+                            },
+                            "raw_block": detail_block,
+                        }) + "\n")
+                        jf.flush()
+                    for dump_range in dump_mem_on_stop:
+                        mem_cmd = f"m {dump_range}"
+                        if show_progress:
+                            console.print(f"[{ts()}] [cyan]dump>[/cyan] {mem_cmd}")
+                        mem_out = client.send(mem_cmd)
+                        f.write(f">>> {mem_cmd}\n{mem_out}\n")
+                        f.flush()
+                        if jf is not None:
+                            jf.write(json.dumps({
+                                "timestamp": ts(),
+                                "type": "mem_dump",
+                                "pc": pc,
+                                "trace_cycle": last_trace_cycle,
+                                "command": mem_cmd,
+                                "response": mem_out,
+                            }) + "\n")
+                            jf.flush()
+                    break
+
+                # Retune coarse breakpoint ignore for the next continue (phase1 only).
+                if (
+                    dynamic_ignore_phase1
+                    and (not phase2_armed)
+                    and phase1_ceiling_cycle is not None
+                    and coarse_break_id is not None
+                    and last_trace_cycle is not None
+                ):
+                    pc_tune = trace_pc if trace_pc is not None else pc
+                    if pc_tune == stop_on_cycle_pc:
+                        ceiling = int(phase1_ceiling_cycle) - int(phase1_margin_cycles)
+                        room = ceiling - int(last_trace_cycle)
+                        if room <= 0:
+                            phase1_next_ignore_dec = 0
+                            phase1_prev_stop_cycle = int(last_trace_cycle)
+                        elif phase1_prev_stop_cycle is None:
+                            rate = max(int(phase1_guess_cyc_per_hit), 1)
+                            phase1_next_ignore_dec = min(
+                                phase1_max_ignore,
+                                max(0, room // rate - 1),
+                            )
+                            phase1_prev_stop_cycle = int(last_trace_cycle)
+                        else:
+                            delta_cyc = int(last_trace_cycle) - int(phase1_prev_stop_cycle)
+                            hits = int(phase1_last_applied_ignore_dec) + 1
+                            rate = max(delta_cyc // max(hits, 1), 1)
+                            want_total = min(
+                                phase1_max_ignore + 1,
+                                max(1, room // rate),
+                            )
+                            phase1_next_ignore_dec = min(
+                                phase1_max_ignore,
+                                max(0, int(want_total) - 1),
+                            )
+                            phase1_prev_stop_cycle = int(last_trace_cycle)
     finally:
         if jf is not None:
             jf.close()
@@ -478,10 +734,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--preset",
-        choices=["", "e5f0_second_00fa"],
+        choices=["", "e5f0_second_00fa", "mismatch_90487723"],
         default="",
         help="e5f0_second_00fa: watch $E5F0, --minimal-poll, stop on $00FA/$00FC, "
-        "default memory dumps (for loader table vs c64py).",
+        "default memory dumps (for loader table vs c64py). "
+        "mismatch_90487723: two-phase break $0881 then $010F; dynamic ignore on $0881; "
+        "stop at vice_cyc>=90487723 at $010F.",
     )
     ap.add_argument(
         "--stop-on-pc",
@@ -521,6 +779,48 @@ def main() -> None:
         action="store_true",
         help="Do not send 'q' to emulator monitor when capture finishes.",
     )
+    ap.add_argument(
+        "--stop-on-cycle",
+        type=int,
+        default=None,
+        help="Optional: stop when parsed VICE trace cycle reaches/exceeds this value.",
+    )
+    ap.add_argument(
+        "--stop-on-cycle-pc",
+        default="",
+        help="Optional: require current monitor PC to equal this hex PC for --stop-on-cycle.",
+    )
+    ap.add_argument(
+        "--phase1-ceiling-cycle",
+        type=int,
+        default=None,
+        help="With --preset mismatch_90487723: STOPWATCH ceiling (default 90487723) so dynamic "
+        "ignore does not overshoot before fine phase.",
+    )
+    ap.add_argument(
+        "--phase1-margin-cycles",
+        type=int,
+        default=None,
+        help="With mismatch preset: cycles kept below ceiling (default 32768).",
+    )
+    ap.add_argument(
+        "--phase1-max-ignore",
+        type=int,
+        default=None,
+        help="With mismatch preset: max breakpoint skips per continue, decimal (default 32768).",
+    )
+    ap.add_argument(
+        "--phase1-guess-cyc-per-hit",
+        type=int,
+        default=None,
+        help="With mismatch preset: initial cyc/hit guess before first measurement (default 2800).",
+    )
+    ap.add_argument(
+        "--phase1-bootstrap-ignore",
+        type=int,
+        default=None,
+        help="With mismatch preset: first-iteration skip count, decimal (default 8192).",
+    )
     args = ap.parse_args()
 
     console = Console()
@@ -541,6 +841,18 @@ def main() -> None:
             )
             args.port = int(port)
 
+        phase2_stop_on_cycle: int | None = None
+        phase2_stop_on_cycle_pc = ""
+        phase2_setup_commands: list[str] | None = None
+        auto_ignore_break_count = 0
+        dynamic_ignore_phase1 = False
+        phase1_ceiling_cycle: int | None = None
+        phase1_margin_cycles = 4096
+        phase1_max_ignore = 0x8000
+        phase1_guess_cyc_per_hit = 2800
+        phase1_bootstrap_ignore = 8192
+        poll_mem_each_stop = True
+
         if args.preset == "e5f0_second_00fa":
             args.watch_mode = "e5f0_second"
             args.stop_on_pc = "00fa,00fc"
@@ -549,16 +861,67 @@ def main() -> None:
             )
             args.minimal_poll = True
             args.iterations = max(args.iterations, 200)
+        elif args.preset == "mismatch_90487723":
+            args.watch_mode = "custom"
+            # Two-phase search:
+            # 1) Coarse: break at 0881 (outer driver, fewer hits) up to near target cycle.
+            # 2) Fine: switch to break 010f and stop at exact mismatch cycle.
+            phase1 = "delete;break 0881"
+            extra = (";" + args.setup) if args.setup else ""
+            args.setup = f"{phase1}{extra}"
+            args.stop_on_pc = ""
+            args.stop_on_cycle = 90487000
+            args.stop_on_cycle_pc = "0881"
+            phase2_stop_on_cycle = 90487723
+            phase2_stop_on_cycle_pc = "010f"
+            phase2_setup_commands = ["delete", "break 010f"]
+            # Dynamic ignore: scale skips from measured c/stop; cap below phase2 target.
+            auto_ignore_break_count = 0
+            dynamic_ignore_phase1 = True
+            phase1_ceiling_cycle = 90487723
+            phase1_margin_cycles = 32768
+            phase1_max_ignore = 0x8000
+            phase1_guess_cyc_per_hit = 2800
+            phase1_bootstrap_ignore = 8192
+            poll_mem_each_stop = False
+            args.dump_mem_on_stop = (
+                "0000 0001;002d 0030;00f8 0118;0100 01ff;e5f0 e610;e750 e770"
+            )
+            # Keep phase1 cheap: parse cycle from register dump (.;) and avoid disasm stepping flood.
+            args.minimal_poll = False
+            args.disasm = 0
+            args.iterations = max(args.iterations, 5000)
+
+        if args.phase1_ceiling_cycle is not None:
+            phase1_ceiling_cycle = args.phase1_ceiling_cycle
+        if args.phase1_margin_cycles is not None:
+            phase1_margin_cycles = max(0, args.phase1_margin_cycles)
+        if args.phase1_max_ignore is not None:
+            phase1_max_ignore = max(0, args.phase1_max_ignore)
+        if args.phase1_guess_cyc_per_hit is not None:
+            phase1_guess_cyc_per_hit = max(1, args.phase1_guess_cyc_per_hit)
+        if args.phase1_bootstrap_ignore is not None:
+            phase1_bootstrap_ignore = max(0, args.phase1_bootstrap_ignore)
 
         setup_commands = build_setup_commands(args.setup, args.watch_mode)
         stop_on_pcs = {pc.strip().lower() for pc in args.stop_on_pc.split(",") if pc.strip()}
         dump_mem_on_stop = [r.strip() for r in args.dump_mem_on_stop.split(";") if r.strip()]
+        stop_on_cycle_pc = args.stop_on_cycle_pc.strip().lower()
         json_output_path = Path(args.json_output) if args.json_output else None
 
         # Connect with retries (x64sc can open the port before the monitor is ready).
         client: ViceMonitorClient | None = None
         last_err: Exception | None = None
         for attempt in range(1, 41):
+            # When we launched x64sc ourselves, refresh the discovered port each retry.
+            if x64sc_proc is not None:
+                try:
+                    args.port = _pick_text_monitor_port_for_pid(
+                        x64sc_proc.pid, host=args.host, timeout_s=0.35
+                    )
+                except Exception:
+                    # Keep prior port; retry connect anyway.
+                    pass
             try:
                 client = ViceMonitorClient(host=args.host, port=args.port)
                 break
@@ -585,6 +948,19 @@ def main() -> None:
                 max_empty_stops=args.max_empty_stops,
                 minimal_poll=args.minimal_poll,
                 exit_on_finish=not args.no_exit,
+                stop_on_cycle=args.stop_on_cycle,
+                stop_on_cycle_pc=stop_on_cycle_pc,
+                phase2_stop_on_cycle=phase2_stop_on_cycle,
+                phase2_stop_on_cycle_pc=phase2_stop_on_cycle_pc,
+                phase2_setup_commands=phase2_setup_commands,
+                auto_ignore_break_count=auto_ignore_break_count,
+                poll_mem_each_stop=poll_mem_each_stop,
+                dynamic_ignore_phase1=dynamic_ignore_phase1,
+                phase1_ceiling_cycle=phase1_ceiling_cycle,
+                phase1_margin_cycles=phase1_margin_cycles,
+                phase1_max_ignore=phase1_max_ignore,
+                phase1_guess_cyc_per_hit=phase1_guess_cyc_per_hit,
+                phase1_bootstrap_ignore=phase1_bootstrap_ignore,
             )
         finally:
             client.close()

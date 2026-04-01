@@ -23,6 +23,8 @@ Examples:
       programs/BruceLee.prg /path/to/roms
 
 Output: maps VICE NV-BDIZC string to P for c64py (bit 5 = 0x20 set like typical trace display).
+
+For stack page **`$0100`–`$01FF`**, convert a VICE **`m 0100 01ff`** dump to **`addr=value`** lines and pass **`--debug-inject-file`** to C64.py (see [test/fixtures/debug_inject_stack.example.txt](../test/fixtures/debug_inject_stack.example.txt)).
 """
 
 from __future__ import annotations
