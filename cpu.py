@@ -1655,7 +1655,8 @@ class CPU6502:
         pc_high = self.memory.read(0x100 + self.state.sp)
         ret = ((pc_high << 8) | pc_low)
         self.state.pc = (ret + 1) & 0xFFFF
-        if (ret + 1) & 0xFFFF in (0x0119, 0x012A):
+        # Log returns from page-$01 helper into the $08xx driver (Bruce Lee loader path).
+        if (ret + 1) & 0xFFFF in (0x0119, 0x012A, 0x0884, 0x088A, 0x08A0, 0x08A3):
             self.memory.brucelee_debug_event(
                 f"RTS_TRACE pc=${(ret + 1) & 0xFFFF:04X} "
                 f"ret_raw=${ret:04X} a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} "

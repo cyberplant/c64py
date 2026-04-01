@@ -50,6 +50,16 @@ So **destination progression and store count to the first `$E5F0` write are alig
 
 Use the VICE **38911→38913** **+2** JSR step as the clean A/B for inner bumps; use **`sta00fa_zp2d_before_e5f0`** when you need a **store-count** anchor that matches both sides.
 
+## Causal chain at `idx=105706` (not “mystery RTS”)
+
+Using **`loader_branch_window.py`** and **`vice_full_trace.log`** ~**90487671–90487723**:
+
+1. **`idx=105705`:** both sides **`$010F` `BNE`** (take=1) → **`$0113` `LDA ($2F),Y`**.
+2. **VICE:** **A←`$D6`** → **`RTS` → `$0884`** → **`CMP #$D6`** → **`BEQ` → `$08A0`** → **`JSR $0103`** → … → second **`$010F`** (**A=`$D6`**) @ **idx=105706**.
+3. **c64py (Bruce log):** **A←`$06`** at eff **`$DA89`** (see **`PTR2_READ`** lines @ **cyc=12794834**) → **`RTS` → `$0884`** → **`CMP #$D6`** **fails** → **no** that **`JSR $0103`** → next **`BRANCH_TRACE`** is **`$088A`** @ **105706**.
+
+So the branch-stream divergence is explained by **data read at `LDA ($2F),Y`**, not by a bogus **`RTS`** PC. Aligning **`$2F/$30`** and bytes under the source pointer with VICE at this window is the direct experiment.
+
 ## Why traces are hard to align
 
 1. **Different absolute cycle bases** between VICE and c64py; compare **semantically** (anchors), not raw cycle numbers.
@@ -328,6 +338,7 @@ python3 scripts/vice_trace_to_inject.py \
 | `BRANCH_TRACE` PCs | [cpu.py](../cpu.py) (includes `$00FE`, `$010F`, `$088A`, …) |
 | Loader milestones / src write window | [memory.py](../memory.py) (`C64PY_LOADER_PTR_*`, `C64PY_LOADER_PTR_SRC_COUNT_*`; flush includes **`sta00fa_zp2d_before_e5f0`**) |
 | `STA ($2D),Y` hook @ `$00FA` | [cpu.py](../cpu.py) `_sta_indy` |
+| `RTS_TRACE` (returns into `$08xx` / `$0119`) | [cpu.py](../cpu.py) `_rts` (when `C64PY_BRUCELEE_DEBUG=1`) |
 | Debug inject | [cpu.py](../cpu.py) `_maybe_apply_debug_inject`; [C64.py](../C64.py) `--debug-inject-at-cycle`, `--debug-inject-map`, **`--debug-inject-file`** |
 | Compare branches | [scripts/compare_loader_branches.py](../scripts/compare_loader_branches.py) |
 | Branch stream window (local context) | [scripts/loader_branch_window.py](../scripts/loader_branch_window.py) |
