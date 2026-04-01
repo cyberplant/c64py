@@ -19,7 +19,7 @@ Persistent notes for the c64py vs VICE mismatch (wrong byte at `$E5F0`, source p
 | Source span c64py | `$E755 - $4F54` = **`$9801`** = **38913** (two extra **`INC $2F`** in the same logical window) |
 | c64py `INC $2F` @ `$010D` in window 4CF5→E5F0 | **38913**; **`INC $30` @ `$0111`**: **152**; IRQs in window: **0** (fast + accurate VIC runs checked) |
 | VICE trace experiment | After **38911**-th **`INC $2F` @ `$010D`** from first anchor `STA $00FA` **A:CC X:4F**, next **`STA ($2D),Y`** shows **`A=$20`**; after **38913**-th, next shows **`A=$C0`** (same trace file) |
-| `compare_loader_branches.py` | **105 706** matching **(pc, take, z)** vs VICE after anchor (fresh log); first mismatch **idx=105706**: c64py **`$088A`** cyc **12794852** vs VICE **`$010F`** cyc **90487723** (same take/z — phase slip). **`--prefix-pc-counts`**: **`$00FE`/`$010F`/`$088A`** totals **35886 / 35637 / 34183** on **both** sides over that prefix (identical). |
+| `compare_loader_branches.py` | **105 706** matching **(pc, take, z)**; **idx=105706**: c64py **`$088A`** vs VICE **`$010F`** (same take/z). **`loader_branch_window`**: VICE does **second** **`$010F`** (**A=`$D6`**) after **`JSR $0103`/`INC $2F`**; c64py omits that beat. **`--prefix-pc-counts`**: global **`$00FE`/`$010F`/`$088A`** totals still **35886 / 35637 / 34183** (both). |
 | c64py milestone cycles (14.5M run) | `first_4cf5` **9804470**; `first_e5f0` **13067075**; delta **3262605** (not portable to VICE absolute cycles) |
 | **JSR outer driver** (`$087E`→`$00FA`, `$0881`→`$0103`) in loader window | See § [JSR counts](#jsr-counts-outer-driver) below |
 
@@ -240,6 +240,16 @@ python3 scripts/compare_loader_branches.py \
   --prefix-pc-counts
 ```
 
+**`loader_branch_window.py`:** aligned slice of the same stream (e.g. around **`idx=105706`**):
+
+```bash
+python3 scripts/loader_branch_window.py \
+  --c64py-log /tmp/bruce.log \
+  --vice-trace /path/to/vice_full_trace.log \
+  --center-idx 105706 \
+  --radius 8
+```
+
 **`--inject-hint`:** on the first **pc/take/z** mismatch, prints **`c64py_cyc`** / **`vice_cyc`**, **`c64py_cyc_last_010f_before_mismatch`** (last **`BRANCH_TRACE @ $010F`** strictly before the mismatch cycle), a suggested **`C64.py`** line with **`--debug-inject-map`** from that **`$010F`** line (regs + ZP), and the alternate [`vice_trace_to_inject.py`](../scripts/vice_trace_to_inject.py) stub for the raw first-mismatch cycle (often **`$088A`**).
 
 ### VICE: count `INC $2F` @ `$010D` (38911 vs 38913 experiment)
@@ -320,6 +330,7 @@ python3 scripts/vice_trace_to_inject.py \
 | `STA ($2D),Y` hook @ `$00FA` | [cpu.py](../cpu.py) `_sta_indy` |
 | Debug inject | [cpu.py](../cpu.py) `_maybe_apply_debug_inject`; [C64.py](../C64.py) `--debug-inject-at-cycle`, `--debug-inject-map`, **`--debug-inject-file`** |
 | Compare branches | [scripts/compare_loader_branches.py](../scripts/compare_loader_branches.py) |
+| Branch stream window (local context) | [scripts/loader_branch_window.py](../scripts/loader_branch_window.py) |
 | VICE `INC $2F` counts | [scripts/vice_trace_loader_counts.py](../scripts/vice_trace_loader_counts.py) |
 | VICE / c64py JSR band counts | [scripts/vice_trace_loader_jsr_counts.py](../scripts/vice_trace_loader_jsr_counts.py), `C64PY_LOADER_JSR_COUNT` |
 | VICE line → inject map | [scripts/vice_trace_to_inject.py](../scripts/vice_trace_to_inject.py) |
@@ -389,7 +400,7 @@ Workflow: capture **`m 0100 01ff`** (and loader ZP) from VICE JSONL → convert 
 ## Hypothesis (active)
 
 - The **+2** on the source pointer is **two extra executions** of the **`INC $2F`** path (or equivalent), not a random KERNAL constant.
-- **Phase slip** at **`idx=105706`**: **`--prefix-pc-counts`** shows **identical** event counts at **`$00FE`**, **`$010F`**, **`$088A`** over the **105 706** matching triples — so not “one more **`$088A`**” vs VICE in that window. The first **pc** mismatch happens while **take/z** still agree; **A** differs (**`$06`** vs **`$D6`** on the sample row). Favour explanations in **cycle-exact instruction logging**, **sub-instruction state**, or **path outside these branch PCs**, rather than a coarse extra inner iteration at **`$010F`/`$088A`** alone.
+- **Phase slip** at **`idx=105706`**: **`--prefix-pc-counts`** shows **identical** global counts for **`$00FE`/`$010F`/`$088A`**, but **`loader_branch_window.py --center-idx 105706`** shows **local** divergence: after the same **`$010F`** at **105705**, **VICE** does a **second** **`$010F`** (**`BNE`**, **A=`$D6`**, cycle **90487723**) while **c64py** goes to **`$088A`**. VICE’s preceding opcode flow is **`JSR $0103` → … → `INC $2F` → `$010F`** (see **`vice_full_trace`** ~**90487671–90487723**). c64py is **missing that inner `$010F` iteration** relative to VICE at this point (compensated elsewhere so totals still match).
 - **IRQ / badlines:** still **0** IRQ in the measured loader window in c64py; VIC steal / RMW detail remains fair game.
 
 ## Next steps (checklist)

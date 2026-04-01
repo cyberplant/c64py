@@ -29,17 +29,20 @@ Explain and fix the **c64py vs VICE** divergence on Bruce Lee: wrong byte around
 4. **Stack + ZP + regs inject (single live JSONL)**  
    Full **`$0100`–`$01FF`** from capture + map **`a,x,y,p,$2D-$30`** from the **same** stop still yielded **`idx=105706`** vs **`vice_full_trace.log`**: **branch order** did not realign; at the mismatch row **A/X** no longer match the **archive** (expected if the map reflected the **live** stop). Confirms **phase slip** is not fixed by **one** full-page stack inject at the **hint** cycle alone.
 
-5. **Prefix histogram (`--prefix-pc-counts`)**  
-   For the **105 706** matching **(pc, take, z)** events before the first mismatch, c64py and VICE have **identical** counts of branch events at **`$00FE`**, **`$010F`**, and **`$088A`** (e.g. **35886 / 35637 / 34183** each — sums to the prefix length). So the first divergence is **not** “one extra trip” through those PCs in the aggregate; indices **0…105705** agree pairwise, then **pc** differs at **105706** while **take/z** still match. Remaining bug hunt: **instruction-boundary / trace alignment** vs VICE, or state outside **(pc,take,z)** (e.g. **A** on the mismatch row), not a simple extra inner iteration at the logged branch sites.
+5. **Prefix histogram + local divergence (`--prefix-pc-counts`, `loader_branch_window`)**  
+   Global counts of **`$00FE`/`$010F`/`$088A`** match over the **105 706**-event prefix (**35886 / 35637 / 34183**). **Locally** at **`idx=105706`**: after the same **`$010F`** at **105705** (c64 **A=`$0A`**, VICE **A=`$AA`**), **VICE** executes **another** **`$010F`** (**A=`$D6`**, cycle **90487723**; second **`BNE`** after **`JSR $0103`** / **`INC $2F`** — see **`vice_full_trace`** ~**90487671→90487723**), while **c64py** goes to **`$088A`**. So c64py skips that **inner** **`$010F`** beat; totals still match because the multiset is rearranged elsewhere. Tool: [`scripts/loader_branch_window.py`](../scripts/loader_branch_window.py).
 
 6. **Inject at `c64py_cyc_last_010f_before_mismatch` with log-derived map**  
    When the map matches current RAM/regs (**no-op** `DEBUG_INJECT`), mismatch **idx** stays **105706** — expected; changing phase requires correcting **emulation timing** or **unlogged** state, not re-poking identical ZP/regs.
+
+7. **`--accurate-vic` vs archived `vice_full_trace.log`**  
+   A c64py run with **`--accurate-vic`** shifts **anchor cycles** and **branch-event count** (~100k vs ~120k events to the same wall time); it **cannot** be compared meaningfully to a trace captured with the **fast** VIC path. For accurate-VIC work, capture a **new** VICE trace (or align on semantic milestones only).
 
 ## Next actions (priority order)
 
 1. **Re-run inject** using **`--debug-inject-at-cycle`** from **`compare_loader_branches --inject-hint`**: it now prints **`c64py_cyc_last_010f_before_mismatch`** (last **`BRANCH_TRACE pc=$010F`** with **`cyc` < first mismatch) plus a suggested **`--debug-inject-map`** parsed from that log line (regs + ZP). Add **`--debug-inject-file`** from VICE when stack matters.
 2. ~~**Optional**: extend **`compare_loader_branches --inject-hint`**~~ **Done:** hint prints mismatch cycle vs **last `$010F`** before mismatch and a stub **`C64.py`** command.
-3. **Focused trace / CPU vs VICE line timing**: smaller VICE logs or PC-filtered c64py trace. Prefix counts show **no** aggregate extra/missing **`$00FE`/`$010F`/`$088A`** branch events; compare **when** each side logs the **same** logical branch vs **cycle-stamp** semantics.
+3. **`$0103` helper / second `$010F`:** disassemble or trace (**`loader_branch_window`**, VICE **`sed`/`rg`** around **90487671**) to find why c64py reaches **`$088A`** without the extra **`$010F`** (**`D0` @ `$010F`**, **A=`$D6`**) that VICE runs after **`INC $2F`**. Suspects: wrong **cycles** inside **`JSR $0103`**, **`DEC $D020`**, port **`$01`**, or **RTS** target.
 4. **Unit tests** if a specific opcode / RMW / port behaviour is isolated (pattern: [`test/test_6510_rmw_port.py`](../test/test_6510_rmw_port.py)).
 
 ## References
