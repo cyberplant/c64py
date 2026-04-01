@@ -31,8 +31,8 @@ Explain and fix the **c64py vs VICE** divergence on Bruce Lee: wrong byte around
 
 ## Next actions (priority order)
 
-1. **Derive inject cycle from c64py `BRANCH_TRACE`** where **`pc=$010F`** (and optionally match **vice_cyc** only after re-aligning anchors), instead of blindly using the **first differing event’s** cycle when that event is **`$088A`**.
-2. **Optional**: extend tooling or docs so **`compare_loader_branches --inject-hint`** prints **both** c64py cycles (**first idx mismatch** vs **first `$010F` after anchor**) when they differ.
+1. **Re-run inject** using **`--debug-inject-at-cycle`** from **`compare_loader_branches --inject-hint`**: it now prints **`c64py_cyc_last_010f_before_mismatch`** (last **`BRANCH_TRACE pc=$010F`** with **`cyc` < first mismatch) plus a suggested **`--debug-inject-map`** parsed from that log line (regs + ZP). Add **`--debug-inject-file`** from VICE when stack matters.
+2. ~~**Optional**: extend **`compare_loader_branches --inject-hint`**~~ **Done:** hint prints mismatch cycle vs **last `$010F`** before mismatch and a stub **`C64.py`** command.
 3. **Focused trace**: smaller VICE logs (**`trace exec`**) or PC-filtered c64py trace to narrow **extra/missing** visits to **`$0881` / `JSR $0103` / `JSR $00FA`**.
 4. **Unit tests** if a specific opcode / RMW / port behaviour is isolated (pattern: [`test/test_6510_rmw_port.py`](../test/test_6510_rmw_port.py)).
 

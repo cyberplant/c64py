@@ -237,7 +237,7 @@ python3 scripts/compare_loader_branches.py \
   --inject-hint
 ```
 
-**`--inject-hint`:** on the first **pc/take/z** mismatch, prints **`c64py_cyc`** and **`vice_cyc`** plus a stub command for [`vice_trace_to_inject.py`](../scripts/vice_trace_to_inject.py) (replace ZP bytes from a VICE monitor dump).
+**`--inject-hint`:** on the first **pc/take/z** mismatch, prints **`c64py_cyc`** / **`vice_cyc`**, **`c64py_cyc_last_010f_before_mismatch`** (last **`BRANCH_TRACE @ $010F`** strictly before the mismatch cycle), a suggested **`C64.py`** line with **`--debug-inject-map`** from that **`$010F`** line (regs + ZP), and the alternate [`vice_trace_to_inject.py`](../scripts/vice_trace_to_inject.py) stub for the raw first-mismatch cycle (often **`$088A`**).
 
 ### VICE: count `INC $2F` @ `$010D` (38911 vs 38913 experiment)
 
@@ -391,7 +391,7 @@ Workflow: capture **`m 0100 01ff`** (and loader ZP) from VICE JSONL → convert 
 ## Next steps (checklist)
 
 - [x] Re-run **`compare_loader_branches`** after **inject** at **`--inject-hint`** cycle **12794852** with **full stack + ZP + regs** from **one** live JSONL capture → **idx unchanged (105706)**; inject **PC** was **`$088A`**, not **`$010F`** (see § [Inject semantics](#inject-semantics-and-capture-coherence-apr-2026)).
-- [ ] Re-run inject using **`--debug-inject-at-cycle`** taken from a **`BRANCH_TRACE pc=$010F`** line near the mismatch (or extend **`compare_loader_branches`** to print that cycle in **`--inject-hint`**).
+- [ ] Re-run inject using **`c64py_cyc_last_010f_before_mismatch`** from **`compare_loader_branches --inject-hint`** (and map from the hint, plus optional stack file).
 - [x] Count **`JSR $0103`** / **`JSR $00FA`** from **`$087E`–`$0884`**: **`C64PY_LOADER_JSR_COUNT`** + [`vice_trace_loader_jsr_counts.py`](../scripts/vice_trace_loader_jsr_counts.py) (see [JSR counts](#jsr-counts-outer-driver)).
 - [x] **`sta00fa_zp2d_before_e5f0`** in `loader_ptr_src_count.log` matches VICE **39162** `STA @ $00FA` in the same bracket — JSR-only gap ~46 is trace **cycle** vs emu **instruction** boundary, not wrong dest/store count.
 - [ ] Optional: VICE **`trace exec 00f8 0135`** and smaller logs; optional future **PC-filtered** c64py trace in [debug.py](../debug.py).

@@ -14,6 +14,9 @@ Usage:
     [--max-diff 20] [--inject-hint]
 
 If --vice-trace is omitted, only prints c64py branch count and sample lines.
+
+With --inject-hint: also emits c64py_cyc_last_010f_before_mismatch and a suggested
+--debug-inject-map from the Bruce log (regs + ZP on that $010F line).
 """
 
 from __future__ import annotations
@@ -34,6 +37,13 @@ C64PY_STA_ANCHOR = re.compile(
 C64PY_BRANCH = re.compile(
     r"^BRANCH_TRACE pc=\$([0-9A-Fa-f]{4}) cyc=(\d+) op=\$([0-9A-Fa-f]{2}) .*\b"
     r"take=(\d) z=(\d) a=\$([0-9A-Fa-f]{2}) x=\$([0-9A-Fa-f]{2}) y=\$([0-9A-Fa-f]{2})"
+)
+# Full $010F line includes ZP (logged in cpu.py for loader debugging).
+C64PY_BRANCH_010F = re.compile(
+    r"^BRANCH_TRACE pc=\$010[Ff] cyc=(\d+) op=\$([0-9A-Fa-f]{2}) "
+    r"rel=\$([0-9A-Fa-f]{2}) target=\$([0-9A-Fa-f]{4}) take=(\d) z=(\d) "
+    r"a=\$([0-9A-Fa-f]{2}) x=\$([0-9A-Fa-f]{2}) y=\$([0-9A-Fa-f]{2}) p=\$([0-9A-Fa-f]{2}) "
+    r"zp2d=\$([0-9A-Fa-f]{2}) zp2e=\$([0-9A-Fa-f]{2}) zp2f=\$([0-9A-Fa-f]{2}) zp30=\$([0-9A-Fa-f]{2})"
 )
 
 VICE_STA_ANCHOR = re.compile(
@@ -125,6 +135,31 @@ def find_vice_anchor(path: Path) -> int:
     raise SystemExit(f"no VICE STA anchor (00fa A:CC X:4F) in {path}")
 
 
+def last_010f_snapshot_before_cyc(path: Path, max_cyc: int) -> tuple[int, str] | None:
+    """
+    Last BRANCH_TRACE at $010F with cyc < max_cyc (c64py cycle before first mismatch).
+
+    Returns (cyc, --debug-inject-map fragment) or None if no $010F seen before max_cyc.
+    """
+    best: tuple[int, str] | None = None
+    with path.open("r", errors="replace") as f:
+        for line in f:
+            m = C64PY_BRANCH_010F.match(line.strip())
+            if not m:
+                continue
+            cyc = int(m.group(1))
+            if cyc >= max_cyc:
+                continue
+            _op, _rel, _tgt, _take, _z, a, x, y, p, d0, d1, d2, d3 = m.groups()[1:]
+            frag = (
+                f"a={a.lower()},x={x.lower()},y={y.lower()},p={p.lower()},"
+                f"2d={d0.lower()},2e={d1.lower()},2f={d2.lower()},30={d3.lower()}"
+            )
+            if best is None or cyc > best[0]:
+                best = (cyc, frag)
+    return best
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--c64py-log", type=Path, required=True)
@@ -133,7 +168,10 @@ def main() -> int:
     ap.add_argument(
         "--inject-hint",
         action="store_true",
-        help="On first pc/take/z mismatch, print c64py/VICE cycles and a vice_trace_to_inject.py stub",
+        help=(
+            "On first pc/take/z mismatch, print c64py/VICE cycles, last $010F inject cycle "
+            "before mismatch, and vice_trace_to_inject.py stub"
+        ),
     )
     args = ap.parse_args()
 
@@ -173,7 +211,31 @@ def main() -> int:
                 cc = c_ev[1]
                 print("--- inject-hint (first pc/take/z mismatch) ---")
                 print(f"FIRST_MISMATCH idx={i} c64py_cyc={cc} vice_cyc={vc}")
-                print("# Fill ZP $2D-$30 from a VICE monitor dump at that cycle if needed.")
+                print(
+                    "# Mismatch PC is often $088A while VICE shows $010F (phase slip). "
+                    "Debug inject runs at the *start* of the step when cycles >= N (see cpu.py)."
+                )
+                snap = last_010f_snapshot_before_cyc(args.c64py_log, cc)
+                if snap is None:
+                    print(
+                        "c64py_cyc_last_010f_before_mismatch: (none — log missing BRANCH_TRACE @ $010F "
+                        "with ZP fields before mismatch cycle; regenerate Bruce log with current cpu.py)"
+                    )
+                else:
+                    c010f, map_frag = snap
+                    print(f"c64py_cyc_last_010f_before_mismatch={c010f}")
+                    print(
+                        "# Suggested: inject at $010F boundary (regs+ZP from that log line); "
+                        "add stack from VICE JSONL if needed:"
+                    )
+                    print(
+                        f"python3 C64.py programs/BruceLee.prg --headless --turbo "
+                        f"--max-cycles 13200000 --autoquit --rom-dir roms \\\n"
+                        f"  --debug-inject-at-cycle {c010f} \\\n"
+                        f"  --debug-inject-file /path/to/stack.inject \\\n"
+                        f"  --debug-inject-map '{map_frag}'"
+                    )
+                print("# Alternate: first-mismatch cycle (may land at $088A, not $010F):")
                 print(
                     f"python3 scripts/vice_trace_to_inject.py --file {args.vice_trace} "
                     f"--match-vice-cycle {vc} --fast-rg \\\n"
