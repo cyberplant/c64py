@@ -33,6 +33,10 @@ bruce_inject*.log
 bruce_clean.log
 bruce_after*.log
 bruce_accurate_vic.log
+bruce_colorfix.log
+bruce_watch2.log
+bruce_iofix.log
+bruce_watch_da89.log
 c64py_full_trace*.log
 vice_full_trace.log
 tmp_stack*.inject

@@ -64,6 +64,11 @@ class MemoryMap:
     _brucelee_last_c200_write: tuple[int, int, int] = field(default=(-1, -1, -1), init=False, repr=False)
     _brucelee_snapshot_0841_seen: bool = field(default=False, init=False, repr=False)
     _brucelee_snapshot_c200_seen: bool = field(default=False, init=False, repr=False)
+    # Optional: log RAM writes in [lo,hi] when Bruce debug is on (hex env, see __post_init__).
+    _brucelee_watch_write_lo: Optional[int] = field(default=None, init=False, repr=False)
+    _brucelee_watch_write_hi: Optional[int] = field(default=None, init=False, repr=False)
+    _brucelee_watch_write_pc_lo: Optional[int] = field(default=None, init=False, repr=False)
+    _brucelee_watch_write_pc_hi: Optional[int] = field(default=None, init=False, repr=False)
     # Optional sparse milestones for Bruce Lee–style loader (STA ($2D),Y at $00FA).
     _loader_ptr_milestones_enabled: bool = field(default=False, init=False, repr=False)
     _loader_ptr_milestones_path: str = field(default="loader_ptr_milestones.log", init=False, repr=False)
@@ -139,6 +144,48 @@ class MemoryMap:
                 f.write("# Bruce Lee targeted debug log\n")
         except Exception:
             self._brucelee_debug_enabled = False
+            return
+        # C64PY_BRUCELEE_WATCH_WRITES=DA89 or DA80-DAFF (hex). Optional C64PY_BRUCELEE_WATCH_WRITES_PC=00F8-0135.
+        watch = os.environ.get("C64PY_BRUCELEE_WATCH_WRITES", "").strip()
+        if watch:
+            try:
+                w = watch.replace(" ", "").lower()
+                if "-" in w:
+                    a, b = w.split("-", 1)
+                    self._brucelee_watch_write_lo = int(a, 16) & 0xFFFF
+                    self._brucelee_watch_write_hi = int(b, 16) & 0xFFFF
+                else:
+                    x = int(w, 16) & 0xFFFF
+                    self._brucelee_watch_write_lo = x
+                    self._brucelee_watch_write_hi = x
+                if self._brucelee_watch_write_lo > self._brucelee_watch_write_hi:
+                    self._brucelee_watch_write_lo, self._brucelee_watch_write_hi = (
+                        self._brucelee_watch_write_hi,
+                        self._brucelee_watch_write_lo,
+                    )
+            except ValueError:
+                self._brucelee_watch_write_lo = None
+                self._brucelee_watch_write_hi = None
+        pc_w = os.environ.get("C64PY_BRUCELEE_WATCH_WRITES_PC", "").strip()
+        if pc_w and self._brucelee_watch_write_lo is not None:
+            try:
+                w = pc_w.replace(" ", "").lower()
+                if "-" in w:
+                    a, b = w.split("-", 1)
+                    self._brucelee_watch_write_pc_lo = int(a, 16) & 0xFFFF
+                    self._brucelee_watch_write_pc_hi = int(b, 16) & 0xFFFF
+                else:
+                    x = int(w, 16) & 0xFFFF
+                    self._brucelee_watch_write_pc_lo = x
+                    self._brucelee_watch_write_pc_hi = x
+                if self._brucelee_watch_write_pc_lo > self._brucelee_watch_write_pc_hi:
+                    self._brucelee_watch_write_pc_lo, self._brucelee_watch_write_pc_hi = (
+                        self._brucelee_watch_write_pc_hi,
+                        self._brucelee_watch_write_pc_lo,
+                    )
+            except ValueError:
+                self._brucelee_watch_write_pc_lo = None
+                self._brucelee_watch_write_pc_hi = None
 
     def _brucelee_log(self, msg: str) -> None:
         if not self._brucelee_debug_enabled:
@@ -418,10 +465,11 @@ class MemoryMap:
                 f"zp2f=${self.ram[0x2F]:02X} zp30=${self.ram[0x30]:02X}"
             )
 
-        # Color RAM ($D800-$DBE7) is a dedicated 4-bit RAM region.
-        # In practice it should be readable/writable regardless of ROM banking.
+        # Color RAM ($D800-$DBE7): hardware is 4-bit; CPU still uses an 8-bit data path.
+        # Store/read full bytes in backing RAM (matches VICE for loaders using $D8xx as linear RAM).
+        # Video code masks to 0x0F when sampling color nybbles (see graphics.py).
         if COLOR_MEM <= addr < (COLOR_MEM + 1000):
-            return self.ram[addr] & 0x0F
+            return self.ram[addr] & 0xFF
 
         # 6510 processor port ($0001) controls banking.
         # Bits (common simplified model):
@@ -511,6 +559,27 @@ class MemoryMap:
                     f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
                     f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
                 )
+            if (
+                self._brucelee_watch_write_lo is not None
+                and self._brucelee_watch_write_lo <= addr <= self._brucelee_watch_write_hi
+            ):
+                pcw = self.debug_last_pc & 0xFFFF
+                ok_pc = True
+                if self._brucelee_watch_write_pc_lo is not None:
+                    ok_pc = (
+                        self._brucelee_watch_write_pc_lo
+                        <= pcw
+                        <= self._brucelee_watch_write_pc_hi
+                    )
+                if ok_pc:
+                    old = self.ram[addr]
+                    self._brucelee_log(
+                        f"WATCH_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                        f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                        f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X} "
+                        f"zp2d=${self.ram[0x2D]:02X} zp2e=${self.ram[0x2E]:02X} "
+                        f"zp2f=${self.ram[0x2F]:02X} zp30=${self.ram[0x30]:02X}"
+                    )
 
         if self._loader_src_count_active and addr in (0x002F, 0x0030):
             pc = self.debug_last_pc & 0xFFFF
@@ -521,9 +590,9 @@ class MemoryMap:
                 key = (addr, pc)
                 self._loader_src_outrange[key] = self._loader_src_outrange.get(key, 0) + 1
 
-        # Color RAM ($D800-$DBE7): dedicated 4-bit writable RAM.
+        # Color RAM: see read() — keep full byte for CPU; VIC uses low nibble when rendering.
         if COLOR_MEM <= addr < (COLOR_MEM + 1000):
-            self.ram[addr] = value & 0x0F
+            self.ram[addr] = value & 0xFF
             return
 
         if addr in (0x0000, 0x0001):
@@ -564,7 +633,7 @@ class MemoryMap:
         """Read from I/O registers"""
         # Color RAM is handled in read(); keep this for safety if called directly.
         if COLOR_MEM <= addr < (COLOR_MEM + 1000):
-            return self.ram[addr] & 0x0F
+            return self.ram[addr] & 0xFF
 
         # VIC registers
         if VIC_BASE <= addr < VIC_BASE + 0x40:
@@ -584,13 +653,14 @@ class MemoryMap:
         if CIA2_BASE <= addr < CIA2_BASE + 0x10:
             return self._read_cia2(addr - CIA2_BASE)
 
-        return 0
+        # Unmapped I/O window: read from RAM (e.g. loader data at $DAxx with CHAREN=1).
+        return self.ram[addr] & 0xFF
 
     def _write_io(self, addr: int, value: int) -> None:
         """Write to I/O registers"""
         # Color RAM is handled in write(); keep this for safety if called directly.
         if COLOR_MEM <= addr < (COLOR_MEM + 1000):
-            self.ram[addr] = value & 0x0F
+            self.ram[addr] = value & 0xFF
             return
 
         # VIC registers
@@ -613,6 +683,9 @@ class MemoryMap:
         if CIA2_BASE <= addr < CIA2_BASE + 0x10:
             self._write_cia2(addr - CIA2_BASE, value)
             return
+
+        # No chip decodes this $D000-$DFFF address: write lands in RAM (same as VICE/hardware).
+        self.ram[addr] = value
 
     def _read_vic(self, reg: int) -> int:
         """Read VIC-II register"""

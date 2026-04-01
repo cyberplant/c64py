@@ -19,7 +19,7 @@ Persistent notes for the c64py vs VICE mismatch (wrong byte at `$E5F0`, source p
 | Source span c64py | `$E755 - $4F54` = **`$9801`** = **38913** (two extra **`INC $2F`** in the same logical window) |
 | c64py `INC $2F` @ `$010D` in window 4CF5→E5F0 | **38913**; **`INC $30` @ `$0111`**: **152**; IRQs in window: **0** (fast + accurate VIC runs checked) |
 | VICE trace experiment | After **38911**-th **`INC $2F` @ `$010D`** from first anchor `STA $00FA` **A:CC X:4F**, next **`STA ($2D),Y`** shows **`A=$20`**; after **38913**-th, next shows **`A=$C0`** (same trace file) |
-| `compare_loader_branches.py` | **105 706** matching **(pc, take, z)**; **idx=105706**: c64py **`$088A`** vs VICE **`$010F`** (same take/z). **`loader_branch_window`**: VICE does **second** **`$010F`** (**A=`$D6`**) after **`JSR $0103`/`INC $2F`**; c64py omits that beat. **`--prefix-pc-counts`**: global **`$00FE`/`$010F`/`$088A`** totals still **35886 / 35637 / 34183** (both). |
+| `compare_loader_branches.py` | With **color-RAM + I/O** fixes: **no `pc/take/z` mismatch** for the full Bruce log at **13.2M** cycles vs **`vice_full_trace.log`**; c64py log ends with **fewer** branch events than the trace tail (VICE has more lines after alignment). Before fix: mismatch **idx=105706** (**`$088A`** vs **`$010F`**) from **`LDA`** @ **`$DA89`**. |
 | c64py milestone cycles (14.5M run) | `first_4cf5` **9804470**; `first_e5f0` **13067075**; delta **3262605** (not portable to VICE absolute cycles) |
 | **JSR outer driver** (`$087E`→`$00FA`, `$0881`→`$0103`) in loader window | See § [JSR counts](#jsr-counts-outer-driver) below |
 
@@ -56,9 +56,9 @@ Using **`loader_branch_window.py`** and **`vice_full_trace.log`** ~**90487671–
 
 1. **`idx=105705`:** both sides **`$010F` `BNE`** (take=1) → **`$0113` `LDA ($2F),Y`**.
 2. **VICE:** **A←`$D6`** → **`RTS` → `$0884`** → **`CMP #$D6`** → **`BEQ` → `$08A0`** → **`JSR $0103`** → … → second **`$010F`** (**A=`$D6`**) @ **idx=105706**.
-3. **c64py (Bruce log):** **A←`$06`** at eff **`$DA89`** (see **`PTR2_READ`** lines @ **cyc=12794834**) → **`RTS` → `$0884`** → **`CMP #$D6`** **fails** → **no** that **`JSR $0103`** → next **`BRANCH_TRACE`** is **`$088A`** @ **105706**.
+3. **c64py (buggy):** **A←`$06`** at eff **`$DA89`** — that address is **color RAM** (**`$D800`–`$DBE7`**). CPU **`read`/`write`** used a **4-bit** mask (**`$D6` → `$06`**), so **`CMP #$D6`** failed and the next **`BRANCH_TRACE`** was **`$088A`**.
 
-So the branch-stream divergence is explained by **data read at `LDA ($2F),Y`**, not by a bogus **`RTS`** PC. Aligning **`$2F/$30`** and bytes under the source pointer with VICE at this window is the direct experiment.
+**Fix (2026-04):** **`MemoryMap`** uses **8-bit** load/store for the color-RAM window on the CPU path; VIC still uses **`& 0x0F`** when sampling nybbles (**`graphics.py`**). Unmapped **`$D000`–`$DFFF`** addresses with **I/O on** also **read/write backing RAM** (not **discard** / **0**). **`C64PY_BRUCELEE_WATCH_WRITES=DA89`** logs sparse **`WATCH_WRITE`** lines (the **`STA $DA00,Y` @ `$0849`** store is visible). After this, **`compare_loader_branches`** reports **no `pc/take/z` mismatch** over the full **13.2M**-cycle Bruce log vs **`vice_full_trace.log`** (c64py still has **fewer** tail branch events than the trace file length).
 
 ## Why traces are hard to align
 
@@ -215,6 +215,8 @@ export C64PY_BRUCELEE_DEBUG_LOG=/tmp/bruce.log
 python3 C64.py programs/BruceLee.prg --headless --turbo \
   --max-cycles 13150000 --autoquit --rom-dir /path/to/roms
 ```
+
+**`C64PY_BRUCELEE_WATCH_WRITES`** (optional, requires Bruce debug): hex **address** or **`lo-hi`** (e.g. **`DA89`** or **`DA80-DAFF`**). Logs **`WATCH_WRITE`** lines. **`C64PY_BRUCELEE_WATCH_WRITES_PC=00F8-0135`** filters by CPU **PC** (reduces noise).
 
 **Regenerate + compare in one shot** (from repo root; `--rom-dir roms` resolves next to `C64.py`):
 
@@ -411,13 +413,13 @@ Workflow: capture **`m 0100 01ff`** (and loader ZP) from VICE JSONL → convert 
 ## Hypothesis (active)
 
 - The **+2** on the source pointer is **two extra executions** of the **`INC $2F`** path (or equivalent), not a random KERNAL constant.
-- **Phase slip** at **`idx=105706`**: **`--prefix-pc-counts`** shows **identical** global counts for **`$00FE`/`$010F`/`$088A`**, but **`loader_branch_window.py --center-idx 105706`** shows **local** divergence: after the same **`$010F`** at **105705**, **VICE** does a **second** **`$010F`** (**`BNE`**, **A=`$D6`**, cycle **90487723**) while **c64py** goes to **`$088A`**. VICE’s preceding opcode flow is **`JSR $0103` → … → `INC $2F` → `$010F`** (see **`vice_full_trace`** ~**90487671–90487723**). c64py is **missing that inner `$010F` iteration** relative to VICE at this point (compensated elsewhere so totals still match).
-- **IRQ / badlines:** still **0** IRQ in the measured loader window in c64py; VIC steal / RMW detail remains fair game.
+- **`idx=105706` “phase slip”** was **explained** by **color RAM @ `$DA89`**: c64py masked CPU access to **4 bits**, so **`LDA`** saw **`$06`** instead of **`$D6`**; **fixed** with **8-bit** color backing for CPU (**§ [Causal chain](#causal-chain-at-idx105706-not-mystery-rts)**). **`compare_loader_branches`** then matches **VICE** for the full **13.2M**-cycle log.
+- **IRQ / badlines:** still **0** IRQ in the measured loader window in c64py; VIC steal / RMW detail remains fair game for other titles.
 
 ## Next steps (checklist)
 
 - [x] Re-run **`compare_loader_branches`** after **inject** at **`--inject-hint`** cycle **12794852** with **full stack + ZP + regs** from **one** live JSONL capture → **idx unchanged (105706)**; inject **PC** was **`$088A`**, not **`$010F`** (see § [Inject semantics](#inject-semantics-and-capture-coherence-apr-2026)).
-- [ ] Re-run inject using **`c64py_cyc_last_010f_before_mismatch`** from **`compare_loader_branches --inject-hint`** (and map from the hint, plus optional stack file).
+- [ ] ~~Re-run inject at **`$010F`** cycle~~ **Superseded** by color-RAM / I/O fix; inject experiments remain useful for other mismatches.
 - [x] Count **`JSR $0103`** / **`JSR $00FA`** from **`$087E`–`$0884`**: **`C64PY_LOADER_JSR_COUNT`** + [`vice_trace_loader_jsr_counts.py`](../scripts/vice_trace_loader_jsr_counts.py) (see [JSR counts](#jsr-counts-outer-driver)).
 - [x] **`sta00fa_zp2d_before_e5f0`** in `loader_ptr_src_count.log` matches VICE **39162** `STA @ $00FA` in the same bracket — JSR-only gap ~46 is trace **cycle** vs emu **instruction** boundary, not wrong dest/store count.
 - [ ] Optional: VICE **`trace exec 00f8 0135`** and smaller logs; optional future **PC-filtered** c64py trace in [debug.py](../debug.py).
