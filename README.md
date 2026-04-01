@@ -21,7 +21,7 @@ A Commodore 64 emulator implemented in Python with both text-based and graphical
   - **Text mode**: ASCII art representation of graphics using Unicode block characters
 - **PRG File Loading**: Load and auto-run Commodore 64 programs
 - **Server Mode**: TCP/UDP server for remote control
-- **Debug Support**: UDP debug logging and detailed debug output
+- **Debug Support**: UDP debug logging and detailed debug output; Bruce Lee loader / VICE trace notes: [docs/bruce_lee_loader_investigation.md](docs/bruce_lee_loader_investigation.md)
 - **Memory Dumping**: Export memory state to files
 - **PAL/NTSC Support**: Configurable video standard
 

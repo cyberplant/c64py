@@ -142,9 +142,36 @@ def main():
         action="store_true",
         help="Enable cycle-accurate VIC/BA timing (slower, more accurate). Default is fast coarse VIC timing.",
     )
+    ap.add_argument(
+        "--debug-inject-at-cycle",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "One-shot experiment: on the first instruction fetch with cumulative CPU cycles >= N, "
+            "poke addresses from --debug-inject-map (then continue normally). Printed on stderr."
+        ),
+    )
+    ap.add_argument(
+        "--debug-inject-map",
+        type=str,
+        default=None,
+        metavar="MAP",
+        help=(
+            "With --debug-inject-at-cycle: comma-separated pairs. RAM: hex addr=value (e.g. 2f=53,30=e7). "
+            "CPU regs: a=, x=, y=, p= (e.g. a=d6,x=da to match a VICE snapshot)."
+        ),
+    )
 
     args = ap.parse_args()
-    
+
+    if args.debug_inject_at_cycle is not None and not args.debug_inject_map:
+        print("ERROR: --debug-inject-map is required with --debug-inject-at-cycle", file=sys.stderr)
+        sys.exit(1)
+    if args.debug_inject_map is not None and args.debug_inject_at_cycle is None:
+        print("ERROR: --debug-inject-at-cycle is required with --debug-inject-map", file=sys.stderr)
+        sys.exit(1)
+
     # --benchmark implies other flags and loads benchmark PRG
     if args.benchmark:
         args.turbo = True
@@ -186,6 +213,24 @@ def main():
         enable_resid=args.enable_resid,
         accurate_vic=args.accurate_vic,
     )
+    if args.debug_inject_at_cycle is not None:
+        inject_pairs: list[tuple[int | str, int]] = []
+        for part in args.debug_inject_map.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                print(f"ERROR: bad --debug-inject-map fragment {part!r} (want addr=val)", file=sys.stderr)
+                sys.exit(1)
+            lhs, rhs = part.split("=", 1)
+            lhs_s = lhs.strip().lower()
+            val = int(rhs.strip(), 16)
+            if lhs_s in ("a", "x", "y", "p", "flags"):
+                inject_pairs.append((lhs_s if lhs_s != "flags" else "p", val))
+            else:
+                inject_pairs.append((int(lhs_s, 16), val))
+        emu.cpu.debug_inject_at_cycle = args.debug_inject_at_cycle
+        emu.cpu.debug_inject_writes = inject_pairs
     emu.debug = args.debug
     emu.autoquit = args.autoquit
     emu.turbo = args.turbo

@@ -2,6 +2,7 @@
 C64 Memory Map
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING, Union
 
@@ -51,11 +52,302 @@ class MemoryMap:
     # CIA2 Port A state (for IEC bus control)
     cia2_pra: int = 0xFF  # Port A data register
     cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)
+    # Optional targeted debug context written by CPU.step (Bruce Lee root-cause work).
+    debug_last_pc: int = 0
+    debug_last_cycles: int = 0
+    debug_last_opcode: int = 0
+    debug_last_op1: int = 0
+    debug_last_op2: int = 0
+    _brucelee_debug_enabled: bool = field(default=False, init=False, repr=False)
+    _brucelee_debug_log_path: str = field(default="brucelee_debug.log", init=False, repr=False)
+    _brucelee_first_c200_write_seen: bool = field(default=False, init=False, repr=False)
+    _brucelee_last_c200_write: tuple[int, int, int] = field(default=(-1, -1, -1), init=False, repr=False)
+    _brucelee_snapshot_0841_seen: bool = field(default=False, init=False, repr=False)
+    _brucelee_snapshot_c200_seen: bool = field(default=False, init=False, repr=False)
+    # Optional sparse milestones for Bruce Lee–style loader (STA ($2D),Y at $00FA).
+    _loader_ptr_milestones_enabled: bool = field(default=False, init=False, repr=False)
+    _loader_ptr_milestones_path: str = field(default="loader_ptr_milestones.log", init=False, repr=False)
+    _loader_ptr_milestone_done: set = field(default_factory=set, init=False, repr=False)
+    # Count RAM writes to $2F/$30 from PC in $00F8-$011A between first_4cf5 and first_e5f0 (STA $00FA).
+    _loader_src_count_enabled: bool = field(default=False, init=False, repr=False)
+    _loader_src_count_log_path: str = field(default="loader_ptr_src_count.log", init=False, repr=False)
+    _loader_src_count_active: bool = field(default=False, init=False, repr=False)
+    _loader_src_count_arm: bool = field(default=False, init=False, repr=False)
+    _loader_src_cycle_start: int = field(default=-1, init=False, repr=False)
+    _loader_src_badline_start: int = field(default=0, init=False, repr=False)
+    _loader_src_irq_during_window: int = field(default=0, init=False, repr=False)
+    _loader_src_2f_by_pc: dict = field(default_factory=dict, init=False, repr=False)
+    _loader_src_30_by_pc: dict = field(default_factory=dict, init=False, repr=False)
+    _loader_src_outrange: dict = field(default_factory=dict, init=False, repr=False)
+    # STA ($2D),Y @ $00FA with eff != $E5F0 while window active (matches VICE count of .C:00fa lines before first E5F0).
+    _loader_sta00fa_before_e5f0: int = field(default=0, init=False, repr=False)
+    # JSR $0103 / $00FA from PC $087E–$0884 in same window as $2F/$30 histogram (Bruce loader).
+    _loader_jsr_count_enabled: bool = field(default=False, init=False, repr=False)
+    _loader_jsr_count_log_path: str = field(default="loader_ptr_jsr_count.log", init=False, repr=False)
+    _loader_jsr_counts: dict = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        lm = os.environ.get("C64PY_LOADER_PTR_MILESTONES", "")
+        self._loader_ptr_milestones_enabled = lm.lower() in ("1", "true", "yes", "on")
+        self._loader_ptr_milestones_path = os.environ.get(
+            "C64PY_LOADER_PTR_MILESTONES_LOG", "loader_ptr_milestones.log"
+        )
+        if self._loader_ptr_milestones_enabled:
+            try:
+                with open(self._loader_ptr_milestones_path, "w", encoding="utf-8") as f:
+                    f.write("# STA ($2D),Y @ $00FA milestones (c64py)\n")
+            except Exception:
+                self._loader_ptr_milestones_enabled = False
+
+        sc = os.environ.get("C64PY_LOADER_PTR_SRC_COUNT", "")
+        self._loader_src_count_enabled = sc.lower() in ("1", "true", "yes", "on")
+        self._loader_src_count_log_path = os.environ.get(
+            "C64PY_LOADER_PTR_SRC_COUNT_LOG", "loader_ptr_src_count.log"
+        )
+        if self._loader_src_count_enabled:
+            try:
+                with open(self._loader_src_count_log_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        "# Writes to $002F/$0030 with CPU PC in $00F8-$011A, "
+                        "window: after first STA($2D),Y@$00FA eff=$4CF5 until first eff=$E5F0\n"
+                    )
+            except Exception:
+                self._loader_src_count_enabled = False
+
+        jsc = os.environ.get("C64PY_LOADER_JSR_COUNT", "")
+        self._loader_jsr_count_enabled = jsc.lower() in ("1", "true", "yes", "on")
+        self._loader_jsr_count_log_path = os.environ.get(
+            "C64PY_LOADER_JSR_COUNT_LOG", "loader_ptr_jsr_count.log"
+        )
+        if self._loader_jsr_count_enabled:
+            try:
+                with open(self._loader_jsr_count_log_path, "w", encoding="utf-8") as f:
+                    f.write(
+                        "# JSR from $087E–$0884 to $0103 or $00FA; "
+                        "window: after first STA@$00FA eff=$4CF5 until first eff=$E5F0\n"
+                    )
+            except Exception:
+                self._loader_jsr_count_enabled = False
+
+        flag = os.environ.get("C64PY_BRUCELEE_DEBUG", "")
+        self._brucelee_debug_enabled = flag.lower() in ("1", "true", "yes", "on")
+        if not self._brucelee_debug_enabled:
+            return
+        self._brucelee_debug_log_path = os.environ.get("C64PY_BRUCELEE_DEBUG_LOG", "brucelee_debug.log")
+        try:
+            with open(self._brucelee_debug_log_path, "w", encoding="utf-8") as f:
+                f.write("# Bruce Lee targeted debug log\n")
+        except Exception:
+            self._brucelee_debug_enabled = False
+
+    def _brucelee_log(self, msg: str) -> None:
+        if not self._brucelee_debug_enabled:
+            return
+        with open(self._brucelee_debug_log_path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    def brucelee_debug_event(self, msg: str) -> None:
+        self._brucelee_log(msg)
+
+    def _loader_src_append_note(self, msg: str) -> None:
+        if not self._loader_src_count_enabled:
+            return
+        try:
+            with open(self._loader_src_count_log_path, "a", encoding="utf-8") as f:
+                f.write(f"# {msg}")
+        except Exception:
+            pass
+
+    def _loader_src_flush_counts(self, cyc_end: int) -> None:
+        cyc_d = cyc_end - self._loader_src_cycle_start if self._loader_src_cycle_start >= 0 else -1
+        bad_d = self.badline_cycles - self._loader_src_badline_start
+        t2 = sum(self._loader_src_2f_by_pc.values())
+        t3 = sum(self._loader_src_30_by_pc.values())
+        to = sum(self._loader_src_outrange.values())
+        try:
+            with open(self._loader_src_count_log_path, "a", encoding="utf-8") as f:
+                f.write("---\n")
+                f.write(
+                    f"cyc_start={self._loader_src_cycle_start} cyc_end={cyc_end} cyc_delta={cyc_d} "
+                    f"raster_line={self.raster_line} badline_cycles_delta={bad_d} "
+                    f"irq_entries={self._loader_src_irq_during_window}\n"
+                )
+                f.write(
+                    f"total_W2F={t2} total_W30={t3} total_W2F30_outrange_pc={to} "
+                    f"sta00fa_zp2d_before_e5f0={self._loader_sta00fa_before_e5f0}\n"
+                )
+                for pc in sorted(self._loader_src_2f_by_pc.keys()):
+                    f.write(f"  W2F pc=${pc:04X} n={self._loader_src_2f_by_pc[pc]}\n")
+                for pc in sorted(self._loader_src_30_by_pc.keys()):
+                    f.write(f"  W30 pc=${pc:04X} n={self._loader_src_30_by_pc[pc]}\n")
+                if self._loader_src_outrange:
+                    f.write("  out_of_range_pc (addr, pc):\n")
+                    for (ad, pc), n in sorted(self._loader_src_outrange.items()):
+                        f.write(f"    ${ad:04X} @ pc=${pc:04X} n={n}\n")
+        except Exception:
+            pass
+
+    def _loader_jsr_flush_counts(self, cyc_end: int) -> None:
+        if not self._loader_jsr_count_enabled:
+            return
+        try:
+            with open(self._loader_jsr_count_log_path, "a", encoding="utf-8") as f:
+                f.write("---\n")
+                f.write(f"cyc_end={cyc_end}\n")
+                if not self._loader_jsr_counts:
+                    f.write("(no JSR $0103/$00FA from $087E–$0884 in window)\n")
+                else:
+                    for (caller, tgt), n in sorted(self._loader_jsr_counts.items()):
+                        f.write(
+                            f"  JSR from ${caller:04X} to ${tgt:04X}  n={n}\n"
+                        )
+                    total = sum(self._loader_jsr_counts.values())
+                    f.write(f"  total_jsr_in_band={total}\n")
+        except Exception:
+            pass
+
+    def loader_ptr_note_sta00fa_before_e5f0(self, eff: int) -> None:
+        """Count STA ($2D),Y @ $00FA while loader window active, excluding the first eff=$E5F0 store."""
+        if not self._loader_src_count_enabled or not self._loader_src_count_active:
+            return
+        if (eff & 0xFFFF) == 0xE5F0:
+            return
+        self._loader_sta00fa_before_e5f0 += 1
+
+    def loader_ptr_note_jsr(self, caller_pc: int, target: int) -> None:
+        """Count JSR abs from the Bruce outer loop into $0103 / $00FA while loader window active."""
+        if not self._loader_jsr_count_enabled or not self._loader_src_count_active:
+            return
+        caller_pc &= 0xFFFF
+        target &= 0xFFFF
+        if not (0x087E <= caller_pc <= 0x0884):
+            return
+        if target not in (0x0103, 0x00FA):
+            return
+        key = (caller_pc, target)
+        self._loader_jsr_counts[key] = self._loader_jsr_counts.get(key, 0) + 1
+
+    def loader_ptr_note_sta00fa_post_write(self, cycles: int) -> None:
+        """Open loader count window right after the first STA @ $00FA that hits eff=$4CF5."""
+        if not (self._loader_src_count_enabled or self._loader_jsr_count_enabled):
+            return
+        if not self._loader_src_count_arm:
+            return
+        self._loader_src_count_active = True
+        self._loader_src_count_arm = False
+        self._loader_src_badline_start = self.badline_cycles
+        self._loader_src_cycle_start = cycles
+        self._loader_src_irq_during_window = 0
+
+    def loader_ptr_milestone_sta00fa(
+        self,
+        eff: int,
+        cycles: int,
+        a: int,
+        y: int,
+    ) -> None:
+        """Milestones file + optional $2F/$30 write histogram between first_4cf5 and first_e5f0."""
+        if y != 0:
+            return
+        if not (
+            self._loader_ptr_milestones_enabled
+            or self._loader_src_count_enabled
+            or self._loader_jsr_count_enabled
+        ):
+            return
+        targets = {
+            0x4CF5: "first_4cf5",
+            0xE500: "first_e500",
+            0xE5F0: "first_e5f0",
+        }
+        tag = targets.get(eff & 0xFFFF)
+        if tag is None or tag in self._loader_ptr_milestone_done:
+            return
+
+        if tag == "first_e5f0" and (
+            self._loader_src_count_enabled or self._loader_jsr_count_enabled
+        ):
+            if self._loader_src_count_active:
+                if self._loader_src_count_enabled:
+                    self._loader_src_flush_counts(cycles)
+                if self._loader_jsr_count_enabled:
+                    self._loader_jsr_flush_counts(cycles)
+            else:
+                if self._loader_src_count_enabled:
+                    self._loader_src_append_note(
+                        "first_e5f0: count window inactive (no arm after first_4cf5 post-write?)\n"
+                    )
+            self._loader_src_count_active = False
+            self._loader_src_count_arm = False
+        elif tag == "first_4cf5" and (
+            self._loader_src_count_enabled or self._loader_jsr_count_enabled
+        ):
+            self._loader_src_count_arm = True
+            self._loader_src_2f_by_pc.clear()
+            self._loader_src_30_by_pc.clear()
+            self._loader_src_outrange.clear()
+            self._loader_src_irq_during_window = 0
+            self._loader_sta00fa_before_e5f0 = 0
+            self._loader_jsr_counts.clear()
+
+        if self._loader_ptr_milestones_enabled:
+            d, e, f, t = self.ram[0x2D], self.ram[0x2E], self.ram[0x2F], self.ram[0x30]
+            p01 = self._cpu_port01_effective()
+            line = (
+                f"{tag} cyc={cycles} eff=${eff:04X} a=${a:02X} "
+                f"zp2d=${d:02X} zp2e=${e:02X} zp2f=${f:02X} zp30=${t:02X} p01_eff=${p01:02X}\n"
+            )
+            try:
+                with open(self._loader_ptr_milestones_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+
+        self._loader_ptr_milestone_done.add(tag)
+
+    def brucelee_debug_capture_snapshot(self, pc: int, opcode: int) -> None:
+        if not self._brucelee_debug_enabled:
+            return
+        if pc == 0x0841 and self._brucelee_snapshot_0841_seen:
+            return
+        if pc == 0xC200 and self._brucelee_snapshot_c200_seen:
+            return
+        if pc == 0x0841:
+            self._brucelee_snapshot_0841_seen = True
+        if pc == 0xC200:
+            self._brucelee_snapshot_c200_seen = True
+        p01 = self.ram[0x01]
+        loram = 1 if (p01 & 0x01) else 0
+        hiram = 1 if (p01 & 0x02) else 0
+        charen = 1 if (p01 & 0x04) else 0
+        c200_bytes = " ".join(f"{self.ram[a]:02X}" for a in range(0xC200, 0xC221))
+        self._brucelee_log(
+            f"SNAPSHOT pc=${pc:04X} op=${opcode:02X} cyc={self.debug_last_cycles} "
+            f"p01=${p01:02X} loram={loram} hiram={hiram} charen={charen} "
+            f"mapped_c200=${self.read(0xC200):02X} ram_c200=${self.ram[0xC200]:02X}"
+        )
+        self._brucelee_log(f"SNAPSHOT_C200_BYTES {c200_bytes}")
+        if pc == 0x0841:
+            wpc, wcy, wv = self._brucelee_last_c200_write
+            self._brucelee_log(
+                f"SNAPSHOT_0841_LAST_C200_WRITE pc=${wpc:04X} cyc={wcy} val=${wv:02X} "
+                f"writes_seen={'1' if self._brucelee_first_c200_write_seen else '0'}"
+            )
 
     def _vic_irq_enabled_pending(self) -> bool:
         """Return True when a VIC IRQ source is both pending and enabled."""
         irq_mask = self._vic_regs[0x1A] & 0x0F
         return (self.vic_interrupt_state & irq_mask) != 0
+
+    def _cpu_port01_effective(self) -> int:
+        """Return effective 6510 port value seen at $0001.
+
+        $0000 is DDR, $0001 is output latch. Input bits are pulled high on C64.
+        """
+        ddr = self.ram[0x0000] & 0xFF
+        latch = self.ram[0x0001] & 0xFF
+        pullups = 0x17
+        return (latch & ddr) | (pullups & (~ddr & 0xFF))
 
     def recompute_pending_irq(self) -> None:
         """Recompute CPU IRQ line from all currently modeled IRQ sources."""
@@ -104,6 +396,27 @@ class MemoryMap:
     def read(self, addr: int) -> int:
         """Read from memory, handling ROM/RAM mapping"""
         addr &= 0xFFFF
+        if addr == 0x0000:
+            return self.ram[0x0000]
+        if addr == 0x0001:
+            return self._cpu_port01_effective()
+        if (
+            self._brucelee_debug_enabled
+            and 0x7C00 <= addr <= 0x7DFF
+            and 0x0846 <= (self.debug_last_pc & 0xFFFF) <= 0x084D
+        ):
+            self._brucelee_log(
+                f"SRC_READ pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                f"addr=${addr:04X} val=${self.ram[addr]:02X} "
+                f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
+            )
+        if self._brucelee_debug_enabled and (self.debug_last_pc & 0xFFFF) == 0x0113:
+            self._brucelee_log(
+                f"PTR2_READ pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                f"addr=${addr:04X} val=${self.ram[addr]:02X} "
+                f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X} "
+                f"zp2f=${self.ram[0x2F]:02X} zp30=${self.ram[0x30]:02X}"
+            )
 
         # Color RAM ($D800-$DBE7) is a dedicated 4-bit RAM region.
         # In practice it should be readable/writable regardless of ROM banking.
@@ -115,7 +428,7 @@ class MemoryMap:
         # - bit 0: LORAM
         # - bit 1: HIRAM
         # - bit 2: CHAREN (1 = I/O visible at $D000-$DFFF, 0 = CHAR ROM / RAM)
-        port_01 = self.ram[0x01]
+        port_01 = self._cpu_port01_effective()
         loram = (port_01 & 0x01) != 0
         hiram = (port_01 & 0x02) != 0
         charen = (port_01 & 0x04) != 0
@@ -151,13 +464,73 @@ class MemoryMap:
         """Write to memory (only RAM, ROM writes are ignored)"""
         addr &= 0xFFFF
         value &= 0xFF
+        if self._brucelee_debug_enabled:
+            if 0xC200 <= addr <= 0xC3FF:
+                old = self.ram[addr]
+                self._brucelee_log(
+                    f"C2_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                    f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                    f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
+                )
+                self._brucelee_last_c200_write = (self.debug_last_pc & 0xFFFF, self.debug_last_cycles, value)
+                self._brucelee_first_c200_write_seen = True
+            if addr in (0x0848, 0x0849, 0x084A, 0x084B):
+                old = self.ram[addr]
+                self._brucelee_log(
+                    f"SMC_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                    f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                    f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
+                )
+            if addr in (0x002D, 0x002E):
+                old = self.ram[addr]
+                self._brucelee_log(
+                    f"PTR_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                    f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                    f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
+                )
+            if addr in (0x002F, 0x0030):
+                old = self.ram[addr]
+                self._brucelee_log(
+                    f"PTR2_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                    f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                    f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
+                )
+            if 0xE5F0 <= addr <= 0xE610:
+                old = self.ram[addr]
+                p01_eff = self._cpu_port01_effective()
+                self._brucelee_log(
+                    f"E5_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                    f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                    f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X} "
+                    f"p00=${self.ram[0x0000]:02X} p01_eff=${p01_eff:02X}"
+                )
+            if addr == 0x0001:
+                old = self.ram[addr]
+                self._brucelee_log(
+                    f"PORT1_WRITE pc=${self.debug_last_pc:04X} cyc={self.debug_last_cycles} "
+                    f"addr=${addr:04X} old=${old:02X} new=${value:02X} "
+                    f"op=${self.debug_last_opcode:02X} op1=${self.debug_last_op1:02X} op2=${self.debug_last_op2:02X}"
+                )
+
+        if self._loader_src_count_active and addr in (0x002F, 0x0030):
+            pc = self.debug_last_pc & 0xFFFF
+            if 0x00F8 <= pc <= 0x011A:
+                bucket = self._loader_src_2f_by_pc if addr == 0x002F else self._loader_src_30_by_pc
+                bucket[pc] = bucket.get(pc, 0) + 1
+            else:
+                key = (addr, pc)
+                self._loader_src_outrange[key] = self._loader_src_outrange.get(key, 0) + 1
 
         # Color RAM ($D800-$DBE7): dedicated 4-bit writable RAM.
         if COLOR_MEM <= addr < (COLOR_MEM + 1000):
             self.ram[addr] = value & 0x0F
             return
 
-        port_01 = self.ram[0x01]
+        if addr in (0x0000, 0x0001):
+            self.ram[addr] = value
+            return
+
+        port_01 = self._cpu_port01_effective()
         charen = (port_01 & 0x04) != 0
 
         # Log memory writes if UDP debug is enabled (only screen writes to reduce overhead)

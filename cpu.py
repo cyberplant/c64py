@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import os
+import sys
 
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Union
 
 from .vicii_cycle import ViciiCycleEngine
 
@@ -76,6 +77,12 @@ class CPU6502:
             self._trace_sync_pc = int(v, 16) if v else None
         except Exception:
             self._trace_sync_pc = None
+        self._brucelee_last_011d_in_c2 = False
+        # Optional one-shot poke (--debug-inject-at-cycle / --debug-inject-map in C64.py).
+        self.debug_inject_at_cycle: Optional[int] = None
+        # (addr, val) for RAM poke, or (reg_name, val) for reg_name in a,x,y,p
+        self.debug_inject_writes: list[tuple[Union[int, str], int]] = []
+        self.debug_inject_done: bool = False
 
         # VICE-aligned VIC-II cycle engine (PAL 6569R3 for now).
         self.vic = ViciiCycleEngine()
@@ -375,6 +382,47 @@ class CPU6502:
         if self.memory.pending_irq and not self._get_flag(0x04):
             self._handle_irq()
 
+    def _maybe_apply_debug_inject(self) -> None:
+        """Apply debug_inject_writes once, on first step() where cycles >= inject cycle."""
+        if self.debug_inject_done or self.debug_inject_at_cycle is None:
+            return
+        if not self.debug_inject_writes:
+            return
+        if self.state.cycles < self.debug_inject_at_cycle:
+            return
+        self.debug_inject_done = True
+        parts: list[str] = []
+        for target, val in self.debug_inject_writes:
+            val &= 0xFF
+            if isinstance(target, str):
+                reg = target.lower()
+                if reg == "a":
+                    old, self.state.a = self.state.a, val
+                    parts.append(f"A=${val:02X}(was${old:02X})")
+                elif reg == "x":
+                    old, self.state.x = self.state.x, val
+                    parts.append(f"X=${val:02X}(was${old:02X})")
+                elif reg == "y":
+                    old, self.state.y = self.state.y, val
+                    parts.append(f"Y=${val:02X}(was${old:02X})")
+                elif reg in ("p", "flags"):
+                    old, self.state.p = self.state.p, val
+                    parts.append(f"P=${val:02X}(was${old:02X})")
+                else:
+                    parts.append(f"?{target}=ignored")
+                continue
+            addr = int(target) & 0xFFFF
+            old = self.memory.ram[addr] if addr < len(self.memory.ram) else 0
+            self.memory.write(addr, val)
+            parts.append(f"${addr:04X}=${val:02X}(was${old:02X})")
+        msg = (
+            f"DEBUG_INJECT cyc={self.state.cycles} pc=${self.state.pc & 0xFFFF:04X} "
+            + " ".join(parts)
+        )
+        print(msg, file=sys.stderr)
+        if getattr(self.memory, "_brucelee_debug_enabled", False):
+            self.memory.brucelee_debug_event(msg)
+
     def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0,
              vice_trace=None) -> int:
         """Execute one instruction, return cycles"""
@@ -384,9 +432,69 @@ class CPU6502:
             # Return 1 cycle to prevent infinite loops in the run loop
             return 1
 
+        self._maybe_apply_debug_inject()
+
         pc = self.state.pc
         opcode = self.memory.read(pc)
+        # Expose current instruction context to MemoryMap debug hooks.
+        self.memory.debug_last_pc = pc
+        self.memory.debug_last_cycles = self.state.cycles
+        self.memory.debug_last_opcode = opcode
+        self.memory.debug_last_op1 = self.memory.read((pc + 1) & 0xFFFF)
+        self.memory.debug_last_op2 = self.memory.read((pc + 2) & 0xFFFF)
         self._record_trace(pc, opcode)
+        if pc == 0x0841 or pc == 0xC200 or (0xC200 <= pc <= 0xC3FF):
+            self.memory.brucelee_debug_capture_snapshot(pc, opcode)
+        if opcode == 0x91 and self.memory.debug_last_op1 == 0x2D:
+            zp = self.memory.debug_last_op1
+            base = self.memory.read(zp) | (self.memory.read((zp + 1) & 0xFF) << 8)
+            eff = (base + self.state.y) & 0xFFFF
+            self.memory.brucelee_debug_event(
+                f"STA_INDY_TRACE pc=${pc:04X} cyc={self.state.cycles} "
+                f"zp=${zp:02X} base=${base:04X} y=${self.state.y:02X} eff=${eff:04X} a=${self.state.a:02X}"
+            )
+            if pc == 0x011D:
+                in_c2 = 0xC200 <= eff <= 0xC3FF
+                if in_c2 != self._brucelee_last_011d_in_c2:
+                    self.memory.brucelee_debug_event(
+                        f"STA011D_REGION_TRANSITION pc=${pc:04X} cyc={self.state.cycles} "
+                        f"eff=${eff:04X} in_c2={1 if in_c2 else 0} "
+                        f"zp2d=${self.memory.read(0x2D):02X} zp2e=${self.memory.read(0x2E):02X} "
+                        f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X} "
+                        f"a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} p=${self.state.p:02X}"
+                    )
+                self._brucelee_last_011d_in_c2 = in_c2
+
+        # Branch tracing for the hot Bruce Lee loader path.
+        op8 = opcode & 0xFF
+        pc16 = pc & 0xFFFF
+        # Bruce Lee loader (and similar): inner source bump uses BNE @ $010F (not $0120).
+        if op8 in (0xD0, 0xF0) and pc16 in (
+            0x00FE,
+            0x010F,
+            0x0120,
+            0x0125,
+            0x012C,
+            0x0130,
+            0x0134,
+            0x088A,
+        ):
+            rel = self.memory.debug_last_op1
+            rel_signed = rel if rel < 0x80 else rel - 0x100
+            target = (pc16 + 2 + rel_signed) & 0xFFFF
+            z = 1 if (self.state.p & 0x02) else 0
+            will_take = 0
+            if op8 == 0xD0:  # BNE
+                will_take = 1 if z == 0 else 0
+            elif op8 == 0xF0:  # BEQ
+                will_take = 1 if z == 1 else 0
+            self.memory.brucelee_debug_event(
+                f"BRANCH_TRACE pc=${pc16:04X} cyc={self.state.cycles} op=${op8:02X} "
+                f"rel=${rel:02X} target=${target:04X} take={will_take} z={z} "
+                f"a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} p=${self.state.p:02X} "
+                f"zp2d=${self.memory.read(0x2D):02X} zp2e=${self.memory.read(0x2E):02X} "
+                f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X}"
+            )
 
         # Trace-only aid: force VIC raster phase to a known point at the sync PC so
         # drift analysis focuses on badline/IRQ logic rather than boot-time phase.
@@ -593,8 +701,8 @@ class CPU6502:
             pc_low = self.memory.read(0x100 + self.state.sp)
             self.state.sp = (self.state.sp + 1) & 0xFF
             pc_high = self.memory.read(0x100 + self.state.sp)
-            # Reconstruct return address: (high << 8) | low + 1
-            self.state.pc = ((pc_high << 8) | pc_low + 1) & 0xFFFF
+            # Reconstruct return address with correct carry semantics.
+            self.state.pc = (((pc_high << 8) | pc_low) + 1) & 0xFFFF
 
             # Safety check: if return address is invalid (e.g., $0000), something is wrong
             if self.state.pc == 0x0000:
@@ -784,8 +892,8 @@ class CPU6502:
         p0 = self.state.p
         x0 = self.state.x
         y0 = self.state.y
-        op1 = self.memory.read((pc + 1) & 0xFFFF)
-        op2 = self.memory.read((pc + 2) & 0xFFFF)
+        op1 = self.memory.debug_last_op1
+        op2 = self.memory.debug_last_op2
 
         cycles = self._execute_opcode(opcode)
         if self.accurate_vic:
@@ -882,6 +990,8 @@ class CPU6502:
 
     def _handle_irq(self, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Handle IRQ interrupt - let KERNAL handle everything including cursor blink"""
+        if self.memory._loader_src_count_active:
+            self.memory._loader_src_irq_during_window += 1
         if not self.accurate_vic:
             # Coarse/fast mode IRQ entry (historical behavior before BA-accurate IRQ sequencing).
             self.memory.pending_irq = False
@@ -1296,7 +1406,9 @@ class CPU6502:
         elif opcode == 0xFE:  # INC absx
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            value = (self.memory.read(addr) + 1) & 0xFF
+            old = self.memory.read(addr)
+            self._rmw_dummy_write_6510(addr, old)
+            value = (old + 1) & 0xFF
             self.memory.write(addr, value)
             self._update_flags(value)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -1523,6 +1635,7 @@ class CPU6502:
     def _jsr_abs(self) -> int:
         """JSR absolute"""
         addr = self._read_word(self.state.pc + 1)
+        self.memory.loader_ptr_note_jsr(self.state.pc, addr)
         # Push return address (PC + 2) onto stack (address of next instruction - 1)
         return_addr = (self.state.pc + 2) & 0xFFFF
         pc_high = return_addr >> 8
@@ -1540,7 +1653,14 @@ class CPU6502:
         pc_low = self.memory.read(0x100 + self.state.sp)
         self.state.sp = (self.state.sp + 1) & 0xFF
         pc_high = self.memory.read(0x100 + self.state.sp)
-        self.state.pc = ((pc_high << 8) | pc_low + 1) & 0xFFFF
+        ret = ((pc_high << 8) | pc_low)
+        self.state.pc = (ret + 1) & 0xFFFF
+        if (ret + 1) & 0xFFFF in (0x0119, 0x012A):
+            self.memory.brucelee_debug_event(
+                f"RTS_TRACE pc=${(ret + 1) & 0xFFFF:04X} "
+                f"ret_raw=${ret:04X} a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} "
+                f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X}"
+            )
         return 6
 
     def _lda_imm(self) -> int:
@@ -1617,6 +1737,12 @@ class CPU6502:
         base = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
         addr = (base + self.state.y) & 0xFFFF
         self.state.a = self.memory.read(addr)
+        if self.state.pc == 0x0113 and zp_addr == 0x2F:
+            self.memory.brucelee_debug_event(
+                f"LDA0113_TRACE pc=${self.state.pc:04X} "
+                f"base=${base:04X} y=${self.state.y:02X} addr=${addr:04X} val=${self.state.a:02X} "
+                f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X}"
+            )
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6 if self._page_crossed(base, self.state.y) else 5
@@ -1700,7 +1826,14 @@ class CPU6502:
         zp_addr = self.memory.read(self.state.pc + 1)
         base = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
         addr = (base + self.state.y) & 0xFFFF
+        if self.state.pc == 0x00FA and zp_addr == 0x2D:
+            self.memory.loader_ptr_milestone_sta00fa(
+                addr, self.state.cycles, self.state.a, self.state.y
+            )
         self.memory.write(addr, self.state.a)
+        if self.state.pc == 0x00FA and zp_addr == 0x2D:
+            self.memory.loader_ptr_note_sta00fa_before_e5f0(addr)
+            self.memory.loader_ptr_note_sta00fa_post_write(self.state.cycles)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6
 
@@ -2030,9 +2163,22 @@ class CPU6502:
         return 4
 
     # Increment/Decrement
+    def _rmw_dummy_write_6510(self, addr: int, read_value: int) -> None:
+        """6502 RMW stores the read byte once before the final write.
+
+        On the 6510, $00 (DDR) and $01 (processor port latch) are sensitive: the
+        dummy write updates the latch like a real store, affecting banking before
+        the final value is written (matches VICE / hardware; loaders use INC/DEC $01).
+        """
+        addr &= 0xFFFF
+        if addr <= 0x0001:
+            self.memory.write(addr, read_value & 0xFF)
+
     def _inc_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = (self.memory.read(zp_addr) + 1) & 0xFF
+        zp_addr = self.memory.read(self.state.pc + 1) & 0xFF
+        old = self.memory.read(zp_addr)
+        self._rmw_dummy_write_6510(zp_addr, old)
+        value = (old + 1) & 0xFF
         self.memory.write(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
@@ -2040,15 +2186,19 @@ class CPU6502:
 
     def _inc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = (self.memory.read(addr) + 1) & 0xFF
+        old = self.memory.read(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        value = (old + 1) & 0xFF
         self.memory.write(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
 
     def _dec_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = (self.memory.read(zp_addr) - 1) & 0xFF
+        zp_addr = self.memory.read(self.state.pc + 1) & 0xFF
+        old = self.memory.read(zp_addr)
+        self._rmw_dummy_write_6510(zp_addr, old)
+        value = (old - 1) & 0xFF
         self.memory.write(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
@@ -2056,7 +2206,9 @@ class CPU6502:
 
     def _dec_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = (self.memory.read(addr) - 1) & 0xFF
+        old = self.memory.read(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        value = (old - 1) & 0xFF
         self.memory.write(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -2065,7 +2217,9 @@ class CPU6502:
     def _dec_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        value = (self.memory.read(addr) - 1) & 0xFF
+        old = self.memory.read(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        value = (old - 1) & 0xFF
         self.memory.write(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -2331,8 +2485,22 @@ class CPU6502:
 
     # Transfers
     def _tax(self) -> int:
+        old_x = self.state.x
         self.state.x = self.state.a
         self._update_flags(self.state.x)
+        if self.state.pc == 0x0119:
+            self.memory.brucelee_debug_event(
+                f"TAX0119_TRACE pc=${self.state.pc:04X} a=${self.state.a:02X} "
+                f"x_old=${old_x:02X} x_new=${self.state.x:02X} "
+                f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X}"
+            )
+            if self.state.x in (0x0C, 0x1B):
+                e5 = " ".join(f"{self.memory.read(a):02X}" for a in range(0xE5F0, 0xE611))
+                self.memory.brucelee_debug_event(
+                    f"TAX0119_E5_DUMP x=${self.state.x:02X} p01=${self.memory.read(0x0001):02X} "
+                    f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X} "
+                    f"bytes={e5}"
+                )
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 2
 
