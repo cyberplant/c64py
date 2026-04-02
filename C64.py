@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import os
 import sys
 import time
@@ -149,6 +150,15 @@ def main():
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
     ap.add_argument("--dump-memory", help="Dump memory to file after execution")
+    ap.add_argument(
+        "--dump-hex-range",
+        metavar="START-END",
+        default=None,
+        help=(
+            "After run (non-graphics path), print hex dump of inclusive RAM [START,END] hex, "
+            "e.g. C200-C2FF, plus sha256 of that byte range (for compare vs VICE monitor m …)."
+        ),
+    )
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
     ap.add_argument("--udp-debug", action="store_true", help="Send debug events via UDP")
     ap.add_argument("--autoquit", action="store_true", help="Automatically quit when max cycles is reached")
@@ -514,6 +524,27 @@ def main():
                         f"A=${entry['a']:02X} X=${entry['x']:02X} Y=${entry['y']:02X} "
                         f"SP=${entry['sp']:02X} P=${entry['p']:02X}"
                     )
+
+        if args.dump_hex_range:
+            rng = args.dump_hex_range.replace(" ", "").lower()
+            if "-" not in rng:
+                print("ERROR: --dump-hex-range wants START-END (hex), e.g. C200-C2FF", file=sys.stderr)
+                sys.exit(1)
+            lo_s, hi_s = rng.split("-", 1)
+            lo, hi = int(lo_s, 16) & 0xFFFF, int(hi_s, 16) & 0xFFFF
+            if lo > hi:
+                lo, hi = hi, lo
+            blob = bytes(emu.memory.ram[lo : hi + 1])
+            digest = hashlib.sha256(blob).hexdigest()
+            print(
+                f"\n=== dump-hex-range ${lo:04X}-${hi:04X} "
+                f"cpu_cycles={emu.current_cycles} sha256={digest} ==="
+            )
+            for base in range(lo, hi + 1, 16):
+                chunk_end = min(base + 16, hi + 1)
+                chunk = emu.memory.ram[base:chunk_end]
+                hexb = " ".join(f"{b:02X}" for b in chunk)
+                print(f"${base:04X}: {hexb}")
 
         # Dump memory if requested
         if args.dump_memory:

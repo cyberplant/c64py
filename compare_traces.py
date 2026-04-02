@@ -19,7 +19,7 @@ import sys
 import tempfile
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple, TextIO
+from typing import BinaryIO, Iterator, List, Optional, Tuple, TextIO
 
 try:
     from rich.console import Console
@@ -79,6 +79,18 @@ class TraceLine:
     def registers_str(self) -> str:
         """Return register state as string"""
         return f"A:{self.a:02X} X:{self.x:02X} Y:{self.y:02X} SP:{self.sp:02X} {self.flags}"
+
+
+@dataclass
+class SyncAnchor:
+    """Result of locating --match-cycles-at in a trace file."""
+
+    byte_offset: int
+    """Absolute file offset of the first byte of the matching trace line (use with --*-skip-bytes)."""
+    physical_lines_read: int
+    """Physical lines read from the search start (including comments/blanks) to reach the match."""
+    trace_line: TraceLine
+    """The matching parsed line (includes .cycles for sync)."""
 
 
 def parse_trace_line(line: str, line_num: int = 0) -> Optional[TraceLine]:
@@ -188,6 +200,59 @@ def iterate_trace_file(f: TextIO, start_line: int = 0) -> Iterator[Tuple[int, Tr
             yield line_num, parsed
 
 
+def _prepare_binary_trace_read(f: BinaryIO, start_byte: int) -> int:
+    """Seek to *start_byte* and align so the next ``readline()`` starts at a full line.
+
+    If *start_byte* points at the beginning of a ``.C:`` trace line, that line is not
+    consumed. Returns the number of physical lines consumed during alignment (0 or 1).
+    """
+    if start_byte <= 0:
+        f.seek(0)
+        return 0
+    f.seek(start_byte)
+    pos = f.tell()
+    peek = f.read(3)
+    if len(peek) < 3:
+        f.seek(pos)
+        return 0
+    # First three bytes of a trace row are b".C:" (must compare 3 bytes, not b".C")
+    if peek == b".C:":
+        f.seek(pos)
+        return 0
+    f.seek(pos)
+    f.readline()
+    return 1
+
+
+def iter_parsed_trace_binary(
+    f: BinaryIO,
+    start_byte: int = 0,
+) -> Iterator[Tuple[int, int, TraceLine]]:
+    """Yield ``(line_start_byte, physical_line_since_prepare, TraceLine)`` for each parsed trace row.
+
+    *physical_line_since_prepare* counts every ``readline()`` after alignment (including
+    lines that are not valid ``.C:`` traces).
+    """
+    align_lines = _prepare_binary_trace_read(f, start_byte)
+    phys = align_lines
+    while True:
+        line_start = f.tell()
+        raw = f.readline()
+        if not raw:
+            break
+        phys += 1
+        text = raw.decode("utf-8", errors="replace")
+        parsed = parse_trace_line(text, phys)
+        if parsed:
+            yield line_start, phys, parsed
+
+
+def iter_trace_compare(binary_f: BinaryIO, start_byte: int = 0) -> Iterator[Tuple[int, TraceLine]]:
+    """``(physical_line, TraceLine)`` stream for compare/resync (same shape as ``iterate_trace_file``)."""
+    for _boff, phys, tl in iter_parsed_trace_binary(binary_f, start_byte):
+        yield phys, tl
+
+
 def get_file_size_mb(filename: str) -> float:
     """Get file size in MB"""
     return os.path.getsize(filename) / (1024 * 1024)
@@ -238,21 +303,65 @@ def run_emulator(prg_file: str, max_cycles: int, trace_file: str, sync_pc: Optio
         return False
 
 
-def find_address_in_trace(filename: str, target_pc: int, max_search: int = 10000000) -> Optional[int]:
-    """Find line number where PC first matches target_pc"""
-    print_msg(f"   🔍 Searching PC=${target_pc:04X} in {os.path.basename(filename)}...", "dim")
-    with open(filename, 'r') as f:
-        for line_num, tl in iterate_trace_file(f):
-            if line_num % 500000 == 0:
-                print_msg(f"      ...scanned {line_num:,} lines", "dim")
-            if tl.pc == target_pc:
-                print_msg(f"      ✅ Found at line {line_num:,}", "green")
-                return line_num
-            if line_num >= max_search:
-                print_msg(f"      ❌ Not found in first {max_search:,} lines", "red")
+def find_address_in_trace(
+    filename: str,
+    target_pc: int,
+    max_search: int = 100_000_000,
+    min_cycles: Optional[int] = None,
+    start_byte: int = 0,
+    resume_flag: str = "--skip-bytes",
+) -> Optional[SyncAnchor]:
+    """Find first parsed trace row with PC *target_pc* (optional min cumulative cycles).
+
+    Scans at most *max_search* **physical** lines (every ``readline``, including blanks
+    and ``;`` comments). *start_byte* seeks before scanning (see *resume_flag* for copy-paste).
+
+    Returns a :class:`SyncAnchor` whose ``byte_offset`` is the file offset of the matching
+    line's first byte (use with ``--vice-skip-bytes`` / ``--our-skip-bytes``).
+    """
+    hint = f" (cycles>={min_cycles:,})" if min_cycles is not None else ""
+    skip_hint = f" from byte {start_byte:,}" if start_byte > 0 else ""
+    print_msg(
+        f"   🔍 Searching PC=${target_pc:04X}{hint}{skip_hint} in {os.path.basename(filename)}...",
+        "dim",
+    )
+    with open(filename, "rb") as f:
+        align_lines = _prepare_binary_trace_read(f, start_byte)
+        lines_read = align_lines
+        while True:
+            line_start = f.tell()
+            raw = f.readline()
+            if not raw:
+                print_msg(f"      ❌ Not found in file", "red")
                 return None
-    print_msg(f"      ❌ Not found in file", "red")
-    return None
+            lines_read += 1
+            if lines_read % 500_000 == 0:
+                print_msg(f"      ...scanned {lines_read:,} physical lines", "dim")
+            if lines_read > max_search:
+                print_msg(f"      ❌ Not found in first {max_search:,} physical lines", "red")
+                return None
+            text = raw.decode("utf-8", errors="replace")
+            parsed = parse_trace_line(text, lines_read)
+            if not parsed:
+                continue
+            if parsed.pc != target_pc:
+                continue
+            if min_cycles is not None and parsed.cycles < min_cycles:
+                continue
+            print_msg(
+                f"      ✅ Found at physical line {lines_read:,}, byte offset {line_start:,} "
+                f"(cyc={parsed.cycles:,})",
+                "green",
+            )
+            print_msg(
+                f"      📎 Next session: {resume_flag} {line_start}",
+                "cyan",
+            )
+            return SyncAnchor(
+                byte_offset=line_start,
+                physical_lines_read=lines_read,
+                trace_line=parsed,
+            )
 
 
 def _col_width() -> int:
@@ -529,6 +638,10 @@ def compare_traces_streaming(
     vice_trace: str,
     ignore_cycles: bool = False,
     match_cycles_at: Optional[int] = None,
+    match_min_cycle: Optional[int] = None,
+    match_search_max_lines: int = 100_000_000,
+    our_skip_bytes: int = 0,
+    vice_skip_bytes: int = 0,
     context_lines: int = 10,
     max_lines: Optional[int] = None,
     diffmode: str = "sidebyside",
@@ -552,43 +665,71 @@ def compare_traces_streaming(
     print_msg(f"📂 VICE: {vice_trace} ({vice_size:.1f} MB)", "cyan")
     print()
     
-    # If match_cycles_at specified, find start positions first
-    our_start_line = 0
-    vice_start_line = 0
+    # Sync: optional PC match + byte offsets for fast seek on huge VICE logs
+    our_sync_byte = 0
+    vice_sync_byte = 0
     cycle_offset = 0
-    
+
     if match_cycles_at is not None:
         print_msg(f"🔄 Searching sync point PC=${match_cycles_at:04X}...", "yellow")
-        
-        our_start_line = find_address_in_trace(our_trace, match_cycles_at)
-        if our_start_line is None:
+
+        mmin = match_min_cycle
+        mmax = match_search_max_lines
+        our_anchor = find_address_in_trace(
+            our_trace,
+            match_cycles_at,
+            mmax,
+            mmin,
+            start_byte=our_skip_bytes,
+            resume_flag="--our-skip-bytes",
+        )
+        if our_anchor is None:
             print_msg(f"❌ PC=${match_cycles_at:04X} not found in our trace", "red")
             return
-        
-        vice_start_line = find_address_in_trace(vice_trace, match_cycles_at)
-        if vice_start_line is None:
+
+        vice_anchor = find_address_in_trace(
+            vice_trace,
+            match_cycles_at,
+            mmax,
+            mmin,
+            start_byte=vice_skip_bytes,
+            resume_flag="--vice-skip-bytes",
+        )
+        if vice_anchor is None:
             print_msg(f"❌ PC=${match_cycles_at:04X} not found in VICE trace", "red")
             return
-        
-        # Get cycle values at sync point
-        with open(our_trace, 'r') as f:
-            for _, tl in iterate_trace_file(f):
-                if tl.line_num == our_start_line:
-                    our_sync_cycles = tl.cycles
-                    break
-        
-        with open(vice_trace, 'r') as f:
-            for _, tl in iterate_trace_file(f):
-                if tl.line_num == vice_start_line:
-                    vice_sync_cycles = tl.cycles
-                    break
-        
+
+        our_sync_byte = our_anchor.byte_offset
+        vice_sync_byte = vice_anchor.byte_offset
+        our_sync_cycles = our_anchor.trace_line.cycles
+        vice_sync_cycles = vice_anchor.trace_line.cycles
         cycle_offset = vice_sync_cycles - our_sync_cycles
         print_msg(f"\n✅ Synchronized:", "green")
-        print_msg(f"   Ours line {our_start_line:,}, VICE line {vice_start_line:,}", "dim")
+        print_msg(
+            f"   Ours: byte {our_sync_byte:,}, physical line {our_anchor.physical_lines_read:,}",
+            "dim",
+        )
+        print_msg(
+            f"   VICE: byte {vice_sync_byte:,}, physical line {vice_anchor.physical_lines_read:,}",
+            "dim",
+        )
         print_msg(f"   VICE cycles: {vice_sync_cycles:,}, Ours: {our_sync_cycles:,}", "dim")
         print_msg(f"   Offset: {cycle_offset:+,} cycles", "dim")
+        print_msg(
+            f"   📎 Resume: --our-skip-bytes {our_sync_byte} --vice-skip-bytes {vice_sync_byte}",
+            "cyan",
+        )
         print()
+    else:
+        our_sync_byte = max(0, our_skip_bytes)
+        vice_sync_byte = max(0, vice_skip_bytes)
+        if our_sync_byte or vice_sync_byte:
+            print_msg(
+                f"📎 Starting compare from bytes (no PC sync): "
+                f"--our-skip-bytes {our_sync_byte} --vice-skip-bytes {vice_sync_byte}",
+                "cyan",
+            )
+            print()
 
     # Running cycle delta (vice.cycles - our.cycles); None until first matched pair.
     # If --match-cycles-at was used we seed it with the known offset.
@@ -639,13 +780,9 @@ def compare_traces_streaming(
         segment_matches = 1
         last_divergence_resynced = True
 
-    with open(our_trace, 'r') as f_our, open(vice_trace, 'r') as f_vice:
-        our_iter: "Iterator[Tuple[int, TraceLine]]" = iterate_trace_file(
-            f_our, start_line=our_start_line - 1 if our_start_line > 0 else 0
-        )
-        vice_iter: "Iterator[Tuple[int, TraceLine]]" = iterate_trace_file(
-            f_vice, start_line=vice_start_line - 1 if vice_start_line > 0 else 0
-        )
+    with open(our_trace, "rb") as f_our, open(vice_trace, "rb") as f_vice:
+        our_iter: "Iterator[Tuple[int, TraceLine]]" = iter_trace_compare(f_our, our_sync_byte)
+        vice_iter: "Iterator[Tuple[int, TraceLine]]" = iter_trace_compare(f_vice, vice_sync_byte)
 
         while not done:
             # Check max lines limit
@@ -929,6 +1066,10 @@ Examples:
   %(prog)s --our-trace ours.txt --vice-trace vice.txt
   %(prog)s --our-trace ours.txt --vice-trace vice.txt --max-lines 1000000
   %(prog)s --our-trace ours.txt --vice-trace vice.txt --skip-drift-report --quiet-drift-summary
+
+Large VICE logs (slow sync scan): first run prints
+  Resume: --our-skip-bytes N --vice-skip-bytes M
+  Re-run with those flags so the tool seeks near the sync point instead of reading from offset 0.
         """
     )
     
@@ -939,7 +1080,43 @@ Examples:
     parser.add_argument('--max-lines', type=int, help='Max lines to compare (for large traces)')
     parser.add_argument('--ignore-cycles', action='store_true', help='Ignore cycle counts in comparison')
     parser.add_argument('--match-cycles-at', type=str, metavar='ADDR',
-                        help='Sync cycle counts at this PC address (hex, e.g., 0100)')
+                        help='Sync at first trace line with this PC (hex, e.g., C200)')
+    parser.add_argument(
+        '--match-min-cycle',
+        type=int,
+        default=None,
+        metavar='N',
+        help=(
+            'With --match-cycles-at: require cumulative trace cycle >= N on that line '
+            '(skip earlier hits of the same PC, e.g. KERNAL noise before game $C200)'
+        ),
+    )
+    parser.add_argument(
+        '--match-search-max-lines',
+        type=int,
+        default=100_000_000,
+        metavar='N',
+        help='Max physical trace lines to scan when locating --match-cycles-at (default: 100M)',
+    )
+    parser.add_argument(
+        '--our-skip-bytes',
+        type=int,
+        default=0,
+        metavar='N',
+        help=(
+            'Seek this many bytes into our trace before sync search / compare '
+            '(use byte offset printed after a successful sync; aligns to next line if not .C:)'
+        ),
+    )
+    parser.add_argument(
+        '--vice-skip-bytes',
+        type=int,
+        default=0,
+        metavar='N',
+        help=(
+            'Seek into VICE trace before sync search / compare (same as --our-skip-bytes)'
+        ),
+    )
     parser.add_argument('--context', type=int, default=10, help='Context lines to show (default: 10)')
     parser.add_argument('--diffmode', choices=['sidebyside', 'simple'], default='sidebyside',
                         help='Diff display mode: sidebyside (default) or simple (stacked ours/vice)')
@@ -1002,7 +1179,10 @@ Examples:
     if not os.path.exists(args.vice_trace):
         print_msg(f"❌ VICE trace not found: {args.vice_trace}", "red")
         sys.exit(1)
-    
+
+    if args.our_skip_bytes < 0 or args.vice_skip_bytes < 0:
+        parser.error("--our-skip-bytes and --vice-skip-bytes must be >= 0")
+
     match_cycles_at = None
     if args.match_cycles_at:
         try:
@@ -1036,6 +1216,10 @@ Examples:
         vice_trace=args.vice_trace,
         ignore_cycles=args.ignore_cycles,
         match_cycles_at=match_cycles_at,
+        match_min_cycle=args.match_min_cycle,
+        match_search_max_lines=args.match_search_max_lines,
+        our_skip_bytes=args.our_skip_bytes,
+        vice_skip_bytes=args.vice_skip_bytes,
         context_lines=args.context,
         max_lines=args.max_lines,
         diffmode=args.diffmode,

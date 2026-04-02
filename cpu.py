@@ -311,10 +311,27 @@ class CPU6502:
                 entries.append(entry)
         return entries
 
+    def _mr(self, addr: int) -> int:
+        """CPU bus read. In fast VIC mode, advances raster/CIA one cycle (matches VICE $D011 timing)."""
+        v = self.memory.read(addr)
+        if not self.accurate_vic:
+            self._advance_raster(1)
+            self._update_cia_timers(1, recompute_irq=False)
+            self.state.cycles += 1
+        return v
+
+    def _mw(self, addr: int, value: int) -> None:
+        """CPU bus write; same per-cycle advance as _mr in fast VIC mode."""
+        self.memory.write(addr, value)
+        if not self.accurate_vic:
+            self._advance_raster(1)
+            self._update_cia_timers(1, recompute_irq=False)
+            self.state.cycles += 1
+
     def _read_word(self, addr: int) -> int:
         """Read 16-bit word (little-endian)"""
-        low = self.memory.read(addr)
-        high = self.memory.read((addr + 1) & 0xFFFF)
+        low = self._mr(addr)
+        high = self._mr((addr + 1) & 0xFFFF)
         return low | (high << 8)
 
     def _get_flag(self, flag: int) -> bool:
@@ -435,6 +452,7 @@ class CPU6502:
         self._maybe_apply_debug_inject()
 
         pc = self.state.pc
+        initial_cyc = self.state.cycles
         opcode = self.memory.read(pc)
         # Expose current instruction context to MemoryMap debug hooks.
         self.memory.debug_last_pc = pc
@@ -528,7 +546,6 @@ class CPU6502:
                 self.state.a, self.state.x, self.state.y, self.state.sp,
                 self.state.p, self.state.cycles
             )
-
 
         # Special handling for CINT when no KERNAL ROM is loaded.
         # If the ROM is present, let the KERNAL initialize its own editor state.
@@ -887,6 +904,12 @@ class CPU6502:
 
             return 20  # Approximate cycles for CHROUT
 
+        # Opcode fetch is cycle 1; advance VIC/CIA before operand reads (after KERNAL fast paths).
+        if not self.accurate_vic:
+            self._advance_raster(1)
+            self._update_cia_timers(1, recompute_irq=False)
+            self.state.cycles += 1
+
         # Pre-instruction state for bus-phase refinement (branches, indexed modes).
         pc0 = pc
         p0 = self.state.p
@@ -918,10 +941,13 @@ class CPU6502:
                 self._handle_irq()
             return elapsed
 
-        # Fast/coarse mode: no BA-prefetch stall loop, approximate VIC timing by raster advance.
-        self.state.cycles += cycles
-        self._update_cia_timers(cycles)
-        self._advance_raster(cycles)
+        # Fast/coarse mode: raster/CIA per bus access + non-bus cycles (NOP internal, branch penalty, …).
+        if not self.accurate_vic:
+            extra = cycles - (self.state.cycles - initial_cyc)
+            if extra > 0:
+                self._advance_raster(extra)
+                self._update_cia_timers(extra, recompute_irq=False)
+                self.state.cycles += extra
         self.memory.recompute_pending_irq()
         if self.memory.pending_irq and not self._get_flag(0x04):
             # Coarse mode: follow historical behavior and service CIA-driven IRQ path.
@@ -1088,7 +1114,7 @@ class CPU6502:
         elif opcode == 0xBD:  # LDA absx
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            self.state.a = self.memory.read(addr)
+            self.state.a = self._mr(addr)
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
             return 5 if self._page_crossed(base, self.state.x) else 4
@@ -1105,15 +1131,15 @@ class CPU6502:
         elif opcode == 0xAE:  # LDX abs
             return self._ldx_abs()
         elif opcode == 0xB6:  # LDX zpy
-            zp_addr = (self.memory.read(self.state.pc + 1) + self.state.y) & 0xFF
-            self.state.x = self.memory.read(zp_addr)
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.y) & 0xFF
+            self.state.x = self._mr(zp_addr)
             self._update_flags(self.state.x)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 4
         elif opcode == 0xBE:  # LDX absy
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.y) & 0xFFFF
-            self.state.x = self.memory.read(addr)
+            self.state.x = self._mr(addr)
             self._update_flags(self.state.x)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
             return 5 if self._page_crossed(base, self.state.y) else 4
@@ -1123,6 +1149,8 @@ class CPU6502:
             return self._ldy_zp()
         elif opcode == 0xAC:  # LDY abs
             return self._ldy_abs()
+        elif opcode == 0xBC:  # LDY abs,X
+            return self._ldy_absx()
         elif opcode == 0xB4:  # LDY zp,X (undocumented)
             return self._ldy_zpx()
         elif opcode == 0x85:  # STA zp
@@ -1150,25 +1178,22 @@ class CPU6502:
         elif opcode == 0x94:  # STY zp,X (undocumented)
             return self._sty_zpx()
         elif opcode == 0x87:  # SAX zp (undocumented - A & X -> memory)
-            zp_addr = self.memory.read(self.state.pc + 1)
-            self.memory.write(zp_addr, self.state.a & self.state.x)
+            zp_addr = self._mr(self.state.pc + 1)
+            self._mw(zp_addr, self.state.a & self.state.x)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 3
-        elif opcode == 0x80:  # NOP (undocumented)
-            self.state.pc = (self.state.pc + 1) & 0xFFFF
-            return 2
         elif opcode == 0xA3:  # LAX (indirect,X) (undocumented - LDA + TAX)
-            zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-            addr = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
-            self.state.a = self.memory.read(addr)
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            addr = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
+            self.state.a = self._mr(addr)
             self.state.x = self.state.a
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 6
         elif opcode == 0xC7:  # DCP zp (undocumented - DEC then CMP)
-            zp_addr = self.memory.read(self.state.pc + 1)
-            value = (self.memory.read(zp_addr) - 1) & 0xFF
-            self.memory.write(zp_addr, value)
+            zp_addr = self._mr(self.state.pc + 1)
+            value = (self._mr(zp_addr) - 1) & 0xFF
+            self._mw(zp_addr, value)
             # CMP part
             result = self.state.a - value
             self._set_flag(0x01, result >= 0)  # Carry
@@ -1197,8 +1222,8 @@ class CPU6502:
         elif opcode == 0xE5:  # SBC zp
             return self._sbc_zp()
         elif opcode == 0xF5:  # SBC zpx
-            zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-            value = self.memory.read(zp_addr)
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            value = self._mr(zp_addr)
             carry = 1 if self._get_flag(0x01) else 0
             result = self.state.a - value - (1 - carry)
             self._set_flag(0x01, result >= 0)
@@ -1209,11 +1234,11 @@ class CPU6502:
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 4
         elif opcode == 0xE1:  # SBC indx
-            zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-            addr_low = self.memory.read(zp_addr)
-            addr_high = self.memory.read((zp_addr + 1) & 0xFF)
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            addr_low = self._mr(zp_addr)
+            addr_high = self._mr((zp_addr + 1) & 0xFF)
             addr = addr_low | (addr_high << 8)
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             carry = 1 if self._get_flag(0x01) else 0
             result = self.state.a - value - (1 - carry)
             self._set_flag(0x01, result >= 0)
@@ -1223,12 +1248,12 @@ class CPU6502:
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 6
         elif opcode == 0xF1:  # SBC indy (SBC ($nn),Y)
-            zp_ptr = self.memory.read(self.state.pc + 1)
-            addr_low = self.memory.read(zp_ptr)
-            addr_high = self.memory.read((zp_ptr + 1) & 0xFF)
+            zp_ptr = self._mr(self.state.pc + 1)
+            addr_low = self._mr(zp_ptr)
+            addr_high = self._mr((zp_ptr + 1) & 0xFF)
             base = addr_low | (addr_high << 8)
             addr = (base + self.state.y) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             carry = 1 if self._get_flag(0x01) else 0
             result = self.state.a - value - (1 - carry)
             self._set_flag(0x01, result >= 0)
@@ -1242,7 +1267,7 @@ class CPU6502:
         elif opcode == 0xFD:  # SBC absx
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             carry = 1 if self._get_flag(0x01) else 0
             result = self.state.a - value - (1 - carry)
             self._set_flag(0x01, result >= 0)
@@ -1254,7 +1279,7 @@ class CPU6502:
         elif opcode == 0xF9:  # SBC absy
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.y) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             carry = 1 if self._get_flag(0x01) else 0
             result = self.state.a - value - (1 - carry)
             self._set_flag(0x01, result >= 0)
@@ -1273,6 +1298,8 @@ class CPU6502:
             return self._and_abs()
         elif opcode == 0x3D:  # AND abs,X
             return self._and_absx()
+        elif opcode == 0x39:  # AND abs,Y
+            return self._and_absy()
         elif opcode == 0x09:  # ORA imm
             return self._ora_imm()
         elif opcode == 0x05:  # ORA zp
@@ -1289,6 +1316,10 @@ class CPU6502:
             return self._eor_zp()
         elif opcode == 0x4D:  # EOR abs
             return self._eor_abs()
+        elif opcode == 0x5D:  # EOR abs,X
+            return self._eor_absx()
+        elif opcode == 0x59:  # EOR abs,Y
+            return self._eor_absy()
         elif opcode == 0x51:  # EOR (zp),Y
             return self._eor_indy()
 
@@ -1302,7 +1333,7 @@ class CPU6502:
         elif opcode == 0xDD:  # CMP absx
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             result = (self.state.a - value) & 0xFF
             self._set_flag(0x01, self.state.a >= value)
             self._update_flags(result)
@@ -1311,7 +1342,7 @@ class CPU6502:
         elif opcode == 0xD9:  # CMP absy
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.y) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             result = (self.state.a - value) & 0xFF
             self._set_flag(0x01, self.state.a >= value)
             self._update_flags(result)
@@ -1333,19 +1364,19 @@ class CPU6502:
         elif opcode == 0xCC:  # CPY abs
             return self._cpy_abs()
         elif opcode == 0xC1:  # CMP indx
-            zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-            addr = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
-            value = self.memory.read(addr)
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            addr = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
+            value = self._mr(addr)
             result = (self.state.a - value) & 0xFF
             self._set_flag(0x01, self.state.a >= value)
             self._update_flags(result)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 6
         elif opcode == 0xD1:  # CMP indy
-            zp_addr = self.memory.read(self.state.pc + 1)
-            base = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
+            zp_addr = self._mr(self.state.pc + 1)
+            base = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
             addr = (base + self.state.y) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             result = (self.state.a - value) & 0xFF
             self._set_flag(0x01, self.state.a >= value)
             self._update_flags(result)
@@ -1406,10 +1437,10 @@ class CPU6502:
         elif opcode == 0xFE:  # INC absx
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            old = self.memory.read(addr)
+            old = self._mr(addr)
             self._rmw_dummy_write_6510(addr, old)
             value = (old + 1) & 0xFF
-            self.memory.write(addr, value)
+            self._mw(addr, value)
             self._update_flags(value)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
             return 7
@@ -1455,18 +1486,18 @@ class CPU6502:
             return self._plp()
         elif opcode == 0x7A:  # PLY (undocumented - pull Y from stack)
             self.state.sp = (self.state.sp + 1) & 0xFF
-            self.state.y = self.memory.read(0x100 + self.state.sp)
+            self.state.y = self._mr(0x100 + self.state.sp)
             self._update_flags(self.state.y)
             self.state.pc = (self.state.pc + 1) & 0xFFFF
             return 4
         elif opcode == 0x7F:  # RRA absx (undocumented - ROR + ADC)
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            value = self.memory.read(addr)
+            value = self._mr(addr)
             carry = 1 if self._get_flag(0x01) else 0
             new_carry = (value & 0x01) != 0
             value = ((value >> 1) | (carry << 7)) & 0xFF
-            self.memory.write(addr, value)
+            self._mw(addr, value)
             self._set_flag(0x01, new_carry)
             # ADC part
             carry = 1 if self._get_flag(0x01) else 0
@@ -1477,15 +1508,15 @@ class CPU6502:
             self.state.pc = (self.state.pc + 3) & 0xFFFF
             return 7
         elif opcode == 0xA7:  # LAX zp (undocumented - LDA + TAX)
-            zp_addr = self.memory.read(self.state.pc + 1)
-            self.state.a = self.memory.read(zp_addr)
+            zp_addr = self._mr(self.state.pc + 1)
+            self.state.a = self._mr(zp_addr)
             self.state.x = self.state.a
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 3
         elif opcode == 0xAF:  # LAX abs (undocumented - LDA + TAX)
             addr = self._read_word(self.state.pc + 1)
-            self.state.a = self.memory.read(addr)
+            self.state.a = self._mr(addr)
             self.state.x = self.state.a
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -1493,7 +1524,7 @@ class CPU6502:
         elif opcode == 0xBF:  # LAX absy (undocumented - LDA + TAX)
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.y) & 0xFFFF
-            self.state.a = self.memory.read(addr)
+            self.state.a = self._mr(addr)
             self.state.x = self.state.a
             self._update_flags(self.state.a)
             self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -1501,8 +1532,8 @@ class CPU6502:
         elif opcode == 0xFF:  # ISC absx (undocumented - increment memory, then subtract with carry)
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
-            value = (self.memory.read(addr) + 1) & 0xFF
-            self.memory.write(addr, value)
+            value = (self._mr(addr) + 1) & 0xFF
+            self._mw(addr, value)
             # SBC part
             carry = 1 if self._get_flag(0x01) else 0
             result = self.state.a - value - (1 - carry)
@@ -1572,7 +1603,8 @@ class CPU6502:
             self.state.pc = (self.state.pc + 1) & 0xFFFF
             return 2
         # NOP variants (documented and undocumented)
-        elif opcode in [0x80, 0x82, 0x89, 0xC2, 0xE2]:  # NOP imm (documented - consume 1 byte operand)
+        elif opcode in [0x80, 0x82, 0x89, 0xC2, 0xE2]:  # NOP #imm (same bus as LDA # — discard result)
+            self._mr((self.state.pc + 1) & 0xFFFF)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 2
         elif opcode in [0x04, 0x44, 0x64]:  # NOP zp (undocumented - consume 1 byte operand)
@@ -1616,11 +1648,11 @@ class CPU6502:
         # Push PC+2 and P onto stack
         pc_high = (self.state.pc + 2) >> 8
         pc_low = (self.state.pc + 2) & 0xFF
-        self.memory.write(0x100 + self.state.sp, pc_high)
+        self._mw(0x100 + self.state.sp, pc_high)
         self.state.sp = (self.state.sp - 1) & 0xFF
-        self.memory.write(0x100 + self.state.sp, pc_low)
+        self._mw(0x100 + self.state.sp, pc_low)
         self.state.sp = (self.state.sp - 1) & 0xFF
-        self.memory.write(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
+        self._mw(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
         self.state.sp = (self.state.sp - 1) & 0xFF
         self._set_flag(0x04, True)  # Set I flag
         self.state.pc = self._read_word(0xFFFE)  # IRQ vector
@@ -1640,9 +1672,9 @@ class CPU6502:
         return_addr = (self.state.pc + 2) & 0xFFFF
         pc_high = return_addr >> 8
         pc_low = return_addr & 0xFF
-        self.memory.write(0x100 + self.state.sp, pc_high)
+        self._mw(0x100 + self.state.sp, pc_high)
         self.state.sp = (self.state.sp - 1) & 0xFF
-        self.memory.write(0x100 + self.state.sp, pc_low)
+        self._mw(0x100 + self.state.sp, pc_low)
         self.state.sp = (self.state.sp - 1) & 0xFF
         self.state.pc = addr
         return 6
@@ -1650,9 +1682,9 @@ class CPU6502:
     def _rts(self) -> int:
         """RTS"""
         self.state.sp = (self.state.sp + 1) & 0xFF
-        pc_low = self.memory.read(0x100 + self.state.sp)
+        pc_low = self._mr(0x100 + self.state.sp)
         self.state.sp = (self.state.sp + 1) & 0xFF
-        pc_high = self.memory.read(0x100 + self.state.sp)
+        pc_high = self._mr(0x100 + self.state.sp)
         ret = ((pc_high << 8) | pc_low)
         self.state.pc = (ret + 1) & 0xFFFF
         # Log returns from page-$01 helper into the $08xx driver (Bruce Lee loader path).
@@ -1666,15 +1698,15 @@ class CPU6502:
 
     def _lda_imm(self) -> int:
         """LDA immediate"""
-        self.state.a = self.memory.read(self.state.pc + 1)
+        self.state.a = self._mr(self.state.pc + 1)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _lda_zp(self) -> int:
         """LDA zero page"""
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.state.a = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        self.state.a = self._mr(zp_addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
@@ -1682,29 +1714,29 @@ class CPU6502:
     def _lda_abs(self) -> int:
         """LDA absolute"""
         addr = self._read_word(self.state.pc + 1)
-        self.state.a = self.memory.read(addr)
+        self.state.a = self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
     def _sta_zp(self) -> int:
         """STA zero page"""
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.memory.write(zp_addr, self.state.a)
+        zp_addr = self._mr(self.state.pc + 1)
+        self._mw(zp_addr, self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _sta_abs(self) -> int:
         """STA absolute"""
         addr = self._read_word(self.state.pc + 1)
-        self.memory.write(addr, self.state.a)
+        self._mw(addr, self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
     # Additional opcode implementations (simplified - add more as needed)
     def _lda_zpx(self) -> int:
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        self.state.a = self.memory.read(zp_addr)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self.state.a = self._mr(zp_addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 4
@@ -1712,7 +1744,7 @@ class CPU6502:
     def _lda_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        self.state.a = self.memory.read(addr)
+        self.state.a = self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5 if self._page_crossed(base, self.state.x) else 4
@@ -1720,24 +1752,24 @@ class CPU6502:
     def _lda_absy(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.y) & 0xFFFF
-        self.state.a = self.memory.read(addr)
+        self.state.a = self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5 if self._page_crossed(base, self.state.y) else 4
 
     def _lda_indx(self) -> int:
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        addr = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
-        self.state.a = self.memory.read(addr)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        addr = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
+        self.state.a = self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6
 
     def _lda_indy(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        base = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
+        zp_addr = self._mr(self.state.pc + 1)
+        base = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
         addr = (base + self.state.y) & 0xFFFF
-        self.state.a = self.memory.read(addr)
+        self.state.a = self._mr(addr)
         if self.state.pc == 0x0113 and zp_addr == 0x2F:
             self.memory.brucelee_debug_event(
                 f"LDA0113_TRACE pc=${self.state.pc:04X} "
@@ -1749,89 +1781,97 @@ class CPU6502:
         return 6 if self._page_crossed(base, self.state.y) else 5
 
     def _ldx_imm(self) -> int:
-        self.state.x = self.memory.read(self.state.pc + 1)
+        self.state.x = self._mr(self.state.pc + 1)
         self._update_flags(self.state.x)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _ldx_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.state.x = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        self.state.x = self._mr(zp_addr)
         self._update_flags(self.state.x)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _ldx_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.state.x = self.memory.read(addr)
+        self.state.x = self._mr(addr)
         self._update_flags(self.state.x)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
     def _ldy_imm(self) -> int:
-        self.state.y = self.memory.read(self.state.pc + 1)
+        self.state.y = self._mr(self.state.pc + 1)
         self._update_flags(self.state.y)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _ldy_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.state.y = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        self.state.y = self._mr(zp_addr)
         self._update_flags(self.state.y)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _ldy_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.state.y = self.memory.read(addr)
+        self.state.y = self._mr(addr)
         self._update_flags(self.state.y)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
+    def _ldy_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        self.state.y = self._mr(addr)
+        self._update_flags(self.state.y)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 5 if self._page_crossed(base, self.state.x) else 4
+
     def _ldy_zpx(self) -> int:
         """LDY zero page,X (undocumented opcode $B4)"""
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        self.state.y = self.memory.read(zp_addr)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self.state.y = self._mr(zp_addr)
         self._update_flags(self.state.y)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 4
 
     def _sta_zpx(self) -> int:
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        self.memory.write(zp_addr, self.state.a)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self._mw(zp_addr, self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 4
 
     def _sta_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        self.memory.write(addr, self.state.a)
+        self._mw(addr, self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5
 
     def _sta_absy(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.y) & 0xFFFF
-        self.memory.write(addr, self.state.a)
+        self._mw(addr, self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5
 
     def _sta_indx(self) -> int:
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        addr = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
-        self.memory.write(addr, self.state.a)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        addr = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
+        self._mw(addr, self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6
 
     def _sta_indy(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        base = self.memory.read(zp_addr) | (self.memory.read((zp_addr + 1) & 0xFF) << 8)
+        zp_addr = self._mr(self.state.pc + 1)
+        base = self._mr(zp_addr) | (self._mr((zp_addr + 1) & 0xFF) << 8)
         addr = (base + self.state.y) & 0xFFFF
         if self.state.pc == 0x00FA and zp_addr == 0x2D:
             self.memory.loader_ptr_milestone_sta00fa(
                 addr, self.state.cycles, self.state.a, self.state.y
             )
-        self.memory.write(addr, self.state.a)
+        self._mw(addr, self.state.a)
         if self.state.pc == 0x00FA and zp_addr == 0x2D:
             self.memory.loader_ptr_note_sta00fa_before_e5f0(addr)
             self.memory.loader_ptr_note_sta00fa_post_write(self.state.cycles)
@@ -1839,39 +1879,39 @@ class CPU6502:
         return 6
 
     def _stx_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.memory.write(zp_addr, self.state.x)
+        zp_addr = self._mr(self.state.pc + 1)
+        self._mw(zp_addr, self.state.x)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _stx_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.memory.write(addr, self.state.x)
+        self._mw(addr, self.state.x)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
     def _sty_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.memory.write(zp_addr, self.state.y)
+        zp_addr = self._mr(self.state.pc + 1)
+        self._mw(zp_addr, self.state.y)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _sty_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.memory.write(addr, self.state.y)
+        self._mw(addr, self.state.y)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
     def _sty_zpx(self) -> int:
         """STY zero page,X (undocumented opcode $94)"""
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        self.memory.write(zp_addr, self.state.y)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self._mw(zp_addr, self.state.y)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 4
 
     # Arithmetic operations (simplified)
     def _adc_imm(self) -> int:
-        value = self.memory.read(self.state.pc + 1)
+        value = self._mr(self.state.pc + 1)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1880,8 +1920,8 @@ class CPU6502:
         return 2
 
     def _adc_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1891,11 +1931,11 @@ class CPU6502:
 
     def _adc_indx(self) -> int:
         """ADC ($zp,X) — indexed indirect"""
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        addr_low = self.memory.read(zp_addr)
-        addr_high = self.memory.read((zp_addr + 1) & 0xFF)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        addr_low = self._mr(zp_addr)
+        addr_high = self._mr((zp_addr + 1) & 0xFF)
         addr = addr_low | (addr_high << 8)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1905,12 +1945,12 @@ class CPU6502:
 
     def _adc_indy(self) -> int:
         """ADC ($zp),Y — indirect indexed"""
-        zp_ptr = self.memory.read(self.state.pc + 1)
-        addr_low = self.memory.read(zp_ptr)
-        addr_high = self.memory.read((zp_ptr + 1) & 0xFF)
+        zp_ptr = self._mr(self.state.pc + 1)
+        addr_low = self._mr(zp_ptr)
+        addr_high = self._mr((zp_ptr + 1) & 0xFF)
         base = addr_low | (addr_high << 8)
         addr = (base + self.state.y) & 0xFFFF
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1920,7 +1960,7 @@ class CPU6502:
 
     def _adc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1932,7 +1972,7 @@ class CPU6502:
         """ADC (Add with Carry) absolute,X"""
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1944,7 +1984,7 @@ class CPU6502:
         """ADC (Add with Carry) absolute,Y"""
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.y) & 0xFFFF
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         old_a = self.state.a
         carry = 1 if self._get_flag(0x01) else 0
         result = old_a + value + carry
@@ -1953,7 +1993,7 @@ class CPU6502:
         return 5 if self._page_crossed(base, self.state.y) else 4
 
     def _sbc_imm(self) -> int:
-        value = self.memory.read(self.state.pc + 1)
+        value = self._mr(self.state.pc + 1)
         carry = 1 if self._get_flag(0x01) else 0
         result = self.state.a - value - (1 - carry)
         self._set_flag(0x01, result >= 0)
@@ -1964,8 +2004,8 @@ class CPU6502:
         return 2
 
     def _sbc_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         carry = 1 if self._get_flag(0x01) else 0
         result = self.state.a - value - (1 - carry)
         self._set_flag(0x01, result >= 0)
@@ -1978,7 +2018,7 @@ class CPU6502:
 
     def _sbc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         carry = 1 if self._get_flag(0x01) else 0
         result = self.state.a - value - (1 - carry)
         self._set_flag(0x01, result >= 0)
@@ -1990,21 +2030,21 @@ class CPU6502:
 
     # Logic operations
     def _and_imm(self) -> int:
-        self.state.a &= self.memory.read(self.state.pc + 1)
+        self.state.a &= self._mr(self.state.pc + 1)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _and_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.state.a &= self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        self.state.a &= self._mr(zp_addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _and_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.state.a &= self.memory.read(addr)
+        self.state.a &= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
@@ -2012,27 +2052,35 @@ class CPU6502:
     def _and_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        self.state.a &= self.memory.read(addr)
+        self.state.a &= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5 if self._page_crossed(base, self.state.x) else 4
 
+    def _and_absy(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.y) & 0xFFFF
+        self.state.a &= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 5 if self._page_crossed(base, self.state.y) else 4
+
     def _ora_imm(self) -> int:
-        self.state.a |= self.memory.read(self.state.pc + 1)
+        self.state.a |= self._mr(self.state.pc + 1)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _ora_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.state.a |= self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        self.state.a |= self._mr(zp_addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _ora_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.state.a |= self.memory.read(addr)
+        self.state.a |= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
@@ -2040,7 +2088,7 @@ class CPU6502:
     def _ora_absy(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.y) & 0xFFFF
-        self.state.a |= self.memory.read(addr)
+        self.state.a |= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5 if self._page_crossed(base, self.state.y) else 4
@@ -2048,45 +2096,61 @@ class CPU6502:
     def _ora_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        self.state.a |= self.memory.read(addr)
+        self.state.a |= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 5 if self._page_crossed(base, self.state.x) else 4
 
     def _eor_imm(self) -> int:
-        self.state.a ^= self.memory.read(self.state.pc + 1)
+        self.state.a ^= self._mr(self.state.pc + 1)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 2
 
     def _eor_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        self.state.a ^= self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        self.state.a ^= self._mr(zp_addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
     def _eor_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        self.state.a ^= self.memory.read(addr)
+        self.state.a ^= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
+    def _eor_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        self.state.a ^= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 5 if self._page_crossed(base, self.state.x) else 4
+
+    def _eor_absy(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.y) & 0xFFFF
+        self.state.a ^= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 5 if self._page_crossed(base, self.state.y) else 4
+
     def _eor_indy(self) -> int:
-        zp_ptr = self.memory.read(self.state.pc + 1)
-        addr_low = self.memory.read(zp_ptr)
-        addr_high = self.memory.read((zp_ptr + 1) & 0xFF)
+        zp_ptr = self._mr(self.state.pc + 1)
+        addr_low = self._mr(zp_ptr)
+        addr_high = self._mr((zp_ptr + 1) & 0xFF)
         base = addr_low | (addr_high << 8)
         addr = (base + self.state.y) & 0xFFFF
-        self.state.a ^= self.memory.read(addr)
+        self.state.a ^= self._mr(addr)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6 if self._page_crossed(base, self.state.y) else 5
 
     # Compare operations
     def _cmp_imm(self) -> int:
-        value = self.memory.read(self.state.pc + 1)
+        value = self._mr(self.state.pc + 1)
         result = (self.state.a - value) & 0xFF
         self._set_flag(0x01, self.state.a >= value)
         self._update_flags(result)
@@ -2094,8 +2158,8 @@ class CPU6502:
         return 2
 
     def _cmp_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         result = (self.state.a - value) & 0xFF
         self._set_flag(0x01, self.state.a >= value)
         self._update_flags(result)
@@ -2104,7 +2168,7 @@ class CPU6502:
 
     def _cmp_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         result = (self.state.a - value) & 0xFF
         self._set_flag(0x01, self.state.a >= value)
         self._update_flags(result)
@@ -2112,7 +2176,7 @@ class CPU6502:
         return 4
 
     def _cpx_imm(self) -> int:
-        value = self.memory.read(self.state.pc + 1)
+        value = self._mr(self.state.pc + 1)
         result = (self.state.x - value) & 0xFF
         self._set_flag(0x01, self.state.x >= value)
         self._update_flags(result)
@@ -2120,8 +2184,8 @@ class CPU6502:
         return 2
 
     def _cpx_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         result = (self.state.x - value) & 0xFF
         self._set_flag(0x01, self.state.x >= value)
         self._update_flags(result)
@@ -2130,7 +2194,7 @@ class CPU6502:
 
     def _cpx_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         result = (self.state.x - value) & 0xFF
         self._set_flag(0x01, self.state.x >= value)
         self._update_flags(result)
@@ -2138,7 +2202,7 @@ class CPU6502:
         return 4
 
     def _cpy_imm(self) -> int:
-        value = self.memory.read(self.state.pc + 1)
+        value = self._mr(self.state.pc + 1)
         result = (self.state.y - value) & 0xFF
         self._set_flag(0x01, self.state.y >= value)
         self._update_flags(result)
@@ -2146,8 +2210,8 @@ class CPU6502:
         return 2
 
     def _cpy_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         result = (self.state.y - value) & 0xFF
         self._set_flag(0x01, self.state.y >= value)
         self._update_flags(result)
@@ -2156,7 +2220,7 @@ class CPU6502:
 
     def _cpy_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         result = (self.state.y - value) & 0xFF
         self._set_flag(0x01, self.state.y >= value)
         self._update_flags(result)
@@ -2173,44 +2237,44 @@ class CPU6502:
         """
         addr &= 0xFFFF
         if addr <= 0x0001:
-            self.memory.write(addr, read_value & 0xFF)
+            self._mw(addr, read_value & 0xFF)
 
     def _inc_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1) & 0xFF
-        old = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1) & 0xFF
+        old = self._mr(zp_addr)
         self._rmw_dummy_write_6510(zp_addr, old)
         value = (old + 1) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5
 
     def _inc_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        old = self.memory.read(addr)
+        old = self._mr(addr)
         self._rmw_dummy_write_6510(addr, old)
         value = (old + 1) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
 
     def _dec_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1) & 0xFF
-        old = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1) & 0xFF
+        old = self._mr(zp_addr)
         self._rmw_dummy_write_6510(zp_addr, old)
         value = (old - 1) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5
 
     def _dec_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        old = self.memory.read(addr)
+        old = self._mr(addr)
         self._rmw_dummy_write_6510(addr, old)
         value = (old - 1) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
@@ -2218,10 +2282,10 @@ class CPU6502:
     def _dec_absx(self) -> int:
         base = self._read_word(self.state.pc + 1)
         addr = (base + self.state.x) & 0xFFFF
-        old = self.memory.read(addr)
+        old = self._mr(addr)
         self._rmw_dummy_write_6510(addr, old)
         value = (old - 1) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 7  # same as INC abs,X; page-cross penalty not modeled
@@ -2259,32 +2323,32 @@ class CPU6502:
         return 2
 
     def _asl_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         self._set_flag(0x01, (value & 0x80) != 0)
         value = (value << 1) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5
 
     def _asl_zpx(self) -> int:
         """ASL (Arithmetic Shift Left) zero-page,X"""
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        value = self.memory.read(zp_addr)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        value = self._mr(zp_addr)
         self._set_flag(0x01, (value & 0x80) != 0)  # Carry = bit 7
         value = (value << 1) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6
 
     def _asl_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         self._set_flag(0x01, (value & 0x80) != 0)
         value = (value << 1) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
@@ -2297,32 +2361,32 @@ class CPU6502:
         return 2
 
     def _lsr_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         self._set_flag(0x01, (value & 0x01) != 0)
         value = (value >> 1) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5
 
     def _lsr_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         self._set_flag(0x01, (value & 0x01) != 0)
         value = (value >> 1) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
 
     def _lsr_zpx(self) -> int:
         """LSR (Logical Shift Right) zero-page,X"""
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        value = self.memory.read(zp_addr)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        value = self._mr(zp_addr)
         self._set_flag(0x01, (value & 0x01) != 0)  # Carry = bit 0
         value = (value >> 1) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 6
@@ -2337,12 +2401,12 @@ class CPU6502:
         return 2
 
     def _rol_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         carry = 1 if self._get_flag(0x01) else 0
         new_carry = (value & 0x80) != 0
         value = ((value << 1) | carry) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._set_flag(0x01, new_carry)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
@@ -2350,11 +2414,11 @@ class CPU6502:
 
     def _rol_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         carry = 1 if self._get_flag(0x01) else 0
         new_carry = (value & 0x80) != 0
         value = ((value << 1) | carry) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._set_flag(0x01, new_carry)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -2370,24 +2434,24 @@ class CPU6502:
         return 2
 
     def _ror_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         carry = 1 if self._get_flag(0x01) else 0
         new_carry = (value & 0x01) != 0
         value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._set_flag(0x01, new_carry)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5
 
     def _ror_zpx(self) -> int:
-        zp_addr = (self.memory.read(self.state.pc + 1) + self.state.x) & 0xFF
-        value = self.memory.read(zp_addr)
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        value = self._mr(zp_addr)
         carry = 1 if self._get_flag(0x01) else 0
         new_carry = (value & 0x01) != 0
         value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.memory.write(zp_addr, value)
+        self._mw(zp_addr, value)
         self._set_flag(0x01, new_carry)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
@@ -2395,11 +2459,11 @@ class CPU6502:
 
     def _ror_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         carry = 1 if self._get_flag(0x01) else 0
         new_carry = (value & 0x01) != 0
         value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.memory.write(addr, value)
+        self._mw(addr, value)
         self._set_flag(0x01, new_carry)
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
@@ -2432,7 +2496,7 @@ class CPU6502:
 
     def _branch(self, condition: bool) -> int:
         """Branch if condition is true"""
-        offset = self.memory.read(self.state.pc + 1)
+        offset = self._mr(self.state.pc + 1)
         if offset & 0x80:
             offset = offset - 256
         if condition:
@@ -2450,37 +2514,37 @@ class CPU6502:
         addr = self._read_word(self.state.pc + 1)
         # Handle page boundary bug
         if (addr & 0xFF) == 0xFF:
-            low = self.memory.read(addr)
-            high = self.memory.read(addr & 0xFF00)
+            low = self._mr(addr)
+            high = self._mr(addr & 0xFF00)
         else:
-            low = self.memory.read(addr)
-            high = self.memory.read(addr + 1)
+            low = self._mr(addr)
+            high = self._mr(addr + 1)
         self.state.pc = low | (high << 8)
         return 5
 
     # Stack operations
     def _pha(self) -> int:
-        self.memory.write(0x100 + self.state.sp, self.state.a)
+        self._mw(0x100 + self.state.sp, self.state.a)
         self.state.sp = (self.state.sp - 1) & 0xFF
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 3
 
     def _pla(self) -> int:
         self.state.sp = (self.state.sp + 1) & 0xFF
-        self.state.a = self.memory.read(0x100 + self.state.sp)
+        self.state.a = self._mr(0x100 + self.state.sp)
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 4
 
     def _php(self) -> int:
-        self.memory.write(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
+        self._mw(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
         self.state.sp = (self.state.sp - 1) & 0xFF
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 3
 
     def _plp(self) -> int:
         self.state.sp = (self.state.sp + 1) & 0xFF
-        self.state.p = self.memory.read(0x100 + self.state.sp) & 0xEF  # Clear B flag
+        self.state.p = self._mr(0x100 + self.state.sp) & 0xEF  # Clear B flag
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 4
 
@@ -2537,17 +2601,17 @@ class CPU6502:
     # Other
     def _rti(self) -> int:
         self.state.sp = (self.state.sp + 1) & 0xFF
-        self.state.p = self.memory.read(0x100 + self.state.sp) & 0xEF
+        self.state.p = self._mr(0x100 + self.state.sp) & 0xEF
         self.state.sp = (self.state.sp + 1) & 0xFF
-        pc_low = self.memory.read(0x100 + self.state.sp)
+        pc_low = self._mr(0x100 + self.state.sp)
         self.state.sp = (self.state.sp + 1) & 0xFF
-        pc_high = self.memory.read(0x100 + self.state.sp)
+        pc_high = self._mr(0x100 + self.state.sp)
         self.state.pc = (pc_low | (pc_high << 8)) & 0xFFFF
         return 6
 
     def _bit_zp(self) -> int:
-        zp_addr = self.memory.read(self.state.pc + 1)
-        value = self.memory.read(zp_addr)
+        zp_addr = self._mr(self.state.pc + 1)
+        value = self._mr(zp_addr)
         self._set_flag(0x40, (value & 0x40) != 0)  # V flag
         self._set_flag(0x80, (value & 0x80) != 0)  # N flag
         self._set_flag(0x02, (self.state.a & value) == 0)  # Z flag
@@ -2556,7 +2620,7 @@ class CPU6502:
 
     def _bit_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
-        value = self.memory.read(addr)
+        value = self._mr(addr)
         self._set_flag(0x40, (value & 0x40) != 0)  # V flag
         self._set_flag(0x80, (value & 0x80) != 0)  # N flag
         self._set_flag(0x02, (self.state.a & value) == 0)  # Z flag
