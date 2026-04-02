@@ -14,6 +14,7 @@ import argparse
 import itertools
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -258,8 +259,18 @@ def get_file_size_mb(filename: str) -> float:
     return os.path.getsize(filename) / (1024 * 1024)
 
 
-def run_emulator(prg_file: str, max_cycles: int, trace_file: str, sync_pc: Optional[int] = None) -> bool:
-    """Run our emulator and generate trace"""
+def run_emulator(
+    prg_file: str,
+    max_cycles: int,
+    trace_file: str,
+    sync_pc: Optional[int] = None,
+    extra_emulator_args: Optional[List[str]] = None,
+) -> bool:
+    """Run our emulator and generate trace.
+
+    *extra_emulator_args* are appended after the default flags (trace, turbo, headless, …).
+    C64.py applies ``--graphics`` after ``--headless``, so graphics wins if both are set.
+    """
     cmd = [
         sys.executable, 'C64.py',
         prg_file,
@@ -269,6 +280,8 @@ def run_emulator(prg_file: str, max_cycles: int, trace_file: str, sync_pc: Optio
         '--turbo',
         '--headless',
     ]
+    if extra_emulator_args:
+        cmd.extend(extra_emulator_args)
 
     # When comparing against VICE we typically sync at a PC address. However, the VIC
     # raster phase at that point can differ between runs due to power-on timing and
@@ -1067,6 +1080,9 @@ Examples:
   %(prog)s --our-trace ours.txt --vice-trace vice.txt --max-lines 1000000
   %(prog)s --our-trace ours.txt --vice-trace vice.txt --skip-drift-report --quiet-drift-summary
 
+  %(prog)s game.prg --vice-trace vice.txt \\
+      --emulator-args '--enable-resid --graphics'
+
 Large VICE logs (slow sync scan): first run prints
   Resume: --our-skip-bytes N --vice-skip-bytes M
   Re-run with those flags so the tool seeks near the sync point instead of reading from offset 0.
@@ -1166,8 +1182,28 @@ Large VICE logs (slow sync scan): first run prints
     )
     parser.add_argument('--nocolor', action='store_true',
                         help='Disable ANSI colours (by default colour is forced for use with less -R)')
-    
+    parser.add_argument(
+        '--emulator-args',
+        dest='emulator_args_shell',
+        default=None,
+        metavar='STRING',
+        help=(
+            'Extra arguments for C64.py as one shell-quoted string (parsed with shlex). '
+            'Avoids parent argparse consuming flags that start with dashes. '
+            'Example: --emulator-args \'--enable-resid --graphics\''
+        ),
+    )
+
     args = parser.parse_args()
+
+    extra_emulator_args: List[str] = []
+    if args.emulator_args_shell is not None:
+        shell = args.emulator_args_shell.strip()
+        if shell:
+            try:
+                extra_emulator_args = shlex.split(shell, posix=True)
+            except ValueError as e:
+                parser.error(f"--emulator-args: invalid shell quoting ({e})")
 
     # Initialise the global console now that we know --nocolor
     global console
@@ -1202,9 +1238,17 @@ Large VICE logs (slow sync scan): first run prints
         
         print_msg(f"🚀 Running emulator on {args.program}...", "cyan")
         print_msg(f"   Max cycles: {args.max_cycles:,}", "dim")
+        if extra_emulator_args:
+            print_msg(f"   Extra C64.py args: {' '.join(extra_emulator_args)}", "dim")
         print()
         
-        if not run_emulator(args.program, args.max_cycles, our_trace, sync_pc=match_cycles_at):
+        if not run_emulator(
+            args.program,
+            args.max_cycles,
+            our_trace,
+            sync_pc=match_cycles_at,
+            extra_emulator_args=extra_emulator_args or None,
+        ):
             print_msg("❌ Failed to generate trace", "red")
             sys.exit(1)
         

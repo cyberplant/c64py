@@ -629,6 +629,18 @@ class MemoryMap:
         else:
             self.ram[addr] = value
 
+    def sid_tick_cpu_cycles(self, n: int) -> None:
+        """Advance reSID by *n* C64 clocks when using :class:`resid.ReSIDEmulator`.
+
+        Invoked from the CPU so SID phase matches bus reads (e.g. ``$D41B``).  No-op for
+        the simple :class:`sid.SidEmulator` or when SID is disabled.
+        """
+        if n <= 0 or not self.sid:
+            return
+        tick = getattr(self.sid, "tick_cpu_cycles", None)
+        if tick is not None:
+            tick(n)
+
     def _read_io(self, addr: int) -> int:
         """Read from I/O registers"""
         # Color RAM is handled in read(); keep this for safety if called directly.

@@ -313,6 +313,8 @@ class CPU6502:
 
     def _mr(self, addr: int) -> int:
         """CPU bus read. In fast VIC mode, advances raster/CIA one cycle (matches VICE $D011 timing)."""
+        if not self.accurate_vic:
+            self.memory.sid_tick_cpu_cycles(1)
         v = self.memory.read(addr)
         if not self.accurate_vic:
             self._advance_raster(1)
@@ -322,6 +324,8 @@ class CPU6502:
 
     def _mw(self, addr: int, value: int) -> None:
         """CPU bus write; same per-cycle advance as _mr in fast VIC mode."""
+        if not self.accurate_vic:
+            self.memory.sid_tick_cpu_cycles(1)
         self.memory.write(addr, value)
         if not self.accurate_vic:
             self._advance_raster(1)
@@ -374,7 +378,9 @@ class CPU6502:
                 self._vic_tick_one()
                 self.state.cycles += 1
                 self._update_cia_timers(1, recompute_irq=False)
+                self.memory.sid_tick_cpu_cycles(1)
         else:
+            self.memory.sid_tick_cpu_cycles(cycles)
             self.state.cycles += cycles
             self._update_cia_timers(cycles)
             self._advance_raster(cycles)
@@ -391,7 +397,9 @@ class CPU6502:
                 self._vic_tick_one()
                 self.state.cycles += 1
                 self._update_cia_timers(1, recompute_irq=False)
+                self.memory.sid_tick_cpu_cycles(1)
         else:
+            self.memory.sid_tick_cpu_cycles(cycles)
             self.state.cycles += cycles
             self._update_cia_timers(cycles)
             self._advance_raster(cycles)
@@ -453,6 +461,8 @@ class CPU6502:
 
         pc = self.state.pc
         initial_cyc = self.state.cycles
+        if not self.accurate_vic:
+            self.memory.sid_tick_cpu_cycles(1)
         opcode = self.memory.read(pc)
         # Expose current instruction context to MemoryMap debug hooks.
         self.memory.debug_last_pc = pc
@@ -931,6 +941,7 @@ class CPU6502:
                     _ba_low, ba_blocks_cpu, _irq_edge = vic_tick_one()
                     st.cycles += 1
                     update_cia(1, recompute_irq=False)
+                    self.memory.sid_tick_cpu_cycles(1)
                     elapsed += 1
                     # Stall CPU only on read cycles while BA blocks (VICE behavior).
                     if not (ba_blocks_cpu and bus_phase == _BUS_READ):
@@ -945,6 +956,7 @@ class CPU6502:
         if not self.accurate_vic:
             extra = cycles - (self.state.cycles - initial_cyc)
             if extra > 0:
+                self.memory.sid_tick_cpu_cycles(extra)
                 self._advance_raster(extra)
                 self._update_cia_timers(extra, recompute_irq=False)
                 self.state.cycles += extra
@@ -1652,7 +1664,7 @@ class CPU6502:
         self.state.sp = (self.state.sp - 1) & 0xFF
         self._mw(0x100 + self.state.sp, pc_low)
         self.state.sp = (self.state.sp - 1) & 0xFF
-        self._mw(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
+        self._mw(0x100 + self.state.sp, (self.state.p | 0x30) & 0xFF)  # B+bit5 set on stack (BRK)
         self.state.sp = (self.state.sp - 1) & 0xFF
         self._set_flag(0x04, True)  # Set I flag
         self.state.pc = self._read_word(0xFFFE)  # IRQ vector
@@ -2537,14 +2549,16 @@ class CPU6502:
         return 4
 
     def _php(self) -> int:
-        self._mw(0x100 + self.state.sp, self.state.p | 0x10)  # Set B flag
+        # NMOS 6502: pushed status has bits 4 (B) and 5 always 1 (see visual6502 / datasheets).
+        self._mw(0x100 + self.state.sp, (self.state.p | 0x30) & 0xFF)
         self.state.sp = (self.state.sp - 1) & 0xFF
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 3
 
     def _plp(self) -> int:
         self.state.sp = (self.state.sp + 1) & 0xFF
-        self.state.p = self._mr(0x100 + self.state.sp) & 0xEF  # Clear B flag
+        # Full P from stack (incl. B and bit 5); matches VICE trace NV-BDIZC after PLP/RTI.
+        self.state.p = self._mr(0x100 + self.state.sp) & 0xFF
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 4
 
@@ -2601,7 +2615,7 @@ class CPU6502:
     # Other
     def _rti(self) -> int:
         self.state.sp = (self.state.sp + 1) & 0xFF
-        self.state.p = self._mr(0x100 + self.state.sp) & 0xEF
+        self.state.p = self._mr(0x100 + self.state.sp) & 0xFF
         self.state.sp = (self.state.sp + 1) & 0xFF
         pc_low = self._mr(0x100 + self.state.sp)
         self.state.sp = (self.state.sp + 1) & 0xFF
