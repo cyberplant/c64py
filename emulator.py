@@ -1138,7 +1138,11 @@ class C64:
             elif self.cpu.state.pc == last_pc:
                 # Check if we're in a graphics mode wait loop
                 mode_info = self.memory.get_display_mode()
-                in_graphics_mode = mode_info['bitmap_mode'] or self.memory.is_sprite_enabled(0)
+                in_graphics_mode = (
+                    mode_info['bitmap_mode']
+                    or mode_info.get('multicolor', False)
+                    or self.memory.is_sprite_enabled(0)
+                )
                 
                 # When the KERNAL ROM is running, input waits can loop inside the ROM.
                 if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
@@ -1365,7 +1369,7 @@ class C64:
         Supports bitmap mode rendering as ASCII art.
         """
         # Check if we're in bitmap mode
-        mode_info = self.memory.get_display_mode()
+        mode_info = self.memory.get_render_display_mode()
         
         if mode_info['bitmap_mode']:
             # Render bitmap mode as ASCII art
@@ -1375,11 +1379,12 @@ class C64:
         # Ensure lookup table is initialized
         self._init_screen_code_table()
         
-        screen_base = mode_info['screen_base']
+        vic_bank = self.memory.get_render_vic_bank_base()
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
         color_base = COLOR_MEM
         
         # Fast dirty-check using bytes comparison
-        current_screen_bytes = bytes(self.memory.ram[screen_base:screen_base + 1000])
+        current_screen_bytes = bytes(self.memory.ram[(screen_base + i) & 0xFFFF] for i in range(1000))
         current_color_bytes = bytes(self.memory.ram[color_base:color_base + 1000])
         cursor_color = self.memory.ram[0x0286] & 0x0F
         
@@ -1438,12 +1443,13 @@ class C64:
         # Unicode block characters for different pixel densities
         BLOCKS = [' ', '░', '▒', '▓', '█']
         
-        bitmap_base = mode_info['bitmap_base']
-        screen_base = mode_info['screen_base']
+        vic_bank = self.memory.get_vic_bank_base()
+        bitmap_base = (vic_bank + mode_info['bitmap_base']) & 0xFFFF
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
         
         # For dirty checking, we'll sample the bitmap
         # (full check would be too expensive for 8000 bytes)
-        sample_bytes = bytes(self.memory.ram[bitmap_base:bitmap_base + 100])
+        sample_bytes = bytes(self.memory.ram[(bitmap_base + i) & 0xFFFF] for i in range(100))
         if hasattr(self, '_prev_bitmap_sample') and sample_bytes == self._prev_bitmap_sample:
             return False
         self._prev_bitmap_sample = sample_bytes
@@ -1457,7 +1463,7 @@ class C64:
                     char_index = char_row * 40 + char_col
                     
                     # Get bitmap data for this 8x8 block
-                    bitmap_offset = bitmap_base + char_index * 8
+                    bitmap_offset = (bitmap_base + char_index * 8) & 0xFFFF
                     
                     # Sample pixels: count set pixels in top-left 4x4 quadrant
                     # This gives us a rough density for ASCII representation
@@ -1465,10 +1471,9 @@ class C64:
                     # We map this to 5 density levels: 0-3, 4-7, 8-11, 12-15, 16
                     pixel_count = 0
                     for y in range(4):
-                        if bitmap_offset + y < len(self.memory.ram):
-                            byte = self.memory.ram[bitmap_offset + y]
-                            # Count bits in upper nibble (left 4 pixels)
-                            pixel_count += bin(byte >> 4).count('1')
+                        byte = self.memory.ram[(bitmap_offset + y) & 0xFFFF]
+                        # Count bits in upper nibble (left 4 pixels)
+                        pixel_count += bin(byte >> 4).count('1')
                     
                     # Map pixel count to block character
                     # 0 pixels = ' ', 16 pixels = '█'
@@ -1476,7 +1481,7 @@ class C64:
                     char = BLOCKS[density]
                     
                     # Get colors from screen RAM
-                    color_data = self.memory.ram[screen_base + char_index]
+                    color_data = self.memory.ram[(screen_base + char_index) & 0xFFFF]
                     if mode_info['multicolor']:
                         # In multicolor mode, use lower nibble for foreground
                         fg_color = color_data & 0x0F

@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import functools
 import hashlib
+import json
 import os
 import sys
 import time
+from argparse import Namespace
 from pathlib import Path
 from typing import Optional
 
@@ -90,6 +92,34 @@ def _show_speed(
             )
         else:
             print(f"Speed:  {mhz:.2f} MHz")
+
+
+def _print_benchmark_record(args: Namespace, emu: "C64", *, wall_start_fallback: float) -> None:
+    """Single-line JSON for scripts: grep '^C64PY_BENCHMARK '."""
+    cycles = emu.current_cycles
+    t0 = getattr(emu, "_speed_throttle_run_wall_start", None)
+    if t0 is not None and cycles > 0:
+        elapsed = time.perf_counter() - t0
+    else:
+        elapsed = time.perf_counter() - wall_start_fallback
+    mhz = (cycles / elapsed / 1e6) if elapsed > 0 and cycles > 0 else 0.0
+    prg = getattr(args, "prg_file", None)
+    rec = {
+        "C64PY_BENCHMARK": 1,
+        "accurate_vic": bool(args.accurate_vic),
+        "cycles": cycles,
+        "emulated_cpu_mhz": round(mhz, 4),
+        "enable_resid": bool(args.enable_resid),
+        "enable_sid": bool(args.enable_sid),
+        "max_cycles_arg": args.max_cycles,
+        "prg": os.path.basename(prg) if prg else None,
+        "schema": 1,
+        "target_hz": emu.target_cpu_hz,
+        "turbo": bool(args.turbo),
+        "video_standard": args.video_standard,
+        "wall_seconds": round(elapsed, 6),
+    }
+    print("C64PY_BENCHMARK " + json.dumps(rec, sort_keys=True))
 
 
 def _parse_debug_inject_pair(lhs_s: str, val_s: str, *, source: str) -> tuple[int | str, int]:
@@ -170,7 +200,7 @@ def main():
     ap.add_argument("--fullscreen", action="store_true", help="Show only C64 screen output (no debug panel or status bar)")
     ap.add_argument("--graphics", action="store_true", help="Render output in a pygame graphics window")
     ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
-    ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
+    ap.add_argument("--graphics-fps", type=int, default=50, help="Graphics target FPS (default: 50, ~PAL field rate)")
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
     ap.add_argument("--enable-sid", action="store_true", help="Enable SID audio output via pygame")
     ap.add_argument(
@@ -248,6 +278,8 @@ def main():
         args.turbo = True
         args.autoquit = True
         args.no_colors = True
+        if not args.graphics:
+            args.headless = True
         if args.max_cycles is None:
             args.max_cycles = 15_000_000  # Enough cycles for benchmark to complete
         # Auto-load benchmark PRG if no file specified
@@ -257,7 +289,7 @@ def main():
                 args.prg_file = benchmark_prg
             else:
                 print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
-                print("Run: compile.sh to build it")
+                print("Run: ./compile.sh to build it (needs VICE petcat).")
     
     # Track start time for speed calculation
     start_time = time.perf_counter()
@@ -440,6 +472,8 @@ def main():
                 server.running = False
             # Show emulation speed
             _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
+            if args.benchmark:
+                _print_benchmark_record(args, emu, wall_start_fallback=start_time)
             return
 
         # Start Textual interface (unless explicitly disabled with --no-colors)
@@ -464,6 +498,8 @@ def main():
                 server.running = False
             # Show emulation speed
             _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
+            if args.benchmark:
+                _print_benchmark_record(args, emu, wall_start_fallback=start_time)
             return  # Exit after Textual interface closes
 
         # This code should never be reached since Textual blocks
@@ -571,6 +607,8 @@ def main():
 
         # Show emulation speed
         _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
+        if args.benchmark:
+            _print_benchmark_record(args, emu, wall_start_fallback=start_time)
 
         # Close UDP debug logger (flush all pending messages)
         if emu.udp_debug:

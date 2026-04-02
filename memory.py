@@ -934,63 +934,40 @@ class MemoryMap:
         for col in range(40):
             self.ram[COLOR_MEM + 24 * 40 + col] = current_color
 
-    def get_display_mode(self) -> dict:
-        """Determine the current VIC-II display mode.
-        
-        Returns a dictionary with:
-        - 'mode': str - One of: 'text', 'bitmap', 'multicolor_text', 'multicolor_bitmap', 'extended_color'
-        - 'bitmap_mode': bool - True if bitmap mode is enabled
-        - 'multicolor': bool - True if multicolor mode is enabled
-        - 'extended_color': bool - True if extended color mode is enabled
-        - 'screen_base': int - Screen/color memory base address
-        - 'bitmap_base': int - Bitmap memory base address (if bitmap mode)
-        - 'char_base': int - Character memory base address (if text mode)
-        """
-        # Read VIC control registers
-        d011 = self._vic_regs[VIC_CONTROL_REG_1] if VIC_CONTROL_REG_1 < len(self._vic_regs) else 0
-        d016 = self._vic_regs[VIC_CONTROL_REG_2] if VIC_CONTROL_REG_2 < len(self._vic_regs) else 0
-        d018 = self._vic_regs[0x18] if 0x18 < len(self._vic_regs) else 0
-        
-        # Extract mode bits
+    def _display_mode_from_vic_bytes(self, regb: bytes) -> dict:
+        """Build display mode dict from a 64-byte VIC register snapshot (indices 0..0x3F)."""
+
+        def rb(idx: int) -> int:
+            return regb[idx] if idx < len(regb) else 0
+
+        d011 = rb(VIC_CONTROL_REG_1)
+        d016 = rb(VIC_CONTROL_REG_2)
+        d018 = rb(0x18)
+
         bitmap_mode = (d011 & VIC_D011_BMM) != 0
         extended_color = (d011 & VIC_D011_ECM) != 0
         multicolor = (d016 & VIC_D016_MCM) != 0
-        
-        # Calculate memory addresses from $D018
-        # Bits 7-4: Video Matrix Base Address (VM)
-        # Bits 3-1: Character Base Address (CB) / Bitmap Base
+
         vm = (d018 >> 4) & 0x0F
         cb = (d018 >> 1) & 0x07
-        
-        # Screen base is VM * 1024 (within VIC bank)
-        # For simplicity, assume VIC bank 0 (default)
         screen_base = vm * 0x0400
-        
+
         if bitmap_mode:
-            # In bitmap mode, bit 3 of $D018 (CB bit 2) selects bitmap base
-            # $D018 bit 3 clear (CB=0-3) -> bitmap at $0000
-            # $D018 bit 3 set (CB=4-7) -> bitmap at $2000
-            # Extract bit 3 of $D018, which is bit 2 of CB
             bitmap_base = 0x2000 if (d018 & 0x08) else 0x0000
             char_base = 0
         else:
-            # In text mode, CB selects character base
             char_base = cb * 0x0800
             bitmap_base = 0
-        
-        # Determine mode name
+
         if bitmap_mode:
-            if multicolor:
-                mode = 'multicolor_bitmap'
-            else:
-                mode = 'bitmap'
+            mode = 'multicolor_bitmap' if multicolor else 'bitmap'
         elif extended_color:
             mode = 'extended_color'
         elif multicolor:
             mode = 'multicolor_text'
         else:
             mode = 'text'
-        
+
         return {
             'mode': mode,
             'bitmap_mode': bitmap_mode,
@@ -1000,7 +977,48 @@ class MemoryMap:
             'bitmap_base': bitmap_base,
             'char_base': char_base,
         }
-    
+
+    def get_display_mode(self) -> dict:
+        """Current VIC-II mode from live registers (CPU-visible)."""
+        return self._display_mode_from_vic_bytes(bytes(self._vic_regs[:0x40]))
+
+    def snapshot_vic_render_state(self) -> None:
+        """Latch VIC + CIA2 PA at raster line 0 for stable full-frame graphics.
+
+        Raster IRQ code often toggles $D011/$D016 during the frame. The pygame thread
+        samples registers without locking, so the renderer was catching different
+        phases and flickering. One snapshot per emulated video frame fixes that.
+
+        Split-screen (different modes on different raster bands) is not modeled;
+        one latched mode is still used for the whole bitmap in that frame.
+        """
+        self._vic_render_snapshot = (bytes(self._vic_regs[:0x40]), int(self.cia2_pra) & 0xFF)
+
+    def get_render_display_mode(self) -> dict:
+        """Display mode from the last render snapshot (falls back to live)."""
+        snap = getattr(self, "_vic_render_snapshot", None)
+        if snap is None:
+            return self.get_display_mode()
+        regb, _pra = snap
+        return self._display_mode_from_vic_bytes(regb)
+
+    def get_render_vic_bank_base(self) -> int:
+        """VIC bank from render snapshot (falls back to live CIA2)."""
+        snap = getattr(self, "_vic_render_snapshot", None)
+        pra = (snap[1] & 0x03) if snap is not None else (self.cia2_pra & 0x03)
+        return (3 - pra) * 0x4000
+
+    def get_vic_bank_base(self) -> int:
+        """Physical base of the 16 KiB window the VIC-II addresses.
+
+        CIA-2 Port A bits 0-1 (as stored in ``cia2_pra``) select the bank:
+        ``%11`` → ``$0000``, ``%10`` → ``$4000``, ``%01`` → ``$8000``,
+        ``%00`` → ``$C000``. Screen matrix, bitmap, and charset pointers
+        from ``$D018`` are offsets within this window.
+        """
+        sel = self.cia2_pra & 0x03
+        return (3 - sel) * 0x4000
+
     def is_sprite_enabled(self, sprite_num: int) -> bool:
         """Check if a sprite is enabled.
         
@@ -1015,54 +1033,35 @@ class MemoryMap:
         sprite_enable_reg = self._vic_regs[0x15] if 0x15 < len(self._vic_regs) else 0
         return (sprite_enable_reg & (1 << sprite_num)) != 0
     
-    def get_sprite_data(self, sprite_num: int) -> dict:
-        """Get sprite data for rendering.
-        
-        Args:
-            sprite_num: Sprite number (0-7)
-            
-        Returns:
-            Dictionary with sprite properties:
-            - 'enabled': bool
-            - 'x': int - X coordinate
-            - 'y': int - Y coordinate
-            - 'color': int - Sprite color (0-15)
-            - 'multicolor': bool
-            - 'pointer': int - Sprite data pointer
-        """
+    def _get_sprite_data_from_regs(
+        self, sprite_num: int, regb: bytes, vic_bank: int, screen_base: int
+    ) -> dict:
         if not 0 <= sprite_num <= 7:
             return {'enabled': False}
-        
-        # Check if sprite is enabled
-        sprite_enable_reg = self._vic_regs[0x15] if 0x15 < len(self._vic_regs) else 0
+
+        def rb(idx: int) -> int:
+            return regb[idx] if idx < len(regb) else 0
+
+        sprite_enable_reg = rb(0x15)
         enabled = (sprite_enable_reg & (1 << sprite_num)) != 0
-        
         if not enabled:
             return {'enabled': False}
-        
-        # Read sprite position
-        x_low = self._vic_regs[sprite_num * 2] if sprite_num * 2 < len(self._vic_regs) else 0
-        y = self._vic_regs[sprite_num * 2 + 1] if sprite_num * 2 + 1 < len(self._vic_regs) else 0
-        
-        # X MSB from $D010
-        x_msb_reg = self._vic_regs[0x10] if 0x10 < len(self._vic_regs) else 0
+
+        x_low = rb(sprite_num * 2)
+        y = rb(sprite_num * 2 + 1)
+        x_msb_reg = rb(0x10)
         x_msb = (x_msb_reg & (1 << sprite_num)) != 0
         x = x_low + (256 if x_msb else 0)
-        
-        # Read sprite color from $D027-$D02E
+
         color_reg = 0x27 + sprite_num
-        color = self._vic_regs[color_reg] if color_reg < len(self._vic_regs) else 0
-        
-        # Check multicolor mode
-        mc_reg = self._vic_regs[0x1C] if 0x1C < len(self._vic_regs) else 0
+        color = rb(color_reg)
+        mc_reg = rb(0x1C)
         multicolor = (mc_reg & (1 << sprite_num)) != 0
-        
-        # Get sprite pointer (from screen memory + $3F8)
-        mode_info = self.get_display_mode()
-        screen_base = mode_info['screen_base']
-        pointer_addr = screen_base + 0x3F8 + sprite_num
-        pointer = self.ram[pointer_addr] if pointer_addr < len(self.ram) else 0
-        
+
+        pointer_addr = (vic_bank + screen_base + 0x3F8 + sprite_num) & 0xFFFF
+        pointer = self.ram[pointer_addr]
+        sprite_ram_base = (vic_bank + ((pointer & 0xFF) << 6)) & 0xFFFF
+
         return {
             'enabled': True,
             'x': x,
@@ -1070,4 +1069,25 @@ class MemoryMap:
             'color': color & 0x0F,
             'multicolor': multicolor,
             'pointer': pointer,
+            'sprite_ram_base': sprite_ram_base,
         }
+
+    def get_sprite_data(self, sprite_num: int, *, for_render: bool = False) -> dict:
+        """Get sprite data for rendering.
+
+        Use ``for_render=True`` from the pygame rasterizer so sprite regs match the
+        same latched frame as ``get_render_display_mode``.
+        """
+        if for_render:
+            snap = getattr(self, "_vic_render_snapshot", None)
+            if snap is not None:
+                regb, pra = snap
+                vic_bank = (3 - (pra & 0x03)) * 0x4000
+                screen_base = self._display_mode_from_vic_bytes(regb)['screen_base']
+                return self._get_sprite_data_from_regs(sprite_num, regb, vic_bank, screen_base)
+
+        regb = bytes(self._vic_regs[:0x40])
+        mode_info = self.get_display_mode()
+        return self._get_sprite_data_from_regs(
+            sprite_num, regb, self.get_vic_bank_base(), mode_info['screen_base']
+        )

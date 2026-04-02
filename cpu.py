@@ -109,6 +109,8 @@ class CPU6502:
         while self.memory.raster_cycles >= cycles_per_line:
             self.memory.raster_cycles -= cycles_per_line
             self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+            if self.memory.raster_line == 0:
+                self.memory.snapshot_vic_render_state()
 
     def _vic_tick_one(self) -> tuple[bool, bool, bool]:
         """Advance VIC by one CPU cycle. Returns (ba_low, ba_blocks_cpu, raster_irq_edge)."""
@@ -122,6 +124,9 @@ class CPU6502:
 
         if irq_edge:
             self.memory.trigger_vic_irq(0x01)
+
+        if self.vic.raster_line == 0 and self.vic.raster_cycle == 0:
+            self.memory.snapshot_vic_render_state()
 
         return ba_low, ba_blocks_cpu, irq_edge
 
@@ -1424,6 +1429,8 @@ class CPU6502:
             return self._asl_zpx()
         elif opcode == 0x0E:  # ASL abs
             return self._asl_abs()
+        elif opcode == 0x1E:  # ASL abs,X
+            return self._asl_absx()
         elif opcode == 0x4A:  # LSR acc
             return self._lsr_acc()
         elif opcode == 0x46:  # LSR zp
@@ -1432,12 +1439,16 @@ class CPU6502:
             return self._lsr_zpx()
         elif opcode == 0x4E:  # LSR abs
             return self._lsr_abs()
+        elif opcode == 0x5E:  # LSR abs,X
+            return self._lsr_absx()
         elif opcode == 0x2A:  # ROL acc
             return self._rol_acc()
         elif opcode == 0x26:  # ROL zp
             return self._rol_zp()
         elif opcode == 0x2E:  # ROL abs
             return self._rol_abs()
+        elif opcode == 0x3E:  # ROL abs,X
+            return self._rol_absx()
         elif opcode == 0x6A:  # ROR acc
             return self._ror_acc()
         elif opcode == 0x66:  # ROR zp
@@ -1446,6 +1457,8 @@ class CPU6502:
             return self._ror_zpx()
         elif opcode == 0x6E:  # ROR abs
             return self._ror_abs()
+        elif opcode == 0x7E:  # ROR abs,X
+            return self._ror_absx()
         elif opcode == 0xFE:  # INC absx
             base = self._read_word(self.state.pc + 1)
             addr = (base + self.state.x) & 0xFFFF
@@ -2365,6 +2378,18 @@ class CPU6502:
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
 
+    def _asl_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        old = self._mr(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        self._set_flag(0x01, (old & 0x80) != 0)
+        value = (old << 1) & 0xFF
+        self._mw(addr, value)
+        self._update_flags(value)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 7
+
     def _lsr_acc(self) -> int:
         self._set_flag(0x01, (self.state.a & 0x01) != 0)
         self.state.a = (self.state.a >> 1) & 0xFF
@@ -2391,6 +2416,18 @@ class CPU6502:
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
+
+    def _lsr_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        old = self._mr(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        self._set_flag(0x01, (old & 0x01) != 0)
+        value = (old >> 1) & 0xFF
+        self._mw(addr, value)
+        self._update_flags(value)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 7
 
     def _lsr_zpx(self) -> int:
         """LSR (Logical Shift Right) zero-page,X"""
@@ -2436,6 +2473,20 @@ class CPU6502:
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
 
+    def _rol_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        old = self._mr(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        carry = 1 if self._get_flag(0x01) else 0
+        new_carry = (old & 0x80) != 0
+        value = ((old << 1) | carry) & 0xFF
+        self._mw(addr, value)
+        self._set_flag(0x01, new_carry)
+        self._update_flags(value)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 7
+
     def _ror_acc(self) -> int:
         carry = 1 if self._get_flag(0x01) else 0
         new_carry = (self.state.a & 0x01) != 0
@@ -2480,6 +2531,20 @@ class CPU6502:
         self._update_flags(value)
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 6
+
+    def _ror_absx(self) -> int:
+        base = self._read_word(self.state.pc + 1)
+        addr = (base + self.state.x) & 0xFFFF
+        old = self._mr(addr)
+        self._rmw_dummy_write_6510(addr, old)
+        carry = 1 if self._get_flag(0x01) else 0
+        new_carry = (old & 0x01) != 0
+        value = ((old >> 1) | (carry << 7)) & 0xFF
+        self._mw(addr, value)
+        self._set_flag(0x01, new_carry)
+        self._update_flags(value)
+        self.state.pc = (self.state.pc + 3) & 0xFFFF
+        return 7
 
     # Branches
     def _bcc(self) -> int:
