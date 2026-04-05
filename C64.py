@@ -217,7 +217,12 @@ def main():
     ap.add_argument(
         "--vice-trace-wall",
         action="store_true",
-        help="With --vice-trace: append '; w <seconds>' lines (monotonic) for host profiling between instructions",
+        help="With --vice-trace: record host seconds since previous line (monotonic) for profiling between instructions",
+    )
+    ap.add_argument(
+        "--vice-trace-inline-wall",
+        action="store_true",
+        help="With --vice-trace: same as wall time but append ' ; w <sec>' on the instruction line instead of a separate '; w' line",
     )
     ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
     ap.add_argument(
@@ -366,7 +371,11 @@ def main():
     # Setup VICE-compatible trace logging if requested
     vice_trace = None
     if args.vice_trace:
-        vice_trace = ViceTraceLogger(filename=args.vice_trace, wall_time=args.vice_trace_wall)
+        vice_trace = ViceTraceLogger(
+            filename=args.vice_trace,
+            wall_time=args.vice_trace_wall or args.vice_trace_inline_wall,
+            wall_inline=args.vice_trace_inline_wall,
+        )
         vice_trace.enable()
         emu.vice_trace = vice_trace
         if show_ui_logs and emu.interface is not None:

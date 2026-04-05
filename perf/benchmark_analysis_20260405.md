@@ -13,11 +13,11 @@ Source: `logs/benchmark-20260405-202206_*.pstats.txt` and `logs/benchmark-log.js
 
 Accurate VIC is ~1.3× slower than fast (headless); adding graphics+ReSID stacks another large cost on top.
 
-## Critical caveat: `--vice-trace` + `--vice-trace-wall` skews profiles
+## Critical caveat: do not combine cProfile with VICE trace in one process
 
-These runs logged **every instruction** to disk. In the profiles, **`debug.py:log_instruction`** is a top cumulative consumer (millions of `TextIOWrapper.write` / string `join` / `ljust`), comparable to real CPU work.
+Older runs did both at once; **`debug.py:log_instruction`** then dominated `.pstats` (I/O + formatting).
 
-**For core-only hotspot work, re-run benchmarks without `--vice-trace` (and without cProfile if measuring raw MHz).** Use trace only when debugging comparison with VICE.
+**`scripts/run_benchmark.sh`** now runs **two passes** when both `--cprofile` and `--vice-trace` are set: trace+wall first, then cProfile without trace. For raw MHz, omit both.
 
 ## Hot spots (structural, after discounting trace I/O)
 

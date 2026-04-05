@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run c64py benchmark combinations; tee each run to logs/; append NDJSON to benchmark-log.json.
+# Run c64py benchmark combinations; tee each run to logs/; append NDJSON to logs/benchmark-log.json.
 #
 # Default: all 4 combinations
 #   - headless × (fast VIC | accurate VIC)
@@ -15,10 +15,15 @@
 #   --vic-fast-only        Only fast VIC (no --accurate-vic)
 #   --vic-accurate-only    Only accurate VIC
 #   --cycles N             Override BENCHMARK_CYCLES / default (20_000_000)
-#   --cprofile             Run under python -m cProfile; write .prof + .pstats.txt per run
+#   --cprofile             Run under python -m cProfile; write .prof + .pstats.txt
 #   --vice-trace           Pass --vice-trace FILE per run (VICE-format CPU trace in logs/)
-#   --vice-trace-wall      With --vice-trace: add --vice-trace-wall (host time between lines)
+#   --vice-trace-wall      With --vice-trace: add --vice-trace-wall (host dt between instructions)
 #   -h, --help             This help
+#
+# cProfile vs VICE trace:
+#   If you pass BOTH --cprofile and (--vice-trace or --vice-trace-wall), each stack×VIC combo
+#   runs TWICE: (1) trace + wall, no cProfile  (2) cProfile, no trace — so .pstats are not
+#   polluted by trace I/O. With only one of them, a single run per combo is used.
 #
 # Logs:
 #   logs/benchmark-<timestamp>_<slug>.log     one tee file per run
@@ -48,7 +53,7 @@ ENABLE_VICE_TRACE=false
 VICE_TRACE_WALL=false
 
 usage() {
-  sed -n '1,40p' "$0" | tail -n +2
+  sed -n '1,45p' "$0" | tail -n +2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -122,8 +127,11 @@ fi
 
 SESSION_TS="$(date +%Y%m%d-%H%M%S)"
 
+# run_one stack vic suffix use_cprof use_vice use_wall_trace
+# suffix empty, or walltrace, or cprofile (appended to slug and benchmark_type)
 run_one() {
-  local stack="$1" vic="$2"
+  local stack="$1" vic="$2" suffix="$3"
+  local use_cprof="$4" use_vice="$5" use_wall_trace="$6"
   local bench_type slug logf argvf t0 t1 host_wall rc
   local -a CMD
 
@@ -143,6 +151,11 @@ run_one() {
     bench_type+="_accurate_vic"
   fi
 
+  if [[ -n "$suffix" ]]; then
+    slug+="_${suffix}"
+    bench_type+="_${suffix}"
+  fi
+
   logf="$ROOT/logs/benchmark-${SESSION_TS}_${slug}.log"
   argvf="$(mktemp)"
   # shellcheck disable=SC2064
@@ -160,17 +173,18 @@ run_one() {
   fi
 
   local prof_path="" pstats_path="" vice_path="" rel_prof="" rel_pstats="" rel_vice=""
-  if $ENABLE_VICE_TRACE || $VICE_TRACE_WALL; then
-    ENABLE_VICE_TRACE=true
+  if $use_vice; then
     vice_path="$ROOT/logs/benchmark-${SESSION_TS}_${slug}.vice.log"
     rel_vice="logs/benchmark-${SESSION_TS}_${slug}.vice.log"
     CMD+=(--vice-trace "$vice_path")
-    $VICE_TRACE_WALL && CMD+=(--vice-trace-wall)
+    if $use_wall_trace; then
+      CMD+=(--vice-trace-wall)
+    fi
   fi
 
   local -a RUN
   RUN=("$PY")
-  if $ENABLE_CPROFILE; then
+  if $use_cprof; then
     prof_path="$ROOT/logs/benchmark-${SESSION_TS}_${slug}.prof"
     pstats_path="$ROOT/logs/benchmark-${SESSION_TS}_${slug}.pstats.txt"
     rel_prof="logs/benchmark-${SESSION_TS}_${slug}.prof"
@@ -183,7 +197,7 @@ run_one() {
 
   echo "============================================================" | tee -a "$logf"
   echo "# benchmark_type=$bench_type  slug=$slug  cycles=$CYCLES" | tee -a "$logf"
-  echo "# cprofile=$ENABLE_CPROFILE vice_trace=$ENABLE_VICE_TRACE vice_trace_wall=$VICE_TRACE_WALL" | tee -a "$logf"
+  echo "# use_cprof=$use_cprof use_vice=$use_vice use_wall_trace=$use_wall_trace" | tee -a "$logf"
   echo "# $(date -u '+%Y-%m-%dT%H:%M:%SZ') start" | tee -a "$logf"
   echo "============================================================" | tee -a "$logf"
 
@@ -197,7 +211,7 @@ run_one() {
   t1="$("$PY" -c 'import time; print(time.perf_counter())')"
   host_wall="$("$PY" -c "print(round($t1 - $t0, 6))")"
 
-  if $ENABLE_CPROFILE && [[ -n "$prof_path" && -f "$prof_path" ]]; then
+  if $use_cprof && [[ -n "$prof_path" && -f "$prof_path" ]]; then
     BENCHMARK_PROF="$prof_path" BENCHMARK_PSTATS="$pstats_path" "$PY" -c "
 import os, pstats
 prof, out = os.environ['BENCHMARK_PROF'], os.environ['BENCHMARK_PSTATS']
@@ -222,12 +236,12 @@ with open(out, 'w') as f:
     --log-file "$rel_log"
     --tee-log-path "$logf"
   )
-  if $ENABLE_CPROFILE && [[ -n "$rel_prof" ]]; then
+  if $use_cprof && [[ -n "$rel_prof" ]]; then
     append_args+=(--cprofile-prof "$rel_prof" --cprofile-pstats "$rel_pstats")
   fi
   if [[ -n "$rel_vice" ]]; then
     append_args+=(--vice-trace-file "$rel_vice")
-    $VICE_TRACE_WALL && append_args+=(--vice-trace-wall)
+    $use_wall_trace && append_args+=(--vice-trace-wall)
   fi
   "$PY" "$APPEND_PY" "${append_args[@]}"
 
@@ -235,17 +249,33 @@ with open(out, 'w') as f:
   trap - RETURN
 }
 
+invoke_combo() {
+  local stack="$1" vic="$2"
+  if $ENABLE_CPROFILE && { $ENABLE_VICE_TRACE || $VICE_TRACE_WALL; }; then
+    echo "# Split diag: trace+wall (no cProfile), then cProfile (no trace)" >&2
+    # Phase 1 always records host dt between instructions (--vice-trace-wall).
+    run_one "$stack" "$vic" walltrace false true true
+    run_one "$stack" "$vic" cprofile true false false
+  elif $ENABLE_CPROFILE; then
+    run_one "$stack" "$vic" "" true false false
+  elif $ENABLE_VICE_TRACE || $VICE_TRACE_WALL; then
+    run_one "$stack" "$vic" "" false true "$VICE_TRACE_WALL"
+  else
+    run_one "$stack" "$vic" "" false false false
+  fi
+}
+
 echo "# Session $SESSION_TS  ROOT=$ROOT  cycles=$CYCLES" >&2
 echo "# stacks: headless=$STACK_HEADLESS graphics=$STACK_GRAPHICS  vic: fast=$VIC_FAST accurate=$VIC_ACCURATE" >&2
-echo "# cprofile=$ENABLE_CPROFILE vice_trace=$ENABLE_VICE_TRACE vice_trace_wall=$VICE_TRACE_WALL" >&2
+echo "# ENABLE_CPROFILE=$ENABLE_CPROFILE ENABLE_VICE_TRACE=$ENABLE_VICE_TRACE VICE_TRACE_WALL=$VICE_TRACE_WALL" >&2
 
 if $STACK_HEADLESS; then
-  $VIC_FAST && run_one headless fast
-  $VIC_ACCURATE && run_one headless accurate
+  $VIC_FAST && invoke_combo headless fast
+  $VIC_ACCURATE && invoke_combo headless accurate
 fi
 if $STACK_GRAPHICS; then
-  $VIC_FAST && run_one graphics fast
-  $VIC_ACCURATE && run_one graphics accurate
+  $VIC_FAST && invoke_combo graphics fast
+  $VIC_ACCURATE && invoke_combo graphics accurate
 fi
 
 echo "# Done. NDJSON appended to $ROOT/logs/benchmark-log.json" >&2
