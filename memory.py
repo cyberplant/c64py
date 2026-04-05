@@ -471,6 +471,12 @@ class MemoryMap:
         if COLOR_MEM <= addr < (COLOR_MEM + 1000):
             return self.ram[addr] & 0xFF
 
+        # Fast path: regions that never depend on 6510 banking (read always from RAM backing).
+        if 2 <= addr < ROM_BASIC_START:
+            return self.ram[addr]
+        if ROM_BASIC_END <= addr < ROM_CHAR_START:
+            return self.ram[addr]
+
         # 6510 processor port ($0001) controls banking.
         # Bits (common simplified model):
         # - bit 0: LORAM

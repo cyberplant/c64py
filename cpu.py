@@ -473,61 +473,67 @@ class CPU6502:
         self.memory.debug_last_pc = pc
         self.memory.debug_last_cycles = self.state.cycles
         self.memory.debug_last_opcode = opcode
-        self.memory.debug_last_op1 = self.memory.read((pc + 1) & 0xFFFF)
-        self.memory.debug_last_op2 = self.memory.read((pc + 2) & 0xFFFF)
+        # Operand prefetch: only needed for accurate-VIC bus-phase tables and Bruce Lee memory hooks.
+        if self.accurate_vic or self.memory._brucelee_debug_enabled:
+            self.memory.debug_last_op1 = self.memory.read((pc + 1) & 0xFFFF)
+            self.memory.debug_last_op2 = self.memory.read((pc + 2) & 0xFFFF)
+        else:
+            self.memory.debug_last_op1 = 0
+            self.memory.debug_last_op2 = 0
         self._record_trace(pc, opcode)
-        if pc == 0x0841 or pc == 0xC200 or (0xC200 <= pc <= 0xC3FF):
-            self.memory.brucelee_debug_capture_snapshot(pc, opcode)
-        if opcode == 0x91 and self.memory.debug_last_op1 == 0x2D:
-            zp = self.memory.debug_last_op1
-            base = self.memory.read(zp) | (self.memory.read((zp + 1) & 0xFF) << 8)
-            eff = (base + self.state.y) & 0xFFFF
-            self.memory.brucelee_debug_event(
-                f"STA_INDY_TRACE pc=${pc:04X} cyc={self.state.cycles} "
-                f"zp=${zp:02X} base=${base:04X} y=${self.state.y:02X} eff=${eff:04X} a=${self.state.a:02X}"
-            )
-            if pc == 0x011D:
-                in_c2 = 0xC200 <= eff <= 0xC3FF
-                if in_c2 != self._brucelee_last_011d_in_c2:
-                    self.memory.brucelee_debug_event(
-                        f"STA011D_REGION_TRANSITION pc=${pc:04X} cyc={self.state.cycles} "
-                        f"eff=${eff:04X} in_c2={1 if in_c2 else 0} "
-                        f"zp2d=${self.memory.read(0x2D):02X} zp2e=${self.memory.read(0x2E):02X} "
-                        f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X} "
-                        f"a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} p=${self.state.p:02X}"
-                    )
-                self._brucelee_last_011d_in_c2 = in_c2
+        if self.memory._brucelee_debug_enabled:
+            if pc == 0x0841 or pc == 0xC200 or (0xC200 <= pc <= 0xC3FF):
+                self.memory.brucelee_debug_capture_snapshot(pc, opcode)
+            if opcode == 0x91 and self.memory.debug_last_op1 == 0x2D:
+                zp = self.memory.debug_last_op1
+                base = self.memory.read(zp) | (self.memory.read((zp + 1) & 0xFF) << 8)
+                eff = (base + self.state.y) & 0xFFFF
+                self.memory.brucelee_debug_event(
+                    f"STA_INDY_TRACE pc=${pc:04X} cyc={self.state.cycles} "
+                    f"zp=${zp:02X} base=${base:04X} y=${self.state.y:02X} eff=${eff:04X} a=${self.state.a:02X}"
+                )
+                if pc == 0x011D:
+                    in_c2 = 0xC200 <= eff <= 0xC3FF
+                    if in_c2 != self._brucelee_last_011d_in_c2:
+                        self.memory.brucelee_debug_event(
+                            f"STA011D_REGION_TRANSITION pc=${pc:04X} cyc={self.state.cycles} "
+                            f"eff=${eff:04X} in_c2={1 if in_c2 else 0} "
+                            f"zp2d=${self.memory.read(0x2D):02X} zp2e=${self.memory.read(0x2E):02X} "
+                            f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X} "
+                            f"a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} p=${self.state.p:02X}"
+                        )
+                    self._brucelee_last_011d_in_c2 = in_c2
 
-        # Branch tracing for the hot Bruce Lee loader path.
-        op8 = opcode & 0xFF
-        pc16 = pc & 0xFFFF
-        # Bruce Lee loader (and similar): inner source bump uses BNE @ $010F (not $0120).
-        if op8 in (0xD0, 0xF0) and pc16 in (
-            0x00FE,
-            0x010F,
-            0x0120,
-            0x0125,
-            0x012C,
-            0x0130,
-            0x0134,
-            0x088A,
-        ):
-            rel = self.memory.debug_last_op1
-            rel_signed = rel if rel < 0x80 else rel - 0x100
-            target = (pc16 + 2 + rel_signed) & 0xFFFF
-            z = 1 if (self.state.p & 0x02) else 0
-            will_take = 0
-            if op8 == 0xD0:  # BNE
-                will_take = 1 if z == 0 else 0
-            elif op8 == 0xF0:  # BEQ
-                will_take = 1 if z == 1 else 0
-            self.memory.brucelee_debug_event(
-                f"BRANCH_TRACE pc=${pc16:04X} cyc={self.state.cycles} op=${op8:02X} "
-                f"rel=${rel:02X} target=${target:04X} take={will_take} z={z} "
-                f"a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} p=${self.state.p:02X} "
-                f"zp2d=${self.memory.read(0x2D):02X} zp2e=${self.memory.read(0x2E):02X} "
-                f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X}"
-            )
+            # Branch tracing for the hot Bruce Lee loader path.
+            op8 = opcode & 0xFF
+            pc16 = pc & 0xFFFF
+            # Bruce Lee loader (and similar): inner source bump uses BNE @ $010F (not $0120).
+            if op8 in (0xD0, 0xF0) and pc16 in (
+                0x00FE,
+                0x010F,
+                0x0120,
+                0x0125,
+                0x012C,
+                0x0130,
+                0x0134,
+                0x088A,
+            ):
+                rel = self.memory.debug_last_op1
+                rel_signed = rel if rel < 0x80 else rel - 0x100
+                target = (pc16 + 2 + rel_signed) & 0xFFFF
+                z = 1 if (self.state.p & 0x02) else 0
+                will_take = 0
+                if op8 == 0xD0:  # BNE
+                    will_take = 1 if z == 0 else 0
+                elif op8 == 0xF0:  # BEQ
+                    will_take = 1 if z == 1 else 0
+                self.memory.brucelee_debug_event(
+                    f"BRANCH_TRACE pc=${pc16:04X} cyc={self.state.cycles} op=${op8:02X} "
+                    f"rel=${rel:02X} target=${target:04X} take={will_take} z={z} "
+                    f"a=${self.state.a:02X} x=${self.state.x:02X} y=${self.state.y:02X} p=${self.state.p:02X} "
+                    f"zp2d=${self.memory.read(0x2D):02X} zp2e=${self.memory.read(0x2E):02X} "
+                    f"zp2f=${self.memory.read(0x2F):02X} zp30=${self.memory.read(0x30):02X}"
+                )
 
         # Trace-only aid: force VIC raster phase to a known point at the sync PC so
         # drift analysis focuses on badline/IRQ logic rather than boot-time phase.
@@ -940,13 +946,16 @@ class CPU6502:
             vic_tick_one = self._vic_tick_one
             update_cia = self._update_cia_timers
             st = self.state
+            mem_sid = self.memory.sid_tick_cpu_cycles
+            pat = pattern
+            patlen = len(pat)
             for i in range(cycles):
-                bus_phase = pattern[i] if i < len(pattern) else _BUS_READ
+                bus_phase = pat[i] if i < patlen else _BUS_READ
                 while True:
                     _ba_low, ba_blocks_cpu, _irq_edge = vic_tick_one()
                     st.cycles += 1
                     update_cia(1, recompute_irq=False)
-                    self.memory.sid_tick_cpu_cycles(1)
+                    mem_sid(1)
                     elapsed += 1
                     # Stall CPU only on read cycles while BA blocks (VICE behavior).
                     if not (ba_blocks_cpu and bus_phase == _BUS_READ):

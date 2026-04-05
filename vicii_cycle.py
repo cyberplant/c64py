@@ -129,15 +129,6 @@ class ViciiCycleEngine:
             self.allow_bad_lines = False
         self.bad_line = False
 
-    def _check_badline(self) -> None:
-        if not self.allow_bad_lines:
-            self.bad_line = False
-            return
-        if self.raster_line < self.first_dma_line or self.raster_line > self.last_dma_line:
-            self.bad_line = False
-            return
-        self.bad_line = ((self.raster_line & 7) == (self.ysmooth & 7))
-
     def tick(self) -> tuple[bool, bool, bool]:
         """Advance one CPU cycle.
 
@@ -153,8 +144,16 @@ class ViciiCycleEngine:
             self.raster_line = (self.raster_line + 1) % self.num_raster_lines
             self._cycle_start_of_line()
 
-        # Update badline state when allowed (VICE checks each cycle)
-        self._check_badline()
+        # Update badline state when allowed (VICE checks each cycle); inlined for hot path.
+        al = self.allow_bad_lines
+        if not al:
+            self.bad_line = False
+        else:
+            rl = self.raster_line
+            if rl < self.first_dma_line or rl > self.last_dma_line:
+                self.bad_line = False
+            else:
+                self.bad_line = ((rl & 7) == (self.ysmooth & 7))
 
         # Raster IRQ edge trigger
         if self.raster_line == self.raster_irq_line:
