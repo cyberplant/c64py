@@ -5,7 +5,7 @@ Este documento resume **dónde se gasta el tiempo** hoy y **líneas de mejora** 
 ## Resumen
 
 - El bucle principal es `**C64.run()` → `cpu.step()`** una vez por instrucción 6502.
-- Con `**accurate_vic**`, cada **ciclo de CPU** avanza también el modelo VIC (`ViciiCycleEngine.tick()`), el SID y los CIAs: es el modo más caro pero necesario para alinear IRQ/badlines con VICE en casos difíciles.
+- Con `**accurate_vic`**, cada **ciclo de CPU** avanza también el modelo VIC (`ViciiCycleEngine.tick()`), el SID y los CIAs: es el modo más caro pero necesario para alinear IRQ/badlines con VICE en casos difíciles.
 - Sin VIC preciso, el raster avanza en **rachas** (`_advance_raster`), mucho más barato pero menos fiel.
 - `**MemoryMap.read` / `write`** concentran la lógica de bancas 6510, I/O, hooks de depuración opcionales y (en rutas calientes) muchas ramas.
 
@@ -98,7 +98,7 @@ Campos relevantes del JSON:
 Por defecto ejecuta **las 4 combinaciones**: headless × (VIC rápido / VIC preciso) y **pygame + ReSID** × (rápido / preciso). Cada corrida:
 
 - Escribe salida con `**tee`** en `logs/benchmark-<fecha>_<modo>.log` (slug con stack y VIC).
-- Añade **una línea JSON** (NDJSON) a `**logs/benchmark-log.json**`, con `git_commit`, `git_dirty`, `git_describe`, `benchmark_type`, `argv`, `exit_code`, `host_wall_seconds`, `log_file`, `python_version`, `platform`, métricas planas (`cycles`, `emulated_cpu_mhz`, …), el objeto `c64py_benchmark`, y si aplica `cprofile_prof`, `cprofile_pstats`, `vice_trace_file`, `vice_trace_wall`.
+- Añade **una línea JSON** (NDJSON) a `**logs/benchmark-log.json`**, con `git_commit`, `git_dirty`, `git_describe`, `benchmark_type`, `argv`, `exit_code`, `host_wall_seconds`, `log_file`, `python_version`, `platform`, métricas planas (`cycles`, `emulated_cpu_mhz`, …), el objeto `c64py_benchmark`, y si aplica `cprofile_prof`, `cprofile_pstats`, `vice_trace_file`, `vice_trace_wall`.
 
 Opcional (mucho I/O en disco; bajar `--cycles` para trazas):
 
@@ -127,6 +127,8 @@ BENCHMARK_CYCLES=5000000 ./scripts/run_benchmark.sh /ruta/a/roms
 # Perfil + traza (pocas ciclos recomendado)
 BENCHMARK_CYCLES=500000 ./scripts/run_benchmark.sh --headless-only --cprofile --vice-trace --vice-trace-wall /ruta/a/roms
 ```
+
+Lectura de resultados y puntos calientes (ejemplo): [perf/benchmark_analysis_20260405.md](../perf/benchmark_analysis_20260405.md) (sesión `20260405-202206`; ojo al sesgo de `--vice-trace` en cProfile).
 
 Leer el log acumulado (una línea = un JSON):
 
