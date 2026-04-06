@@ -179,6 +179,11 @@ class ReSIDEmulator:
                         environment variable.
         sampling_method: reSID sampling method (default
                         :data:`SAMPLE_INTERPOLATE`).
+        cpu_lockstep:   If ``True`` (default), advance the SID from the CPU thread via
+                        :meth:`tick_cpu_cycles` so reads like ``$D41B`` match cycle-accurate
+                        hosts. If ``False`` (used with **fast** coarse VIC), the audio
+                        thread advances reSID in large ``resid_clock`` steps only—much
+                        faster, but SID phase vs CPU is approximate.
     """
 
     REG_COUNT = 0x20
@@ -192,6 +197,7 @@ class ReSIDEmulator:
         mixer_buffer: int = 512,
         chip_model: Optional[str] = None,
         sampling_method: int = SAMPLE_INTERPOLATE,
+        cpu_lockstep: bool = True,
     ) -> None:
         self._lib = _load_resid_lib()
         self._sid_ptr = self._lib.resid_create()
@@ -218,6 +224,8 @@ class ReSIDEmulator:
 
         self._lib.resid_set_chip_model(self._sid_ptr, model_const)
 
+        self._cpu_lockstep = bool(cpu_lockstep)
+
         # Apply sampling parameters
         ok = self._lib.resid_set_sampling_parameters(
             self._sid_ptr,
@@ -233,12 +241,21 @@ class ReSIDEmulator:
                 RuntimeWarning,
             )
 
-        # Fixed chunk of C64 clock cycles per audio buffer (audio thread only).
+        # Target C64 clocks per mixer buffer (audio drains PCM produced by CPU-driven clock).
         self._cycles_per_buffer = self._clock_hz * self._buffer_seconds
-        # resid_clock() returns unconsumed cycles in delta_t; carry between buffers.
+
+        # Scratch buffer for resid_clock(); must stay non-empty capacity (wrapper rejects 0).
+        self._clock_scratch_samples = 4096
+        self._clock_scratch = (ctypes.c_int16 * self._clock_scratch_samples)()
+
+        # PCM queued from tick_cpu_cycles() when cpu_lockstep (accurate path).
+        self._pcm_pending = bytearray()
+        self._pcm_pending_max = self._sample_rate * 2 * 8  # cap ~8 s mono int16 bytes
+
+        # Legacy field (audio thread no longer clocks SID directly).
         self._cycle_remainder = 0
 
-        # PCM output buffer (audio thread + resid_clock)
+        # PCM output buffer (audio thread: lockstep drain or resid_clock in decoupled mode)
         self._pcm_buf = (ctypes.c_int16 * self._buffer_samples)()
         self._current_sound = None  # keep Sound alive while playing
         self._queued_sound = None   # keep queued Sound alive
@@ -272,6 +289,40 @@ class ReSIDEmulator:
                 float(self._sample_rate),
                 -1.0,
             )
+
+    def tick_cpu_cycles(self, n: int) -> None:
+        """Advance reSID by *n* C64 master-clock cycles (lockstep with CPU).
+
+        Called from the CPU emulation thread before each bus access / time step so
+        register reads (e.g. ``$D41B`` voice-3 output) see the same phase as
+        cycle-accurate hosts.  PCM is appended for the audio worker to drain.
+
+        When ``cpu_lockstep`` was set to ``False`` (fast VIC mode), this is a no-op;
+        the audio thread advances the chip via :meth:`_render_buffer` instead.
+        """
+        if not self._cpu_lockstep or n <= 0 or not self._sid_ptr:
+            return
+        scratch_n = self._clock_scratch_samples
+        with self._lock:
+            remaining = int(n)
+            while remaining > 0:
+                dt = ctypes.c_int(remaining)
+                produced = self._lib.resid_clock(
+                    self._sid_ptr,
+                    ctypes.byref(dt),
+                    self._clock_scratch,
+                    scratch_n,
+                )
+                remaining = int(dt.value)
+                if produced > 0:
+                    raw = ctypes.string_at(
+                        ctypes.addressof(self._clock_scratch),
+                        produced * 2,
+                    )
+                    self._pcm_pending += raw
+                    if len(self._pcm_pending) > self._pcm_pending_max:
+                        drop = len(self._pcm_pending) - self._pcm_pending_max
+                        del self._pcm_pending[:drop]
 
     # ------------------------------------------------------------------
     # Register access
@@ -308,6 +359,8 @@ class ReSIDEmulator:
                 pass
         self._current_sound = None
         self._queued_sound = None
+        with self._lock:
+            self._pcm_pending.clear()
         if self._sid_ptr:
             self._lib.resid_destroy(self._sid_ptr)
             self._sid_ptr = None
@@ -397,7 +450,32 @@ class ReSIDEmulator:
                 self._channel.queue(sound)
 
     def _render_buffer(self) -> bytes:
-        """Advance reSID by one buffer's worth of clock cycles and return PCM."""
+        """Produce one mixer buffer of PCM.
+
+        * **cpu_lockstep** (accurate): drain samples queued by ``tick_cpu_cycles``.
+        * **Not lockstep** (fast VIC): advance reSID with ``resid_clock`` in one call
+          (historical behaviour; matches pre-lockstep performance).
+        """
+        need = self._buffer_samples * 2
+        if not self._cpu_lockstep:
+            return self._render_buffer_decoupled()
+
+        with self._lock:
+            if not self._sid_ptr:
+                return bytes(need)
+            if len(self._pcm_pending) >= need:
+                chunk = bytes(self._pcm_pending[:need])
+                del self._pcm_pending[:need]
+                return chunk
+            chunk = bytes(self._pcm_pending)
+            self._pcm_pending.clear()
+        pad = need - len(chunk)
+        if pad > 0:
+            chunk += bytes(pad)
+        return chunk
+
+    def _render_buffer_decoupled(self) -> bytes:
+        """Advance reSID by ~one buffer of C64 clocks (audio thread only)."""
         delta_cycles = int(self._cycles_per_buffer) + self._cycle_remainder
         if delta_cycles < 1:
             return bytes(self._buffer_samples * 2)
