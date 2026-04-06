@@ -87,6 +87,34 @@ If you add new **pre-`_execute_opcode`** shortcuts in `step()`, extend **`_pytho
   `python C64.py programs/swinth.prg --headless --turbo --autoquit --max-cycles 5000000`  
   Then read `=== Emulation Speed ===` or the `C64PY_BENCHMARK` line with `--benchmark`.
 
+## Next milestone: hybrid accurate VIC (Rust + Python)
+
+**Goal:** keep **Python `ViciiCycleEngine` / `MemoryMap` raster + BA stall rules** as the **reference**, while letting a **Rust inner loop** run the 6502 fast path **per emulated CPU cycle** in accurate mode (same semantics as today’s `cpu.step()` accurate branch: VIC tick, CIA, optional IRQ, then opcode).
+
+**Suggested sequence**
+
+1. **Extract a “single CPU cycle” contract** from Python: inputs (memory, VIC shadow, CIA, CPU state) and outputs (RAM mutations, raster, `pending_irq`, cycle count). Match existing `step()` accurate path in tests (fixed PRGs, compare state each N cycles).
+2. **Port or duplicate the VIC tick for that path in Rust** by **translating** `ViciiCycleEngine::tick` + the glue in `cpu.py` (`_vic_tick_one`, BA stall rules) into `c64py-core`, driven by the same register shadow as today. **Badlines** stay inside that model — they are not a separate subsystem.
+3. **Gate with a new flag** (e.g. `C64PY_RUST_ACCURATE_VIC=1`) until parity is good; keep pure-Python `--accurate-vic` as fallback.
+4. **Optional:** coarse “run N cycles” in Rust with callback to Python only on IRQ / raster breakpoints (later optimization).
+
+## ReSID and the Rust core — one `resid_c` dylib
+
+**Yes — you only build `resid_c` once.** Python (`resid.py` via **ctypes**) and Rust (**`extern "C"`** declarations matching [src/resid_wrapper/resid_c.h](../src/resid_wrapper/resid_c.h)) load the **same** `resid_c.dylib` / `resid_c.so`. No second reSID build is required unless you choose to **statically** link reSID into the PyO3 crate (optional packaging choice, not required).
+
+**Today**
+
+- **Fast VIC + ReSID decoupled** (`_cpu_lockstep == false`): the CPU thread skips `tick_cpu_cycles`; Rust batching is **allowed**; audio advances on the pygame thread via `resid_clock`. **Same dylib, no Rust involvement.**
+- **Accurate VIC or lockstep ReSID** (`_cpu_lockstep == true`): `_rust_fast_batch_usable()` is **false**, so you stay on Python `step()` and existing `tick_cpu_cycles` → **`resid_clock`** with a scratch buffer (see `resid.py`).
+
+**Re-enabling lockstep ReSID while using the Rust CPU batch**
+
+- The **C API** you already have is enough: `resid_read` / `resid_write` / `resid_clock` (same as Python). Rust would call these during a batch when it decodes **$D400–$D41C** accesses and when advancing **emulated cycles**, mirroring `memory.sid_tick_cpu_cycles` + `read_register` / `write_register`.
+- **Threading:** `ReSIDEmulator` protects the SID with a Python **`threading.Lock`**. The Rust batch runs with the **GIL held** today, so the audio thread can block on that lock — same as a long Python opcode. If you later **`allow_threads`** around the Rust batch, you must **not** call `resid_*` without the same exclusion rule (e.g. only clock SID from the CPU thread while holding the lock, or move to a `resid_c`-level mutex — larger change).
+- **Optional C helper:** if calling `resid_clock` into a scratch buffer every cycle from Rust is awkward, add something like `resid_advance_cycles(resid_sid_t *sid, int cycles)` in `resid_c.cpp` **only if** the underlying reSID API exposes a cheap “clock only” path; otherwise keep **`resid_clock`** with a small stack buffer (same strategy as Python).
+
+**Summary:** one **`resid_c`** shared library for **Python-only** and **Python+Rust**; Rust binds to the **existing C symbols** (or `libloading`). Next implementation step is **wiring** those calls into the Rust memory map / cycle loop when lockstep is on, with **locking** rules matching `resid.py`.
+
 ### Tests
 
 - Rust: `cargo test` in `rust/c64py-core/`.
