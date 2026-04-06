@@ -11,7 +11,7 @@ the pure-Python ``CPU6502.step`` path.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from .cpu import CPU6502
@@ -46,6 +46,7 @@ def run_fast_batch(
     basic_rom: Optional[bytes] = None,
     kernal_rom: Optional[bytes] = None,
     char_rom: Optional[bytes] = None,
+    stop_pcs: Optional[Sequence[int]] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, int, bool]:
     """Run the Rust fast batch; sync ``memory.ram`` via a shared ``bytearray``.
 
@@ -67,6 +68,12 @@ def run_fast_batch(
     vs = memory.video_standard
     if vs not in ("pal", "ntsc"):
         vs = "pal"
+
+    stops: List[int]
+    if stop_pcs is None:
+        stops = []
+    else:
+        stops = [int(x) & 0xFFFF for x in stop_pcs]
 
     t = _rust.run_fast_batch_py(
         ram,
@@ -103,6 +110,7 @@ def run_fast_batch(
         None if basic_rom is None else bytes(basic_rom),
         None if kernal_rom is None else bytes(kernal_rom),
         None if char_rom is None else bytes(char_rom),
+        stops,
     )
     (
         ins,

@@ -774,6 +774,15 @@ class C64:
             self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
         return True
 
+    def _kernal_hook_rts_return(self) -> None:
+        """Pop return address from stack like RTS after a simulated KERNAL vector call."""
+        sp = self.cpu.state.sp
+        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
+        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
+        ret_addr = ret_addr_low | (ret_addr_high << 8)
+        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
+        self.cpu.state.sp = (sp + 2) & 0xFF
+
     def _handle_kernal_load(self) -> bool:
         """Handle KERNAL LOAD operation for virtual disk drives.
         
@@ -810,8 +819,7 @@ class C64:
             self.memory.write(0x90, 0x80)  # Status byte: device not present
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
-            # Return from JSR
-            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            self._kernal_hook_rts_return()
             return True
         
         # Get LOAD parameters
@@ -839,8 +847,7 @@ class C64:
             self.memory.write(0x90, 0x40)  # Status byte: error
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
-            # Return from JSR (pop return address and continue)
-            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            self._kernal_hook_rts_return()
             return True
         
         # Get load address
@@ -890,18 +897,7 @@ class C64:
             self.memory.write(0x0031, end_addr & 0xFF)
             self.memory.write(0x0032, (end_addr >> 8) & 0xFF)
         
-        # Return from JSR (pop return address and continue)
-        # The JSR to $FFD5 pushed the return address on the stack
-        # We need to pop it and continue from there
-        sp = self.cpu.state.sp
-        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
-        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
-        ret_addr = ret_addr_low | (ret_addr_high << 8)
-        # JSR pushes PC+2 (where PC points to last byte of JSR instruction)
-        # RTS adds 1 to get to next instruction
-        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
-        self.cpu.state.sp = (sp + 2) & 0xFF
-        
+        self._kernal_hook_rts_return()
         return True
 
     def _handle_kernal_save(self) -> bool:
@@ -940,8 +936,7 @@ class C64:
             self.memory.write(0x90, 0x80)
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
-            # Return from JSR
-            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            self._kernal_hook_rts_return()
             return True
         
         # Get SAVE parameters
@@ -1001,15 +996,16 @@ class C64:
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
         
-        # Return from JSR
-        sp = self.cpu.state.sp
-        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
-        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
-        ret_addr = ret_addr_low | (ret_addr_high << 8)
-        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
-        self.cpu.state.sp = (sp + 2) & 0xFF
-        
+        self._kernal_hook_rts_return()
         return True
+
+    def run_cpu_instruction_quantum(self, cycles_before: int) -> int:
+        """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
+        if self._handle_kernal_load():
+            return 0
+        if self._handle_kernal_save():
+            return 0
+        return self.cpu.cpu_step_quantum(self.udp_debug, self.vice_trace, cycles_before)
 
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
@@ -1096,17 +1092,10 @@ class C64:
                             self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
                         self.disk_image_path = None  # Clear path even on error
 
-            # Check for KERNAL LOAD hook (before executing instruction)
-            if self._handle_kernal_load():
-                # LOAD was handled, skip this CPU instruction
+            step_cycles = self.run_cpu_instruction_quantum(cycles)
+            if step_cycles == 0:
                 continue
 
-            # Check for KERNAL SAVE hook (before executing instruction)
-            if self._handle_kernal_save():
-                # SAVE was handled, skip this CPU instruction
-                continue
-
-            step_cycles = self.cpu.step(self.udp_debug, cycles, self.vice_trace)
             cycles += step_cycles
             self.current_cycles = cycles
             self.throttle_emulation_if_needed(cycles)

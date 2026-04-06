@@ -5,11 +5,11 @@ pub fn brk(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let pc_high: u8 = ((cpu.pc.wrapping_add(2)) >> 8) as u8;
     let pc_low: u8 = ((cpu.pc.wrapping_add(2)) & 0xFF) as u8;
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), pc_high);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), pc_low);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), (cpu.p | 0x30) & 0xFF);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     set_flag(cpu, 0x04, true);
     cpu.pc = read_word_at(mem, 0xFFFE);
     return 7;
@@ -28,20 +28,20 @@ pub fn jsr_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let pc_high: u8 = (return_addr >> 8) as u8;
     let pc_low: u8 = (return_addr & 0xFF) as u8;
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), pc_high);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), pc_low);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     cpu.pc = addr;
     return 6;
 }
 
 pub fn rts(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     let pc_low: u8 = (mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16))) as u8;
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     let pc_high: u8 = (mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16))) as u8;
     let ret: u16 = (u16::from(pc_high) << 8) | u16::from(pc_low);
-    cpu.pc = (ret + 1) & 0xFFFF;
+    cpu.pc = ret.wrapping_add(1);
     return 6;
 }
 
@@ -530,7 +530,7 @@ pub fn eor_indy(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 
 pub fn cmp_imm(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let value= mr(mem, cpu, cpu.pc.wrapping_add(1));
-    let result= (cpu.a - value) & 0xFF;
+    let result= cpu.a.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.a >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -540,7 +540,7 @@ pub fn cmp_imm(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn cmp_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let zp_addr= mr(mem, cpu, cpu.pc.wrapping_add(1));
     let value= mr(mem, cpu, u16::from(zp_addr));
-    let result= (cpu.a - value) & 0xFF;
+    let result= cpu.a.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.a >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -550,7 +550,7 @@ pub fn cmp_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn cmp_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let addr: u16 = read_word_at(mem, cpu.pc.wrapping_add(1));
     let value= mr(mem, cpu, addr);
-    let result= (cpu.a - value) & 0xFF;
+    let result= cpu.a.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.a >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(3);
@@ -559,7 +559,7 @@ pub fn cmp_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 
 pub fn cpx_imm(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let value= mr(mem, cpu, cpu.pc.wrapping_add(1));
-    let result= (cpu.x - value) & 0xFF;
+    let result= cpu.x.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.x >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -569,7 +569,7 @@ pub fn cpx_imm(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn cpx_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let zp_addr= mr(mem, cpu, cpu.pc.wrapping_add(1));
     let value= mr(mem, cpu, u16::from(zp_addr));
-    let result= (cpu.x - value) & 0xFF;
+    let result= cpu.x.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.x >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -579,7 +579,7 @@ pub fn cpx_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn cpx_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let addr: u16 = read_word_at(mem, cpu.pc.wrapping_add(1));
     let value= mr(mem, cpu, addr);
-    let result= (cpu.x - value) & 0xFF;
+    let result= cpu.x.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.x >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(3);
@@ -588,7 +588,7 @@ pub fn cpx_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 
 pub fn cpy_imm(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let value= mr(mem, cpu, cpu.pc.wrapping_add(1));
-    let result= (cpu.y - value) & 0xFF;
+    let result= cpu.y.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.y >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -598,7 +598,7 @@ pub fn cpy_imm(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn cpy_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let zp_addr= mr(mem, cpu, cpu.pc.wrapping_add(1));
     let value= mr(mem, cpu, u16::from(zp_addr));
-    let result= (cpu.y - value) & 0xFF;
+    let result= cpu.y.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.y >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -608,7 +608,7 @@ pub fn cpy_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn cpy_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let addr: u16 = read_word_at(mem, cpu.pc.wrapping_add(1));
     let value= mr(mem, cpu, addr);
-    let result= (cpu.y - value) & 0xFF;
+    let result= cpu.y.wrapping_sub(value);
     set_flag(cpu, 0x01, cpu.y >= value);
     update_nz(cpu, result);
     cpu.pc = cpu.pc.wrapping_add(3);
@@ -620,7 +620,7 @@ pub fn inc_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let zp_addr= mr(mem, cpu, cpu.pc.wrapping_add(1)) & 0xFF;
     let old= mr(mem, cpu, u16::from(zp_addr));
     rmw_dummy_6510(mem, cpu, zp_addr as u16, old);
-    let value= (old + 1) & 0xFF;
+    let value= old.wrapping_add(1);
     mw(mem, cpu, zp_addr as u16, value);
     update_nz(cpu, value);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -631,7 +631,7 @@ pub fn inc_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let addr: u16 = read_word_at(mem, cpu.pc.wrapping_add(1));
     let old= mr(mem, cpu, addr);
     rmw_dummy_6510(mem, cpu, addr, old);
-    let value= (old + 1) & 0xFF;
+    let value= old.wrapping_add(1);
     mw(mem, cpu, addr, value);
     update_nz(cpu, value);
     cpu.pc = cpu.pc.wrapping_add(3);
@@ -642,7 +642,7 @@ pub fn dec_zp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let zp_addr= mr(mem, cpu, cpu.pc.wrapping_add(1)) & 0xFF;
     let old= mr(mem, cpu, u16::from(zp_addr));
     rmw_dummy_6510(mem, cpu, zp_addr as u16, old);
-    let value= (old - 1) & 0xFF;
+    let value= old.wrapping_sub(1);
     mw(mem, cpu, zp_addr as u16, value);
     update_nz(cpu, value);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -653,7 +653,7 @@ pub fn dec_abs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let addr: u16 = read_word_at(mem, cpu.pc.wrapping_add(1));
     let old= mr(mem, cpu, addr);
     rmw_dummy_6510(mem, cpu, addr, old);
-    let value= (old - 1) & 0xFF;
+    let value= old.wrapping_sub(1);
     mw(mem, cpu, addr, value);
     update_nz(cpu, value);
     cpu.pc = cpu.pc.wrapping_add(3);
@@ -665,7 +665,7 @@ pub fn dec_absx(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     let addr: u16 = base.wrapping_add(cpu.x as u16);
     let old= mr(mem, cpu, addr);
     rmw_dummy_6510(mem, cpu, addr, old);
-    let value= (old - 1) & 0xFF;
+    let value= old.wrapping_sub(1);
     mw(mem, cpu, addr, value);
     update_nz(cpu, value);
     cpu.pc = cpu.pc.wrapping_add(3);
@@ -673,28 +673,28 @@ pub fn dec_absx(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 }
 
 pub fn inx(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.x = (cpu.x + 1) & 0xFF;
+    cpu.x = cpu.x.wrapping_add(1);
     update_nz(cpu, cpu.x);
     cpu.pc = cpu.pc.wrapping_add(1);
     return 2;
 }
 
 pub fn iny(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.y = (cpu.y + 1) & 0xFF;
+    cpu.y = cpu.y.wrapping_add(1);
     update_nz(cpu, cpu.y);
     cpu.pc = cpu.pc.wrapping_add(1);
     return 2;
 }
 
 pub fn dex(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.x = (cpu.x - 1) & 0xFF;
+    cpu.x = cpu.x.wrapping_sub(1);
     update_nz(cpu, cpu.x);
     cpu.pc = cpu.pc.wrapping_add(1);
     return 2;
 }
 
 pub fn dey(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.y = (cpu.y - 1) & 0xFF;
+    cpu.y = cpu.y.wrapping_sub(1);
     update_nz(cpu, cpu.y);
     cpu.pc = cpu.pc.wrapping_add(1);
     return 2;
@@ -959,13 +959,13 @@ pub fn bvs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 
 pub fn pha(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), cpu.a);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     cpu.pc = cpu.pc.wrapping_add(1);
     return 3;
 }
 
 pub fn pla(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     cpu.a = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16));
     update_nz(cpu, cpu.a);
     cpu.pc = cpu.pc.wrapping_add(1);
@@ -975,13 +975,13 @@ pub fn pla(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 pub fn php(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
     // NMOS 6502: pushed status has bits 4 (B) and 5 always 1 (see visual6502 / datasheets).
     mw(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16), (cpu.p | 0x30) & 0xFF);
-    cpu.sp = (cpu.sp - 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_sub(1);
     cpu.pc = cpu.pc.wrapping_add(1);
     return 3;
 }
 
 pub fn plp(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     // Full P from stack (incl. B and bit 5); matches VICE trace NV-BDIZC after PLP/RTI.
     cpu.p = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16)) & 0xFF;
     cpu.pc = cpu.pc.wrapping_add(1);
@@ -1032,11 +1032,11 @@ pub fn txs(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
 }
 
 pub fn rti(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) -> u32 {
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     cpu.p = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16)) & 0xFF;
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     let pc_low: u8 = (mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16))) as u8;
-    cpu.sp = (cpu.sp + 1) & 0xFF;
+    cpu.sp = cpu.sp.wrapping_add(1);
     let pc_high: u8 = (mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16))) as u8;
     cpu.pc = u16::from(pc_low) | (u16::from(pc_high) << 8);
     return 6;

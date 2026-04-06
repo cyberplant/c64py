@@ -501,6 +501,7 @@ class CPU6502:
 
         # Special handling for CINT when no KERNAL ROM is loaded.
         # If the ROM is present, let the KERNAL initialize its own editor state.
+        # Python-only path; keep :meth:`_python_only_step_pcs` and Rust stop-PC list in sync.
         if pc == 0xFF5B and self.memory.kernal_rom is None:  # Start of CINT
             if self.interface:
                 self.interface.add_debug_log("🎯 CINT: Fast-path init (screen + default colors)")
@@ -552,6 +553,7 @@ class CPU6502:
 
         # Check if we're at a KERNAL vector that needs handling.
         # These fallbacks are only used when the KERNAL ROM is missing.
+        # Python-only; keep :meth:`_python_only_step_pcs` and Rust stop-PC list in sync.
         # CHRIN ($FFCF) - Input character from keyboard
         if pc == 0xFFCF and self.memory.kernal_rom is None:
             # CHRIN - return character from input/keyboard buffers
@@ -696,6 +698,8 @@ class CPU6502:
             return 20  # Approximate cycles for CHRIN
 
         # CHROUT ($FFD2) - Output character to screen
+        # Python-only shortcut; Rust fast batch must stop before executing here
+        # (:meth:`_python_only_step_pcs`, :meth:`_rust_delegate_stop_pcs`).
         # Keep a compatibility implementation so screen output works even when
         # the ROM screen editor path is not fully supported by the CPU core.
         if pc == 0xFFD2:
@@ -927,17 +931,36 @@ class CPU6502:
         sid = self.memory.sid
         if sid is not None and getattr(sid, "_cpu_lockstep", True):
             return False
-        if self.interface is not None:
-            return False
         if not isinstance(self.memory.ram, bytearray):
             return False
         return True
 
-    def step_fast_batch(self, max_instructions: int) -> tuple[int, int]:
+    def _rust_delegate_stop_pcs(self) -> list[int]:
+        """PCs where a Rust batch must hand off to Python (hooks + ``step()`` shortcuts).
+
+        Includes LOAD/SAVE vectors so ``C64`` KERNAL hooks run between batches.
+        """
+        pcs = [0xFFD2, 0xFFD5, 0xFFD8]
+        if self.memory.kernal_rom is None:
+            pcs.extend((0xFF5B, 0xFFCF))
+        return sorted(set(pcs))
+
+    def _python_only_step_pcs(self) -> frozenset[int]:
+        """PCs handled in :meth:`step` before ``_execute_opcode``; must match delegate stops where applicable."""
+        s = {0xFFD2}
+        if self.memory.kernal_rom is None:
+            s.add(0xFF5B)
+            s.add(0xFFCF)
+        return frozenset(s)
+
+    def step_fast_batch(
+        self, max_instructions: int, stop_pcs: Optional[list[int]] = None
+    ) -> tuple[int, int]:
         """Run up to ``max_instructions`` instructions.
 
         Uses the optional Rust core when :meth:`_rust_fast_batch_usable` is true; otherwise
-        falls back to repeated :meth:`step`.
+        falls back to repeated :meth:`step`. ``stop_pcs`` defaults to
+        :meth:`_rust_delegate_stop_pcs` (Rust exits the batch before executing at those PCs).
 
         Returns ``(instructions_executed, cycles_emulated)``.
         """
@@ -957,6 +980,7 @@ class CPU6502:
 
         from . import _core
 
+        stops = self._rust_delegate_stop_pcs() if stop_pcs is None else stop_pcs
         ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped = _core.run_fast_batch(
             self.memory,
             max_instructions=max_instructions,
@@ -971,6 +995,7 @@ class CPU6502:
             basic_rom=self.memory.basic_rom,
             kernal_rom=self.memory.kernal_rom,
             char_rom=self.memory.char_rom,
+            stop_pcs=stops,
         )
         self.state.pc = opc
         self.state.a = oa
@@ -982,6 +1007,32 @@ class CPU6502:
         self.state.stopped = ostopped
         self.memory.sid_tick_cpu_cycles(cyc)
         return ins, cyc
+
+    def cpu_step_quantum(
+        self,
+        udp_debug: Optional['UdpDebugLogger'],
+        vice_trace,
+        current_cycles: int,
+    ) -> int:
+        """One logical instruction: Rust batch when safe, else :meth:`step`."""
+        if udp_debug and udp_debug.enabled:
+            return self.step(udp_debug, current_cycles, vice_trace)
+        if vice_trace and vice_trace.enabled:
+            return self.step(udp_debug, current_cycles, vice_trace)
+        if (self.state.pc & 0xFFFF) in self._python_only_step_pcs():
+            return self.step(udp_debug, current_cycles, vice_trace)
+        if not self._rust_fast_batch_usable():
+            return self.step(udp_debug, current_cycles, vice_trace)
+        try:
+            batch_n = int(os.environ.get("C64PY_RUST_BATCH", "64"))
+        except ValueError:
+            batch_n = 64
+        batch_n = max(1, min(batch_n, 10_000))
+        stops = self._rust_delegate_stop_pcs()
+        ins, cyc = self.step_fast_batch(batch_n, stop_pcs=stops)
+        if ins == 0:
+            return self.step(udp_debug, current_cycles, vice_trace)
+        return cyc
 
     def _update_cia_timers(self, cycles: int, recompute_irq: bool = True) -> None:
         """Update CIA timers and optionally recompute pending IRQ (defer in hot inner loops)."""

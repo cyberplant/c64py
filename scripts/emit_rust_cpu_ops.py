@@ -314,6 +314,27 @@ def rust_fn_name(py: str) -> str:
     return py[1:]  # drop _
 
 
+def apply_u8_wrapping_arithmetic(text: str) -> str:
+    """6502 byte math wraps; Rust ``u8`` +/- panics in debug without wrapping_*."""
+    pairs = [
+        ("cpu.sp = (cpu.sp - 1) & 0xFF;", "cpu.sp = cpu.sp.wrapping_sub(1);"),
+        ("cpu.sp = (cpu.sp + 1) & 0xFF;", "cpu.sp = cpu.sp.wrapping_add(1);"),
+        ("let result= (cpu.a - value) & 0xFF;", "let result= cpu.a.wrapping_sub(value);"),
+        ("let result= (cpu.x - value) & 0xFF;", "let result= cpu.x.wrapping_sub(value);"),
+        ("let result= (cpu.y - value) & 0xFF;", "let result= cpu.y.wrapping_sub(value);"),
+        ("let value= (old + 1) & 0xFF;", "let value= old.wrapping_add(1);"),
+        ("let value= (old - 1) & 0xFF;", "let value= old.wrapping_sub(1);"),
+        ("cpu.x = (cpu.x + 1) & 0xFF;", "cpu.x = cpu.x.wrapping_add(1);"),
+        ("cpu.y = (cpu.y + 1) & 0xFF;", "cpu.y = cpu.y.wrapping_add(1);"),
+        ("cpu.x = (cpu.x - 1) & 0xFF;", "cpu.x = cpu.x.wrapping_sub(1);"),
+        ("cpu.y = (cpu.y - 1) & 0xFF;", "cpu.y = cpu.y.wrapping_sub(1);"),
+        ("    cpu.pc = (ret + 1) & 0xFFFF;", "    cpu.pc = ret.wrapping_add(1);"),
+    ]
+    for old, new in pairs:
+        text = text.replace(old, new)
+    return text
+
+
 def main() -> None:
     src = CPU_PY.read_text()
     chunks = []
@@ -351,6 +372,7 @@ def main() -> None:
         "cpu.pc = (pc_low | (pc_high << 8)) & 0xFFFF;",
         "cpu.pc = u16::from(pc_low) | (u16::from(pc_high) << 8);",
     )
+    text = apply_u8_wrapping_arithmetic(text)
     OUT.write_text(text)
     print("wrote", OUT)
 

@@ -37,8 +37,8 @@ fn rust_core_version() -> &'static str {
     cia1_icr,
     cia2_pra, cia2_ddra,
     ta_latch, ta_counter, ta_running, ta_irq_en, ta_oneshot, ta_input,
-    tb_latch, tb_counter, tb_running, tb_irq_en, tb_oneshot, tb_input,
-    basic_rom=None, kernal_rom=None, char_rom=None
+    tb_latch, tb_counter, tb_running, tb_irq_en,     tb_oneshot, tb_input,
+    basic_rom=None, kernal_rom=None, char_rom=None, stop_pcs=None
 ))]
 fn run_fast_batch_py<'py>(
     py: Python<'py>,
@@ -76,6 +76,7 @@ fn run_fast_batch_py<'py>(
     basic_rom: Option<Vec<u8>>,
     kernal_rom: Option<Vec<u8>>,
     char_rom: Option<Vec<u8>>,
+    stop_pcs: Option<Vec<u16>>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
         1u8
@@ -167,7 +168,10 @@ fn run_fast_batch_py<'py>(
             cycles,
             stopped,
         };
-        let (ins, cyc) = run_fast_batch(&mut cpu, &mut mem, max_instructions);
+        let mut stops = stop_pcs.unwrap_or_default();
+        stops.sort_unstable();
+        stops.dedup();
+        let (ins, cyc) = run_fast_batch(&mut cpu, &mut mem, max_instructions, &stops);
         let out: OutTuple = (
             ins,
             cyc,
