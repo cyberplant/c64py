@@ -1,0 +1,8 @@
+# Example for --debug-inject-file: one addr=value per line (hex).
+# Paste from VICE monitor after `m 0100 01ff` (convert to 0100=.. 0101=..).
+# Order with C64.py: --debug-inject-file test/fixtures/debug_inject_stack.example.txt
+# then optional --debug-inject-map for regs/ZP (map overrides file on duplicate addrs).
+
+0100=fd
+0101=fc
+0102=fb
