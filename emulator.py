@@ -42,9 +42,12 @@ from .constants import (
 )
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
+from .drive import DiskDrive
 from .memory import MemoryMap
-from .roms import REQUIRED_ROMS
+from .roms import REQUIRED_ROMS, find_drive_rom
 from .ui import TextualInterface
+from .iec_bus import IECBus
+from .drive1541 import Drive1541
 
 class C64:
     """Main C64 emulator"""
@@ -70,7 +73,13 @@ class C64:
         (0xBB, 0xBB, 0xBB),  # 15 light gray
     )
 
-    def __init__(self, interface_factory=None, enable_sid: bool = False, enable_resid: bool = False):
+    def __init__(
+        self,
+        interface_factory=None,
+        enable_sid: bool = False,
+        enable_resid: bool = False,
+        accurate_vic: bool = False,
+    ):
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -78,7 +87,8 @@ class C64:
             self.interface = interface_factory(self)
 
         # Create CPU with interface reference
-        self.cpu = CPU6502(self.memory, self.interface)
+        self.cpu = CPU6502(self.memory, self.interface, accurate_vic=accurate_vic)
+        self.accurate_vic = accurate_vic
         self.sid = None
 
         self.running = False
@@ -94,6 +104,7 @@ class C64:
         self.debug = False
         self.no_colors = False  # ANSI color output enabled by default
         self.udp_debug = None  # Will be set if UDP debugging is enabled
+        self.vice_trace = None  # Will be set if VICE-compatible tracing is enabled
         self.screen_update_thread = None
         self.screen_update_interval = 0.0167  # Update screen every 16.7ms (60Hz)
         self.screen_lock = threading.Lock()
@@ -102,9 +113,20 @@ class C64:
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
         self.turbo = False  # When True, no wall-clock throttling (see --turbo)
+
+        # Disk drives (devices 8-11)
+        self.drives: Dict[int, DiskDrive] = {}
+        self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
+
+        # IEC serial bus for 1541 drive emulation (optional, created when needed)
+        self.iec_bus: Optional[IECBus] = None
+        self.iec_drives: Dict[int, Drive1541] = {}  # 1541 drives with ROM
+        self.use_iec_bus = False  # Enable when 1541 ROMs are available
+
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
         self._prev_color_data = b''
+        self._screen_dirty = False  # Flag for manual screen updates
         self._screen_dirty = True  # Force initial render
 
         # Backward compatibility
@@ -113,7 +135,10 @@ class C64:
         if enable_resid:
             try:
                 from .resid import ReSIDEmulator
-                self.sid = ReSIDEmulator(video_standard=self.memory.video_standard)
+                self.sid = ReSIDEmulator(
+                    video_standard=self.memory.video_standard,
+                    cpu_lockstep=accurate_vic,
+                )
                 self.memory.sid = self.sid
                 if self.interface:
                     self.interface.add_debug_log("🔊 reSID audio enabled (VICE-Team reSID)")
@@ -211,6 +236,11 @@ class C64:
         Cumulative *deadline* (+= span/hz) sets the target wall time. Each ``time.sleep`` is
         shortened by an EMA of (actual_sleep − requested_sleep) so different OS/schedulers
         converge toward ~100% of nominal PAL/NTSC MHz without per-machine constants.
+
+        Event queues / high-resolution host timers are useful for *wall-clock* sync (audio,
+        vsync, UI). They do not replace per-cycle CPU/VIC stepping when modeling BA stalls
+        and IRQ phase; that still requires advancing the chip model each emulated cycle
+        (or a proven fast-forward with equivalent state).
 
         """
         if getattr(self, "turbo", False):
@@ -362,6 +392,7 @@ class C64:
         # Bits 0-2: Memory configuration
         # 0x37 = %00110111 = BASIC ROM + KERNAL ROM + I/O enabled
         self.memory.ram[0x01] = 0x37
+        self.memory.invalidate_6510_port_read_cache()
 
         # Initialize screen memory with spaces (don't pre-fill - let KERNAL/BASIC do it)
         # The C64 typically clears screen during initialization
@@ -627,6 +658,359 @@ class C64:
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
 
+    def _inject_load_directory_command(self, device: int = 8) -> None:
+        """Inject 'LOAD"$",device' command into keyboard buffer to list disk directory."""
+        
+        # Put in keyboard buffer (raw keypresses)
+        # Clear buffer first
+        for i in range(10):
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, 0)
+
+        # Write 'LOAD"$",8' + RETURN
+        # PETSCII: L O A D " $ " , 8 RETURN (RETURN = 0x0D)
+        command = f'LOAD"$",{device}\r'  # \r is carriage return (0x0D)
+        command_bytes = command.encode('ascii')
+        
+        for i, char in enumerate(command_bytes):
+            self.memory.write(KEYBOARD_BUFFER_BASE + i, char)
+
+        # Set buffer length
+        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, len(command_bytes))
+        
+        if self.interface:
+            self.interface.add_debug_log(f"💾 Injected 'LOAD\"$\",{device}' command into keyboard buffer")
+
+    def attach_disk(self, disk_path: str, device: int = 8) -> None:
+        """Attach a D64 disk image to a drive.
+        
+        Args:
+            disk_path: Path to D64 disk image file
+            device: Device number (8-11, default 8)
+        """
+        from .d64 import load_d64
+        
+        if device < 8 or device > 11:
+            raise ValueError(f"Invalid device number: {device} (must be 8-11)")
+        
+        # Load D64 image
+        d64 = load_d64(disk_path)
+        
+        # Create or get drive
+        if device not in self.drives:
+            self.drives[device] = DiskDrive(device)
+        
+        # Attach disk
+        self.drives[device].attach_disk(d64, disk_path)
+        
+        if self.interface:
+            disk_name, disk_id = d64.read_bam()
+            self.interface.add_debug_log(f"💾 Attached disk '{disk_name}' (ID: {disk_id}) to drive {device}")
+            self.interface.add_debug_log(f"   File: {disk_path}")
+
+    def detach_disks(self) -> None:
+        """Detach all disk images from drives."""
+        for device, drive in self.drives.items():
+            drive.detach_disk()
+            if self.interface:
+                self.interface.add_debug_log(f"💾 Detached disk from drive {device}")
+        self.drives.clear()
+        
+        # Also detach from IEC drives if using IEC bus
+        for device, drive in self.iec_drives.items():
+            drive.detach_disk()
+            if self.interface:
+                self.interface.add_debug_log(f"💾 Detached disk from IEC drive {device}")
+
+    def get_drive(self, device: int) -> Optional[DiskDrive]:
+        """Get disk drive by device number.
+        
+        Args:
+            device: Device number (8-11)
+            
+        Returns:
+            DiskDrive instance or None if not attached
+        """
+        return self.drives.get(device)
+    
+    def initialize_iec_bus(self, rom_dir: Optional[str] = None) -> bool:
+        """Initialize IEC bus and 1541 drive emulation.
+        
+        This loads 1541 ROMs and creates the IEC bus infrastructure.
+        If ROMs cannot be found, falls back to KERNAL hook method.
+        
+        Args:
+            rom_dir: Optional ROM directory path
+            
+        Returns:
+            True if IEC bus was successfully initialized
+        """
+        # Try to load 1541 DOS ROM
+        dos_rom = find_drive_rom("dos1541", rom_dir)
+        if dos_rom is None:
+            if self.interface:
+                self.interface.add_debug_log("⚠️  1541 DOS ROM not found - using KERNAL hooks for disk I/O")
+            self.use_iec_bus = False
+            return False
+        
+        # Serial ROM is optional
+        serial_rom = find_drive_rom("serial1541", rom_dir)
+        if serial_rom is None:
+            if self.interface:
+                self.interface.add_debug_log("⚠️  1541 Serial ROM not found (optional)")
+        
+        # Create IEC bus
+        self.iec_bus = IECBus()
+        self.memory.iec_bus = self.iec_bus
+        
+        # Create 1541 drives for devices 8-11
+        for device in range(8, 12):
+            drive = Drive1541(device_number=device)
+            drive.load_rom(dos_rom, serial_rom)
+            self.iec_bus.attach_device(drive)
+            self.iec_drives[device] = drive
+        
+        self.use_iec_bus = True
+        if self.interface:
+            self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
+        return True
+
+    def _handle_kernal_load(self) -> bool:
+        """Handle KERNAL LOAD operation for virtual disk drives.
+        
+        This intercepts LOAD calls when PC is at $FFD5 and device is 8-11.
+        Returns True if LOAD was handled, False otherwise.
+        
+        KERNAL LOAD calling convention:
+        - A: 0 = LOAD, 1 = VERIFY
+        - X: Load address low byte (if secondary address = 0)
+        - Y: Load address high byte (if secondary address = 0)
+        - $B7: Filename length
+        - $BB-$BC: Filename pointer
+        - $BA: Device number
+        - $B9: Secondary address (0 = use address in X/Y, 1 = use address from file)
+        """
+        # Check if we're at the LOAD entry point
+        if self.cpu.state.pc != 0xFFD5:
+            return False
+        
+        # Get device number from zero page
+        device = self.memory.read(0xBA)
+        
+        # Only handle disk devices (8-11)
+        if device < 8 or device > 11:
+            return False
+        
+        # Check if we have a drive attached for this device
+        drive = self.get_drive(device)
+        if not drive or not drive.has_disk():
+            # No disk attached - show "DEVICE NOT PRESENT" error
+            if self.interface:
+                self.interface.add_debug_log(f"❌ No disk in drive {device}")
+            # Set error status
+            self.memory.write(0x90, 0x80)  # Status byte: device not present
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+            # Return from JSR
+            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            return True
+        
+        # Get LOAD parameters
+        verify = self.cpu.state.a != 0  # A=0 for LOAD, A=1 for VERIFY
+        secondary_addr = self.memory.read(0xB9)
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        
+        # Read filename from memory
+        filename_bytes = []
+        for i in range(filename_len):
+            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
+        
+        if self.interface:
+            self.interface.add_debug_log(f"🔧 KERNAL LOAD intercepted: device={device}, file='{filename}', verify={verify}")
+        
+        # Load file from virtual disk
+        file_data = drive.load_file(filename, secondary_addr)
+        
+        if file_data is None:
+            if self.interface:
+                self.interface.add_debug_log(f"❌ File not found: '{filename}'")
+            # Set error: FILE NOT FOUND
+            self.memory.write(0x90, 0x40)  # Status byte: error
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+            # Return from JSR (pop return address and continue)
+            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            return True
+        
+        # Get load address
+        if secondary_addr == 0:
+            # Use address from X/Y registers
+            load_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+        else:
+            # Use address from file (first 2 bytes)
+            if len(file_data) >= 2:
+                load_addr = file_data[0] | (file_data[1] << 8)
+                file_data = file_data[2:]  # Skip load address bytes
+            else:
+                load_addr = 0x0801  # Default to BASIC start
+        
+        # Write file data to memory (skip if VERIFY)
+        if not verify:
+            for i, byte_val in enumerate(file_data):
+                addr = (load_addr + i) & 0xFFFF
+                self.memory.write(addr, byte_val)
+        
+        end_addr = (load_addr + len(file_data)) & 0xFFFF
+        
+        if self.interface:
+            self.interface.add_debug_log(
+                f"✅ {'Verified' if verify else 'Loaded'} {len(file_data)} bytes "
+                f"at ${load_addr:04X}-${end_addr:04X}"
+            )
+        
+        # Set end address in X/Y registers
+        self.cpu.state.x = end_addr & 0xFF
+        self.cpu.state.y = (end_addr >> 8) & 0xFF
+        
+        # Clear carry flag to indicate success
+        self.cpu.state.p &= ~0x01
+        
+        # Clear status byte
+        self.memory.write(0x90, 0x00)
+        
+        # If loading directory, update BASIC pointers
+        if filename == "$" and load_addr == 0x0801:
+            # Update BASIC end pointer ($2D/$2E)
+            self.memory.write(0x002D, end_addr & 0xFF)
+            self.memory.write(0x002E, (end_addr >> 8) & 0xFF)
+            # Update variable pointers
+            self.memory.write(0x002F, end_addr & 0xFF)
+            self.memory.write(0x0030, (end_addr >> 8) & 0xFF)
+            self.memory.write(0x0031, end_addr & 0xFF)
+            self.memory.write(0x0032, (end_addr >> 8) & 0xFF)
+        
+        # Return from JSR (pop return address and continue)
+        # The JSR to $FFD5 pushed the return address on the stack
+        # We need to pop it and continue from there
+        sp = self.cpu.state.sp
+        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
+        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
+        ret_addr = ret_addr_low | (ret_addr_high << 8)
+        # JSR pushes PC+2 (where PC points to last byte of JSR instruction)
+        # RTS adds 1 to get to next instruction
+        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
+        self.cpu.state.sp = (sp + 2) & 0xFF
+        
+        return True
+
+    def _handle_kernal_save(self) -> bool:
+        """Handle KERNAL SAVE operation for virtual disk drives.
+        
+        This intercepts SAVE calls when PC is at $FFD8 and device is 8-11.
+        Returns True if SAVE was handled, False otherwise.
+        
+        KERNAL SAVE calling convention:
+        - A: Zero page pointer to start address (low byte)
+        - X: Start address low byte  
+        - Y: Start address high byte
+        - $B7: Filename length
+        - $BB-$BC: Filename pointer
+        - $BA: Device number
+        - $AE-$AF: End address + 1
+        """
+        # Check if we're at the SAVE entry point
+        if self.cpu.state.pc != 0xFFD8:
+            return False
+        
+        # Get device number from zero page
+        device = self.memory.read(0xBA)
+        
+        # Only handle disk devices (8-11)
+        if device < 8 or device > 11:
+            return False
+        
+        # Check if we have a drive attached for this device
+        drive = self.get_drive(device)
+        if not drive or not drive.has_disk():
+            # No disk attached - show error
+            if self.interface:
+                self.interface.add_debug_log(f"❌ No disk in drive {device}")
+            # Set error status
+            self.memory.write(0x90, 0x80)
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+            # Return from JSR
+            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            return True
+        
+        # Get SAVE parameters
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        
+        # Read filename from memory
+        filename_bytes = []
+        for i in range(filename_len):
+            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
+        
+        # Get start and end addresses
+        start_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+        end_addr = self.memory.read(0xAE) | (self.memory.read(0xAF) << 8)
+        
+        if self.interface:
+            self.interface.add_debug_log(
+                f"🔧 KERNAL SAVE intercepted: device={device}, file='{filename}', "
+                f"${start_addr:04X}-${end_addr:04X}"
+            )
+        
+        # Read data from memory
+        data_len = end_addr - start_addr
+        file_data = bytearray()
+        
+        # Add load address (first 2 bytes of PRG file)
+        file_data.append(start_addr & 0xFF)
+        file_data.append((start_addr >> 8) & 0xFF)
+        
+        # Read the actual data
+        for addr in range(start_addr, end_addr):
+            file_data.append(self.memory.read(addr & 0xFFFF))
+        
+        # Try to save file to disk
+        try:
+            success = drive.save_file(filename, bytes(file_data))
+            if success:
+                if self.interface:
+                    self.interface.add_debug_log(f"✅ Saved {len(file_data)} bytes to '{filename}'")
+                # Clear carry flag to indicate success
+                self.cpu.state.p &= ~0x01
+                # Clear status byte
+                self.memory.write(0x90, 0x00)
+            else:
+                if self.interface:
+                    self.interface.add_debug_log(f"❌ Failed to save '{filename}'")
+                # Set error status
+                self.memory.write(0x90, 0x40)
+                # Set carry flag to indicate error
+                self.cpu.state.p |= 0x01
+        except Exception as e:
+            if self.interface:
+                self.interface.add_debug_log(f"❌ Save error: {e}")
+            # Set error status
+            self.memory.write(0x90, 0x40)
+            # Set carry flag to indicate error
+            self.cpu.state.p |= 0x01
+        
+        # Return from JSR
+        sp = self.cpu.state.sp
+        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
+        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
+        ret_addr = ret_addr_low | (ret_addr_high << 8)
+        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
+        self.cpu.state.sp = (sp + 2) & 0xFF
+        
+        return True
+
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
         import time
@@ -694,7 +1078,35 @@ class C64:
                             self.interface.add_debug_log(f"❌ Failed to load program: {e}")
                         self.prg_file_path = None  # Clear path even on error
 
-            step_cycles = self.cpu.step(self.udp_debug, cycles)
+            # Attach disk if pending (after BASIC boot completes)
+            if self.disk_image_path and not hasattr(self, '_disk_attached_after_boot'):
+                # BASIC is ready - attach disk now (after boot has completed)
+                # Wait until we're past boot sequence
+                if cycles > BASIC_BOOT_CYCLES:
+                    try:
+                        self.attach_disk(self.disk_image_path, device=8)
+                        self.disk_image_path = None  # Clear path after attaching
+                        self._disk_attached_after_boot = True
+                        if self.interface:
+                            self.interface.add_debug_log("💾 Disk attached after BASIC boot completed")
+                        # Inject LOAD"$",8 command into keyboard buffer to list directory
+                        self._inject_load_directory_command(device=8)
+                    except Exception as e:
+                        if self.interface:
+                            self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
+                        self.disk_image_path = None  # Clear path even on error
+
+            # Check for KERNAL LOAD hook (before executing instruction)
+            if self._handle_kernal_load():
+                # LOAD was handled, skip this CPU instruction
+                continue
+
+            # Check for KERNAL SAVE hook (before executing instruction)
+            if self._handle_kernal_save():
+                # SAVE was handled, skip this CPU instruction
+                continue
+
+            step_cycles = self.cpu.step(self.udp_debug, cycles, self.vice_trace)
             cycles += step_cycles
             self.current_cycles = cycles
             self.throttle_emulation_if_needed(cycles)
@@ -730,7 +1142,11 @@ class C64:
             elif self.cpu.state.pc == last_pc:
                 # Check if we're in a graphics mode wait loop
                 mode_info = self.memory.get_display_mode()
-                in_graphics_mode = mode_info['bitmap_mode'] or self.memory.is_sprite_enabled(0)
+                in_graphics_mode = (
+                    mode_info['bitmap_mode']
+                    or mode_info.get('multicolor', False)
+                    or self.memory.is_sprite_enabled(0)
+                )
                 
                 # When the KERNAL ROM is running, input waits can loop inside the ROM.
                 if self.memory.kernal_rom and ROM_KERNAL_START <= self.cpu.state.pc < ROM_KERNAL_END:
@@ -957,7 +1373,7 @@ class C64:
         Supports bitmap mode rendering as ASCII art.
         """
         # Check if we're in bitmap mode
-        mode_info = self.memory.get_display_mode()
+        mode_info = self.memory.get_render_display_mode()
         
         if mode_info['bitmap_mode']:
             # Render bitmap mode as ASCII art
@@ -967,11 +1383,12 @@ class C64:
         # Ensure lookup table is initialized
         self._init_screen_code_table()
         
-        screen_base = mode_info['screen_base']
+        vic_bank = self.memory.get_render_vic_bank_base()
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
         color_base = COLOR_MEM
         
         # Fast dirty-check using bytes comparison
-        current_screen_bytes = bytes(self.memory.ram[screen_base:screen_base + 1000])
+        current_screen_bytes = bytes(self.memory.ram[(screen_base + i) & 0xFFFF] for i in range(1000))
         current_color_bytes = bytes(self.memory.ram[color_base:color_base + 1000])
         cursor_color = self.memory.ram[0x0286] & 0x0F
         
@@ -1030,12 +1447,13 @@ class C64:
         # Unicode block characters for different pixel densities
         BLOCKS = [' ', '░', '▒', '▓', '█']
         
-        bitmap_base = mode_info['bitmap_base']
-        screen_base = mode_info['screen_base']
+        vic_bank = self.memory.get_vic_bank_base()
+        bitmap_base = (vic_bank + mode_info['bitmap_base']) & 0xFFFF
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
         
         # For dirty checking, we'll sample the bitmap
         # (full check would be too expensive for 8000 bytes)
-        sample_bytes = bytes(self.memory.ram[bitmap_base:bitmap_base + 100])
+        sample_bytes = bytes(self.memory.ram[(bitmap_base + i) & 0xFFFF] for i in range(100))
         if hasattr(self, '_prev_bitmap_sample') and sample_bytes == self._prev_bitmap_sample:
             return False
         self._prev_bitmap_sample = sample_bytes
@@ -1049,7 +1467,7 @@ class C64:
                     char_index = char_row * 40 + char_col
                     
                     # Get bitmap data for this 8x8 block
-                    bitmap_offset = bitmap_base + char_index * 8
+                    bitmap_offset = (bitmap_base + char_index * 8) & 0xFFFF
                     
                     # Sample pixels: count set pixels in top-left 4x4 quadrant
                     # This gives us a rough density for ASCII representation
@@ -1057,10 +1475,9 @@ class C64:
                     # We map this to 5 density levels: 0-3, 4-7, 8-11, 12-15, 16
                     pixel_count = 0
                     for y in range(4):
-                        if bitmap_offset + y < len(self.memory.ram):
-                            byte = self.memory.ram[bitmap_offset + y]
-                            # Count bits in upper nibble (left 4 pixels)
-                            pixel_count += bin(byte >> 4).count('1')
+                        byte = self.memory.ram[(bitmap_offset + y) & 0xFFFF]
+                        # Count bits in upper nibble (left 4 pixels)
+                        pixel_count += bin(byte >> 4).count('1')
                     
                     # Map pixel count to block character
                     # 0 pixels = ' ', 16 pixels = '█'
@@ -1068,7 +1485,7 @@ class C64:
                     char = BLOCKS[density]
                     
                     # Get colors from screen RAM
-                    color_data = self.memory.ram[screen_base + char_index]
+                    color_data = self.memory.ram[(screen_base + char_index) & 0xFFFF]
                     if mode_info['multicolor']:
                         # In multicolor mode, use lower nibble for foreground
                         fg_color = color_data & 0x0F

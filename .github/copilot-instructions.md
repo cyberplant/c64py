@@ -181,5 +181,13 @@ while total_cycles < max_cycles:
 2. Update `GraphicsRenderer` in `graphics.py` for pygame window
 3. Test with both `--graphics` and without for text mode
 
+### Bruce Lee loader / VICE trace debugging (historical c64py env hooks removed; VICE scripts still useful)
+- **Narrative + commands:** `docs/bruce_lee_loader_investigation.md`
+- **Planning / status / next actions:** `docs/LOADER_DEBUG_PLAN.md`
+- **Automation:** `scripts/vice_monitor_client.py` (x64sc remote monitor, JSONL)
+- **Inject:** `C64.py` `--debug-inject-at-cycle`, `--debug-inject-map`, `--debug-inject-file`; `scripts/vice_mem_dump_to_inject.py`, `scripts/vice_trace_to_inject.py`
+- **Compare branch streams:** `scripts/compare_loader_branches.py` (needs large `vice_full_trace.log` locally; do not commit trace blobs)
+- **Regenerate Bruce log + compare:** `scripts/regen_bruce_fresh_compare.sh` (deprecated; exits 1 — use old revision for c64py logs)
+
 ## License
 This project is licensed under the BSD 3-Clause License. All contributions must be compatible with this license.

@@ -1,0 +1,23 @@
+# Headless --benchmark, 5M cycles, PAL, turbo, rom-dir ./roms
+# Lines: grep '^C64PY_BENCHMARK ' from stderr/stdout.
+
+# Reference run before hot-path changes (same machine class; wall time varies):
+# fast:        emulated_cpu_mhz ~0.467  wall ~10.71s
+# accurate_vic: emulated_cpu_mhz ~0.341  wall ~14.69s
+
+# After MemoryMap RAM fast path, lazy operands, Bruce gate, VIC tick + accurate loop tweaks:
+# fast:        emulated_cpu_mhz ~0.554  wall ~9.03s
+# accurate_vic: emulated_cpu_mhz ~0.353  wall ~14.16s
+
+# cProfile (2M cycles, accurate VIC): top cumulative included cpu.step, memory.read,
+# _vic_tick_one, ViciiCycleEngine.tick, _update_cia_timers.
+
+# Full stack: use ./scripts/run_benchmark.sh (default = 4 combos including graphics+ReSID).
+# Per-run tee: logs/benchmark-<timestamp>_<slug>.log
+# NDJSON metrics: logs/benchmark-log.json (see scripts/run_benchmark.sh --help)
+# Optional: --cprofile  --vice-trace  --vice-trace-wall
+
+# PyPy: `import c64py` pulls optional UI deps (rich). After `pypy3 -m pip install -e .`
+# (or install rich/textual/pygame-ce), compare:
+#   PYTHONPATH=/parent/of/c64py pypy3 c64py/scripts/profile_hotpath.py --accurate-vic 50000
+# vs the same with python3.
