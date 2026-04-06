@@ -43,3 +43,13 @@ package-dir = { c64py = "." }
 [tool.setuptools.exclude-package-data]
 c64py = ["__pycache__/*", "*.pyc", "*.pyo", "*.pyd"]
 
+# Optional native extension (install maturin, then from repo root):
+#   pip install maturin
+#   maturin develop --manifest-path rust/c64py-core/Cargo.toml
+[tool.maturin]
+manifest-path = "rust/c64py-core/Cargo.toml"
+module-name = "c64py_rust_core"
+
+[project.optional-dependencies]
+native = ["maturin>=1.7,<2"]
+

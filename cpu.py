@@ -907,6 +907,82 @@ class CPU6502:
                 self._handle_irq()
         return cycles
 
+    def _rust_fast_batch_usable(self) -> bool:
+        if os.environ.get("C64PY_USE_RUST_FAST", "1").strip().lower() in ("0", "no", "false"):
+            return False
+        try:
+            from . import _core
+        except ImportError:
+            return False
+        if not _core.is_available:
+            return False
+        if self.accurate_vic:
+            return False
+        if self.trace_enabled:
+            return False
+        if self._trace_sync_pc is not None:
+            return False
+        if self.debug_inject_at_cycle is not None or self.debug_inject_writes:
+            return False
+        sid = self.memory.sid
+        if sid is not None and getattr(sid, "_cpu_lockstep", True):
+            return False
+        if self.interface is not None:
+            return False
+        if not isinstance(self.memory.ram, bytearray):
+            return False
+        return True
+
+    def step_fast_batch(self, max_instructions: int) -> tuple[int, int]:
+        """Run up to ``max_instructions`` instructions.
+
+        Uses the optional Rust core when :meth:`_rust_fast_batch_usable` is true; otherwise
+        falls back to repeated :meth:`step`.
+
+        Returns ``(instructions_executed, cycles_emulated)``.
+        """
+        if max_instructions <= 0:
+            return 0, 0
+        if self.state.stopped:
+            return 0, 0
+        if not self._rust_fast_batch_usable():
+            ins = 0
+            cyc = 0
+            for _ in range(max_instructions):
+                if self.state.stopped:
+                    break
+                cyc += self.step()
+                ins += 1
+            return ins, cyc
+
+        from . import _core
+
+        ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped = _core.run_fast_batch(
+            self.memory,
+            max_instructions=max_instructions,
+            pc=self.state.pc,
+            a=self.state.a,
+            x=self.state.x,
+            y=self.state.y,
+            sp=self.state.sp,
+            p=self.state.p,
+            cycles=self.state.cycles,
+            stopped=self.state.stopped,
+            basic_rom=self.memory.basic_rom,
+            kernal_rom=self.memory.kernal_rom,
+            char_rom=self.memory.char_rom,
+        )
+        self.state.pc = opc
+        self.state.a = oa
+        self.state.x = ox
+        self.state.y = oy
+        self.state.sp = osp
+        self.state.p = op
+        self.state.cycles = ocycles
+        self.state.stopped = ostopped
+        self.memory.sid_tick_cpu_cycles(cyc)
+        return ins, cyc
+
     def _update_cia_timers(self, cycles: int, recompute_irq: bool = True) -> None:
         """Update CIA timers and optionally recompute pending IRQ (defer in hot inner loops)."""
         mem = self.memory

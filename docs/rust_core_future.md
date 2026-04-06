@@ -23,6 +23,41 @@ The Python layer would keep **ROM loading**, **pygame**, **CLI**, tests that com
 - **Differential:** Run the same program in Python vs Rust core for N cycles and assert identical state (or allow known divergences documented per mode).
 - **Performance:** Reuse the **swinth + graphics + ReSID + turbo** canary from [performance.md](performance.md) once the Rust path can drive the same front end.
 
-## Status
+## Status (v1 implemented)
 
-**Not implemented** in this repository as of the document date; this is a roadmap note for contributors.
+An **optional** PyO3 module `c64py_rust_core` lives under `rust/c64py-core/`. Python exposes it via `c64py._core` and `CPU6502.step_fast_batch()` when it is safe to use.
+
+### Build
+
+From the repository root (Rust stable + `maturin`):
+
+```bash
+pip install maturin
+maturin develop --manifest-path rust/c64py-core/Cargo.toml
+```
+
+Pure-Python installs are unchanged; omit the step above if you do not need the native core.
+
+### When the Rust batch runs
+
+`CPU6502.step_fast_batch(n)` calls Rust only if **all** of the following hold:
+
+- Extension import succeeds and `C64PY_USE_RUST_FAST` is not `0` / `false`.
+- **Fast VIC** (`accurate_vic` is false).
+- No **trace** (`trace_enabled` false), no **trace sync PC** env hook, no **debug inject** fields set.
+- **SID** is absent or ReSID/SID is in **decoupled** mode (`_cpu_lockstep` is false). Lockstep audio forces the Python `step()` path.
+- **`interface` is None** so the **CHROUT ($FFD2) shortcut** in `step()` is not required (Rust does not implement that shortcut).
+- `memory.ram` is a **`bytearray`** (shared copy-in/copy-out in Rust).
+
+Otherwise the same API runs **n** Python `step()` calls.
+
+### Known gaps vs full `step()`
+
+- **CHROUT / CINT** fast paths and other **interface** hooks only exist on the Python path.
+- **`--accurate-vic`**, **UDP / VICE trace**, **lockstep SID**, and **badline extra cycles** are out of scope for the Rust batch (see [emulation_modes.md](emulation_modes.md)).
+- **SID** is advanced in Python after the batch via `memory.sid_tick_cpu_cycles(total_cycles)` (decoupled mode).
+
+### Tests
+
+- Rust: `cargo test` in `rust/c64py-core/`.
+- Python differential: `test/test_rust_core_parity.py` (skipped if the extension is not built).

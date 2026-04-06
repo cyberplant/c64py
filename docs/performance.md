@@ -68,7 +68,7 @@ Mitigations and tooling live in-tree: **`C64PY_PROFILE_CPU_THREAD`**, **`scripts
 ### Closing the gap
 
 - **Python:** Batching presenter updates (fewer tiny `fill_rect` / pixel calls) is the most realistic win for **`--graphics`** without dropping features.
-- **Native core:** A **Rust** (or similar) hot loop is the intended longer-term direction; see [rust_core_future.md](rust_core_future.md).
+- **Native core:** An **optional** Rust extension (`c64py_rust_core` / `CPU6502.step_fast_batch`) exists for the fast-VIC path; see [rust_core_future.md](rust_core_future.md).
 
 Merging **`main`** with the current branch is **compatible** with accepting this throughput trade-off while accuracy and presenter behavior are locked; treat **`faf640f`** as the **performance regression anchor** for future native-core or batching work.
 
