@@ -6,7 +6,7 @@ A Commodore 64 emulator focused on text mode operation.
 Can load and run PRG files, dump memory, and communicate via TCP/UDP.
 
 Usage:
-    python C64.py [program.prg]
+    python C64.py [media.prg|media.d64|media.bas]
     python C64.py --tcp-port 1234
     python C64.py program.prg --udp-port 1235
 """
@@ -14,15 +14,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import functools
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from argparse import Namespace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # Handle both direct execution and module import
 try:
@@ -94,7 +98,66 @@ def _show_speed(
             print(f"Speed:  {mhz:.2f} MHz")
 
 
-def _print_benchmark_record(args: Namespace, emu: "C64", *, wall_start_fallback: float) -> None:
+def _unlink_if_exists(path: str) -> None:
+    try:
+        if path and os.path.isfile(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def _resolve_media_cli_arg(media_path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Classify startup media: ``(prg_path, d64_path, temp_prg_to_delete)``.
+
+    ``temp_prg_to_delete`` is set when a ``.bas`` file was converted with VICE ``petcat``.
+    """
+    path = os.path.normpath(os.path.abspath(media_path))
+    if not os.path.isfile(path):
+        print(f"ERROR: file not found: {media_path}", file=sys.stderr)
+        sys.exit(1)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".d64":
+        return None, path, None
+    if ext == ".bas":
+        petcat = shutil.which("petcat")
+        if not petcat:
+            print(
+                "ERROR: .bas files require VICE `petcat` on PATH (e.g. install the VICE package for your OS).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        fd, tmp_path = tempfile.mkstemp(prefix="c64py_", suffix=".prg")
+        os.close(fd)
+        try:
+            r = subprocess.run(
+                [petcat, "-w2", "-o", tmp_path, path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _unlink_if_exists(tmp_path)
+            print(f"ERROR: petcat failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if r.returncode != 0:
+            _unlink_if_exists(tmp_path)
+            err = (r.stderr or r.stdout or "").strip()
+            msg = f"ERROR: petcat exited {r.returncode}"
+            if err:
+                msg += f": {err}"
+            print(msg, file=sys.stderr)
+            sys.exit(1)
+        return tmp_path, None, tmp_path
+    return path, None, None
+
+
+def _print_benchmark_record(
+    args: Namespace,
+    emu: "C64",
+    *,
+    wall_start_fallback: float,
+    prg_display_basename: Optional[str] = None,
+) -> None:
     """Single-line JSON for scripts: grep '^C64PY_BENCHMARK '."""
     cycles = emu.current_cycles
     t0 = getattr(emu, "_speed_throttle_run_wall_start", None)
@@ -103,7 +166,6 @@ def _print_benchmark_record(args: Namespace, emu: "C64", *, wall_start_fallback:
     else:
         elapsed = time.perf_counter() - wall_start_fallback
     mhz = (cycles / elapsed / 1e6) if elapsed > 0 and cycles > 0 else 0.0
-    prg = getattr(args, "prg_file", None)
     rec = {
         "C64PY_BENCHMARK": 1,
         "accurate_vic": bool(emu.accurate_vic),
@@ -113,7 +175,7 @@ def _print_benchmark_record(args: Namespace, emu: "C64", *, wall_start_fallback:
         "enable_resid": bool(args.enable_resid),
         "enable_sid": bool(args.enable_sid),
         "max_cycles_arg": args.max_cycles,
-        "prg": os.path.basename(prg) if prg else None,
+        "prg": prg_display_basename,
         "schema": 1,
         "target_hz": emu.target_cpu_hz,
         "turbo": bool(args.turbo),
@@ -165,18 +227,65 @@ def _parse_debug_inject_file(path: str) -> list[tuple[int | str, int]]:
     return pairs
 
 
+def _warn_if_rust_fast_core_unavailable(
+    vic_emulation: str,
+    emu: C64,
+    *,
+    show_ui_logs: bool,
+    no_colors: bool,
+) -> None:
+    """Warn when the Rust CPU batch path is missing for modes that would use it (fast, accurate-rust)."""
+    v = os.environ.get("C64PY_USE_RUST_FAST", "1").strip().lower()
+    if v in ("0", "no", "false"):
+        return
+    # accurate-python runs the CPU in Python with per-cycle VIC in Python; Rust batch is never used.
+    if vic_emulation == "accurate-python":
+        return
+    try:
+        from . import _core
+    except ImportError:
+        from c64py import _core
+    if _core.is_available:
+        return
+    lines = (
+        "WARNING: Optional Rust CPU core (c64py_rust_core) is not installed — using the Python instruction loop.",
+        '  The "VIC emulation: …" line is only VIC-II timing. Without the extension, --vic-emulation fast is slower;',
+        "  --vic-emulation accurate-rust also loses the hybrid Rust VIC+CPU batch and falls back to Python.",
+        "  (--vic-emulation accurate-python is unchanged: it always uses Python for cycle-accurate VIC.)",
+        "  Fix (same Python / venv as this command):",
+        "    maturin develop --manifest-path rust/c64py-core/Cargo.toml",
+        "  Silence this hint on Python-only runs:  export C64PY_USE_RUST_FAST=0",
+    )
+    use_color = not no_colors and sys.stderr.isatty()
+    for line in lines:
+        if use_color:
+            print(f"\033[33m{line}\033[0m", file=sys.stderr)
+        else:
+            print(line, file=sys.stderr)
+    iface = getattr(emu, "interface", None)
+    if show_ui_logs and iface is not None and hasattr(iface, "add_debug_log"):
+        iface.add_debug_log(
+            "⚠ c64py_rust_core not loaded — CPU on Python path (see stderr).",
+            style="yellow",
+        )
+
+
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     ap = argparse.ArgumentParser(description="C64 Emulator")
-    ap.add_argument("prg_file", nargs="?", help="PRG file to load and run")
+    ap.add_argument(
+        "media_file",
+        nargs="?",
+        metavar="FILE",
+        help="PRG to load, D64 to attach as drive 8, or .bas (requires petcat) converted to PRG at startup",
+    )
     ap.add_argument(
         "--rom-dir",
         default=None,
         help="Directory containing ROM files (default: auto-detect common locations)",
     )
-    ap.add_argument("--disk", type=str, help="D64 disk image to attach to drive 8")
     ap.add_argument(
         "--disk-emulation",
         choices=("fast", "accurate"),
@@ -188,11 +297,15 @@ def main():
         ),
     )
     ap.add_argument(
-        "--render-beam",
-        action="store_true",
+        "--video-rendering",
+        choices=("fast", "accurate"),
+        default="fast",
         help=(
-            "Pygame: sample VIC/CIA2 per raster line for vertical effects (best with "
-            "--vic-emulation accurate-python; see docs/DEBUGGING.md)."
+            "Pygame output sampling. fast: one VIC latch per presented frame (default). "
+            "accurate: per-raster-line VIC + CIA2 bank for vertical splits when the Python "
+            "CPU runs every instruction (e.g. --vic-emulation accurate-python, or no Rust core); "
+            "with the Rust batch + default accurate-rust, output uses the same latch as fast. "
+            "See docs/DEBUGGING.md."
         ),
     )
     ap.add_argument(
@@ -352,14 +465,24 @@ def main():
         if args.max_cycles is None:
             args.max_cycles = 15_000_000  # Enough cycles for benchmark to complete
         # Auto-load benchmark PRG if no file specified
-        if args.prg_file is None:
+        if args.media_file is None:
             benchmark_prg = os.path.join(script_dir, "programs", "benchmark.prg")
             if os.path.exists(benchmark_prg):
-                args.prg_file = benchmark_prg
+                args.media_file = benchmark_prg
             else:
                 print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
                 print("Run: ./compile.sh to build it (needs VICE petcat).")
-    
+
+    temp_prg_cleanup: Optional[str] = None
+    prg_path: Optional[str] = None
+    disk_path: Optional[str] = None
+    if args.media_file:
+        prg_path, disk_path, temp_prg_cleanup = _resolve_media_cli_arg(args.media_file)
+        if temp_prg_cleanup:
+            atexit.register(lambda p=temp_prg_cleanup: _unlink_if_exists(p))
+
+    prg_display_basename = os.path.basename(args.media_file) if args.media_file else None
+
     # Track start time for speed calculation
     start_time = time.perf_counter()
 
@@ -419,13 +542,22 @@ def main():
         except ValueError as exc:
             print(f"ERROR: --inject-keys: {exc}", file=sys.stderr)
             sys.exit(1)
-    print(f"VIC emulation: {vic_emulation}  |  disk emulation: {args.disk_emulation}")
+    print(
+        f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}  "
+        f"|  disk emulation: {args.disk_emulation}"
+    )
     if args.debug:
         emu.cpu.enable_trace(1024)
     supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")
     if supports_ui_logs:
         emu.interface.fullscreen = args.fullscreen
     show_ui_logs = (not args.fullscreen) if supports_ui_logs else False
+    _warn_if_rust_fast_core_unavailable(
+        vic_emulation,
+        emu,
+        show_ui_logs=show_ui_logs,
+        no_colors=args.no_colors,
+    )
     if args.debug and show_ui_logs and emu.interface is not None:
         emu.interface.add_debug_log("🐛 Debug mode enabled")
 
@@ -468,10 +600,6 @@ def main():
         if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
-        emu.memory.beam_render_enabled = bool(args.render_beam)
-        if args.render_beam:
-            emu.memory.ensure_beam_buffers()
-
         # Load ROMs (auto-detect common locations if not provided).
         # Import ROM helper with support for both package and script execution.
         try:
@@ -496,15 +624,26 @@ def main():
 
             if args.disk_emulation == "accurate":
                 iec_ok = emu.initialize_iec_bus(str(rom_dir_path))
+                if not iec_ok:
+                    print(
+                        "ERROR: --disk-emulation accurate needs a 1541 DOS ROM in the ROM path "
+                        "(e.g. dos1541, d1541-325302-01.bin, or VICE DRIVES/ "
+                        "dos1541-325302-01+901229-05.bin — usually 16 KiB). "
+                        "Optional serial ROM: d1541II / 901229-05.bin (see roms.py, IEC_BUS_STATUS.md).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 if show_ui_logs and emu.interface is not None:
-                    if iec_ok:
-                        emu.interface.add_debug_log("📀 Disk emulation: accurate (IEC bus active)")
-                    else:
-                        emu.interface.add_debug_log(
-                            "📀 Disk emulation: accurate requested; IEC init failed — fast hooks only"
-                        )
+                    emu.interface.add_debug_log("📀 Disk emulation: accurate (IEC bus active)")
             elif show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("📀 Disk emulation: fast (KERNAL hooks)")
+
+            if args.video_rendering == "accurate":
+                emu.memory.beam_render_enabled = True
+                emu.memory.ensure_beam_buffers()
+                emu.memory.prime_beam_snapshots_from_current_vic()
+            else:
+                emu.memory.beam_render_enabled = False
         except Exception as e:
             # Ensure UI is not left running, then show a clear error.
             try:
@@ -516,16 +655,16 @@ def main():
             sys.exit(1)
 
         # Store PRG file path for loading after boot (BASIC boot clears $0801-$0802)
-        if args.prg_file:
-            emu.prg_file_path = args.prg_file
+        if prg_path:
+            emu.prg_file_path = prg_path
             if show_ui_logs and emu.interface is not None:
-                emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {args.prg_file}")
+                emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {prg_path}")
 
         # Store D64 disk image path for attaching after boot
-        if args.disk:
-            emu.disk_image_path = args.disk
+        if disk_path:
+            emu.disk_image_path = disk_path
             if show_ui_logs and emu.interface is not None:
-                emu.interface.add_debug_log(f"💾 D64 disk will be attached after BASIC boot: {args.disk}")
+                emu.interface.add_debug_log(f"💾 D64 disk will be attached after BASIC boot: {disk_path}")
 
         # Initialize CPU (use _read_word to ensure correct byte order and ROM mapping)
         reset_vector = emu.cpu._read_word(0xFFFC)
@@ -589,7 +728,12 @@ def main():
             # Show emulation speed
             _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
             if args.benchmark:
-                _print_benchmark_record(args, emu, wall_start_fallback=start_time)
+                _print_benchmark_record(
+                    args,
+                    emu,
+                    wall_start_fallback=start_time,
+                    prg_display_basename=prg_display_basename,
+                )
             return
 
         # Start Textual interface (unless explicitly disabled with --no-colors)
@@ -615,7 +759,12 @@ def main():
             # Show emulation speed
             _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
             if args.benchmark:
-                _print_benchmark_record(args, emu, wall_start_fallback=start_time)
+                _print_benchmark_record(
+                    args,
+                    emu,
+                    wall_start_fallback=start_time,
+                    prg_display_basename=prg_display_basename,
+                )
             return  # Exit after Textual interface closes
 
         # This code should never be reached since Textual blocks
@@ -724,7 +873,12 @@ def main():
         # Show emulation speed
         _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
         if args.benchmark:
-            _print_benchmark_record(args, emu, wall_start_fallback=start_time)
+            _print_benchmark_record(
+                args,
+                emu,
+                wall_start_fallback=start_time,
+                prg_display_basename=prg_display_basename,
+            )
 
         # Close UDP debug logger (flush all pending messages)
         if emu.udp_debug:

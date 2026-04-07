@@ -292,14 +292,19 @@ impl ViciiEngine {
         }
 
         self.raster_cycle += 1;
+        let mut line_advanced = false;
         if self.raster_cycle >= self.cycles_per_line {
             self.raster_cycle = 0;
             self.raster_line = (self.raster_line + 1) % self.num_raster_lines;
+            line_advanced = true;
             self.cycle_start_of_line();
         }
 
         mem.raster_line = self.raster_line;
         mem.raster_cycles = self.raster_cycle;
+        if line_advanced {
+            mem.beam_capture_current_line();
+        }
 
         irq_edge
     }

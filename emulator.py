@@ -842,6 +842,7 @@ class C64:
             self.iec_drives[device] = drive
         
         self.use_iec_bus = True
+        self.cpu.kernal_disk_hook_vectors = False
         if self.interface:
             self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
         return True
@@ -859,6 +860,7 @@ class C64:
         """Handle KERNAL LOAD operation for virtual disk drives.
         
         This intercepts LOAD calls when PC is at $FFD5 and device is 8-11.
+        Skipped when :attr:`use_iec_bus` is True (real KERNAL + 1541 ROM handle I/O).
         Returns True if LOAD was handled, False otherwise.
         
         KERNAL LOAD calling convention:
@@ -870,6 +872,8 @@ class C64:
         - $BA: Device number
         - $B9: Secondary address (0 = use address in X/Y, 1 = use address from file)
         """
+        if self.use_iec_bus:
+            return False
         # Check if we're at the LOAD entry point
         if self.cpu.state.pc != 0xFFD5:
             return False
@@ -976,6 +980,7 @@ class C64:
         """Handle KERNAL SAVE operation for virtual disk drives.
         
         This intercepts SAVE calls when PC is at $FFD8 and device is 8-11.
+        Skipped when :attr:`use_iec_bus` is True.
         Returns True if SAVE was handled, False otherwise.
         
         KERNAL SAVE calling convention:
@@ -987,6 +992,8 @@ class C64:
         - $BA: Device number
         - $AE-$AF: End address + 1
         """
+        if self.use_iec_bus:
+            return False
         # Check if we're at the SAVE entry point
         if self.cpu.state.pc != 0xFFD8:
             return False
@@ -1072,10 +1079,14 @@ class C64:
         return True
 
     def _step_iec_drives(self, host_cycles: int) -> None:
-        """Advance 1541 CPUs in proportion to host C64 cycles (IEC accurate mode)."""
+        """Advance 1541 CPUs in lockstep with C64 CPU cycles (IEC accurate mode).
+
+        The previous cap (128) starved the drive when the Rust batch reported thousands
+        of cycles per quantum, which broke KERNAL serial I/O (e.g. stuck on SEARCHING).
+        """
         if not self.use_iec_bus:
             return
-        n = max(1, min(int(host_cycles), 128))
+        n = max(1, int(host_cycles))
         for d in self.iec_drives.values():
             d.step(n)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -14,6 +15,7 @@ if ROOT not in sys.path:
 from c64py.emulator import C64  # noqa: E402
 from c64py.iec_bus import IECBus  # noqa: E402
 from c64py.memory import MemoryMap  # noqa: E402
+from c64py.roms import find_drive_rom  # noqa: E402
 
 
 class _FakeIECDevice:
@@ -93,7 +95,65 @@ def test_c64_disk_emulation_accurate_ctor() -> None:
     assert emu.disk_emulation == "accurate"
 
 
-def test_initialize_iec_idempotent() -> None:
+def test_kernal_load_save_hooks_skipped_when_iec_bus_active() -> None:
     emu = C64(interface_factory=lambda _e: None)
-    assert emu.initialize_iec_bus(rom_dir="__no_such_rom_dir__") is False
-    assert emu.initialize_iec_bus(rom_dir="__no_such_rom_dir__") is False
+    emu.use_iec_bus = True
+    emu.cpu.state.pc = 0xFFD5
+    assert emu._handle_kernal_load() is False
+    emu.cpu.state.pc = 0xFFD8
+    assert emu._handle_kernal_save() is False
+
+
+def test_rust_stop_pcs_omit_disk_vectors_when_kernal_disk_hooks_off() -> None:
+    from c64py.cpu import CPU6502
+    from c64py.memory import MemoryMap
+
+    cpu = CPU6502(MemoryMap())
+    assert 0xFFD5 in cpu._rust_delegate_stop_pcs()
+    assert 0xFFD8 in cpu._rust_delegate_stop_pcs()
+    cpu.kernal_disk_hook_vectors = False
+    stops = cpu._rust_delegate_stop_pcs()
+    assert 0xFFD5 not in stops
+    assert 0xFFD8 not in stops
+    assert 0xFFD2 in stops
+
+
+def test_initialize_iec_idempotent(tmp_path) -> None:
+    """Without drive ROMs in the given dir, IEC init fails; must not scan other paths."""
+    empty = tmp_path / "roms"
+    empty.mkdir()
+    with patch("c64py.roms.iter_candidate_rom_dirs", return_value=[]):
+        emu = C64(interface_factory=lambda _e: None)
+        assert emu.initialize_iec_bus(rom_dir=str(empty)) is False
+        assert emu.initialize_iec_bus(rom_dir=str(empty)) is False
+
+
+def test_find_drive_rom_vice_plus_name_16k_dos_only(tmp_path) -> None:
+    """VICE DRIVES/ ``dos1541-…+….bin`` is normally the full 16 KiB DOS image only."""
+    dos_only = bytes((i * 3) & 0xFF for i in range(16384))
+    (tmp_path / "dos1541-325302-01+901229-05.bin").write_bytes(dos_only)
+    assert find_drive_rom("dos1541", str(tmp_path)) == dos_only
+    assert find_drive_rom("serial1541", str(tmp_path)) is None
+    (tmp_path / "901229-05.bin").write_bytes(b"Z" * 8192)
+    assert find_drive_rom("serial1541", str(tmp_path)) == b"Z" * 8192
+
+
+def test_find_drive_rom_vice_combined_24k(tmp_path) -> None:
+    """Rare 24 KiB single file: DOS (16 KiB) + serial (8 KiB)."""
+    dos_part = bytes((i & 0xFF) for i in range(16384))
+    ser_part = bytes(((i + 17) & 0xFF) for i in range(8192))
+    combined = dos_part + ser_part
+    assert len(combined) == 24576
+    (tmp_path / "dos1541-325302-01+901229-05.bin").write_bytes(combined)
+
+    assert find_drive_rom("dos1541", str(tmp_path)) == dos_part
+    assert find_drive_rom("serial1541", str(tmp_path)) == ser_part
+
+
+def test_find_drive_rom_vice_combined_glob_revision(tmp_path) -> None:
+    """Glob dos1541*+*.bin with 24 KiB still splits DOS + serial."""
+    dos_part = b"D" * 16384
+    ser_part = b"S" * 8192
+    (tmp_path / "dos1541-325302-01+901229-07.bin").write_bytes(dos_part + ser_part)
+    assert find_drive_rom("dos1541", str(tmp_path)) == dos_part
+    assert find_drive_rom("serial1541", str(tmp_path)) == ser_part

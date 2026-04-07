@@ -90,6 +90,9 @@ class CPU6502:
         # (addr, val) for RAM poke, or (reg_name, val) for reg_name in a,x,y,p
         self.debug_inject_writes: list[tuple[Union[int, str], int]] = []
         self.debug_inject_done: bool = False
+        # When True, Rust batch stops at $FFD5/$FFD8 and the emulator applies Python KERNAL disk hooks.
+        # Set False when IEC 1541 emulation is active so the real KERNAL vectors run.
+        self.kernal_disk_hook_vectors: bool = True
 
         # VICE-aligned VIC-II cycle engine (PAL 6569R3 / NTSC 6567R8 cycle tables).
         self.vic = ViciiCycleEngine()
@@ -736,7 +739,7 @@ class CPU6502:
         # (:meth:`_python_only_step_pcs`, :meth:`_rust_delegate_stop_pcs`).
         # Keep a compatibility implementation so screen output works even when
         # the ROM screen editor path is not fully supported by the CPU core.
-        if pc == 0xFFD2:
+        if pc == 0xFFD2 and self.memory.kernal_shortcuts_enabled:
             # This is CHROUT - character should be in accumulator
             char = self.state.a
             self.chrout_count += 1
@@ -979,9 +982,12 @@ class CPU6502:
     def _rust_delegate_stop_pcs(self) -> list[int]:
         """PCs where a Rust batch must hand off to Python (hooks + ``step()`` shortcuts).
 
-        Includes LOAD/SAVE vectors so ``C64`` KERNAL hooks run between batches.
+        Includes LOAD/SAVE vectors when :attr:`kernal_disk_hook_vectors` is True so ``C64``
+        KERNAL hooks run between batches; omitted for IEC-accurate disk (real KERNAL).
         """
-        pcs = [0xFFD2, 0xFFD5, 0xFFD8]
+        pcs = [0xFFD2]
+        if self.kernal_disk_hook_vectors:
+            pcs.extend((0xFFD5, 0xFFD8))
         if self.memory.kernal_rom is None:
             pcs.extend((0xFF5B, 0xFFCF))
         return sorted(set(pcs))

@@ -29,8 +29,8 @@ Run the same PRG or D64 with these combinations and note **which configuration f
 
 | Beam / per-raster sampling | Flag |
 |---------------------------|------|
-| Frame latched VIC (default graphics) | omit `--render-beam` |
-| Per-raster-line VIC snapshots when the CPU advances the beam | `--render-beam` (best results with `--vic-emulation accurate-python` or small `C64PY_RUST_BATCH`; see below) |
+| Frame latched VIC (default graphics) | `--video-rendering fast` (default) |
+| Per-raster-line VIC + CIA2 samples (Python capture + Rust in-place beam buffers) | `--video-rendering accurate` (see §5) |
 
 ### Interpreting results
 
@@ -54,13 +54,17 @@ Run the same PRG or D64 with these combinations and note **which configuration f
 
 `--debug-inject-at-cycle N` with `--debug-inject-map` / `--debug-inject-file` applies pokes (and optional `a=`, `x=`, …) once the cumulative CPU cycle count reaches **N**. Useful to align state with a VICE snapshot mid-run.
 
-## 5. Beam render mode limitations
+## 5. Accurate video rendering
 
-`--render-beam` fills a per-raster-line VIC register history as the **Python** CPU path advances the raster (coarse step in `fast` mode, cycle engine in `accurate-python`). **Rust hybrid batches** advance raster inside native code without recording each line in Python; in that configuration, beam history may be incomplete and the UI may fall back to behavior closer to single-frame latch. Prefer `accurate-python` or `C64PY_RUST_BATCH=1` when debugging raster splits.
+`--video-rendering accurate` uses per-raster-line VIC register copies and CIA2 port A (VIC bank) samples. The **Python** CPU path calls `MemoryMap.beam_capture_raster_line` from the raster/VIC tick hooks. When the **Rust** fast batch runs with `MemoryMap.beam_render_enabled`, the core writes **`MemoryMap.beam_vic_flat` / `beam_cia2_flat` in place** (no full-buffer copy back per batch); pygame reads those shared bytearrays.
+
+**Border limits:** The presenter samples **one** border color (`$D020`) per raster line from that line’s VIC snapshot. Real hardware and VICE can change the border **several times on the same line**; matching that needs finer-than-line sampling (e.g. cycle-keyed VIC events), not just RAM write batching.
+
+**Charset:** The VIC-II fetches dot patterns from **character ROM** for offsets ``$1000``–``$1FFF`` inside video **banks** ``$0000`` and ``$8000``; the CPU still sees **RAM** at those physical addresses. Pygame uses `MemoryMap.read_vic_charset_glyph_rows` / `read_vic_charset_block_2k` so the boot charset at bank 0 + ``$1000`` matches hardware. For CPU-visible char ROM at ``$D000`` (CHAREN=0), `MemoryMap.read` is still correct.
 
 ## 6. TCP monitor (c64py)
 
-When started with `--monitor-port PORT`, a small line-oriented TCP server (see implementation) provides `HELP`, `REGS`, `M`, `STEP`, `G`, `BREAK`, `CLEARBREAK`, `HALT`. It forces small CPU steps for predictable stepping. This is **not** wire-compatible with VICE’s full monitor protocol.
+When started with `--monitor-port PORT`, a small line-oriented TCP server (see `monitor_tcp.py`) provides `HELP`, `REGS`, `M`, `STEP`, `GO`, `HALT`, `STOP` (sets `emu.running = False`), `BREAK`, `CLEARBREAK`, `QUIT` (closes the client connection after `OK bye`). This is **not** wire-compatible with VICE’s full monitor protocol.
 
 ## 7. VICE screenshot / frame comparison
 

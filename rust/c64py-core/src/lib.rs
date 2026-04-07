@@ -50,6 +50,8 @@ fn rust_core_version() -> &'static str {
     v_sprite_enable_mask=0,     v_cycles_per_line=63, v_num_raster_lines=312,
     resid_lib_path=None, resid_ptr=None,
     iec_enabled=false, iec_peer_clk_high=true, iec_peer_data_high=true,
+    beam_render_enabled=false, beam_nlines=0u16,
+    beam_vic_flat=None, beam_cia2_flat=None,
 ))]
 fn run_fast_batch_py<'py>(
     py: Python<'py>,
@@ -108,6 +110,10 @@ fn run_fast_batch_py<'py>(
     iec_enabled: bool,
     iec_peer_clk_high: bool,
     iec_peer_data_high: bool,
+    beam_render_enabled: bool,
+    beam_nlines: u16,
+    beam_vic_flat: Option<Bound<'py, PyByteArray>>,
+    beam_cia2_flat: Option<Bound<'py, PyByteArray>>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
         1u8
@@ -176,7 +182,51 @@ fn run_fast_batch_py<'py>(
         None
     };
 
-    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 14]), String> = (move || {
+    // Beam: raw pointers into Python-owned bytearrays (valid while buffer is not resized).
+    let mut beam_vic_ptr_usize: usize = 0;
+    let mut beam_cia2_ptr_usize: usize = 0;
+    let mut beam_capture_active = false;
+    if beam_render_enabled {
+        let n = beam_nlines as usize;
+        if n == 0 {
+            return Err(PyValueError::new_err(
+                "beam_render_enabled requires beam_nlines > 0",
+            ));
+        }
+        let Some(ref bv) = beam_vic_flat else {
+            return Err(PyValueError::new_err(
+                "beam_vic_flat is required when beam_render_enabled",
+            ));
+        };
+        let Some(ref bc) = beam_cia2_flat else {
+            return Err(PyValueError::new_err(
+                "beam_cia2_flat is required when beam_render_enabled",
+            ));
+        };
+        unsafe {
+            let vs = bv.as_bytes_mut();
+            let cs = bc.as_bytes_mut();
+            if vs.len() != n * 64 || cs.len() != n {
+                return Err(PyValueError::new_err(format!(
+                    "beam buffers must be {} and {} bytes, got {} and {}",
+                    n * 64,
+                    n,
+                    vs.len(),
+                    cs.len()
+                )));
+            }
+            let vp = vs.as_mut_ptr();
+            let cp = cs.as_mut_ptr();
+            beam_vic_ptr_usize = vp as usize;
+            beam_cia2_ptr_usize = cp as usize;
+            beam_capture_active = true;
+        }
+    }
+
+    // Run the heavy batch outside the GIL so Python-side audio/UI threads can run.
+    // Safe: we copied the bytearray into `backing` and do not touch Python objects inside.
+    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 14]), String> =
+        py.detach(move || (move || {
         let ram_arr: &mut [u8; 65536] = backing
             .as_mut_slice()
             .try_into()
@@ -214,6 +264,13 @@ fn run_fast_batch_py<'py>(
         mem.kernal_rom = kernal_rom.as_deref();
         mem.char_rom = char_rom.as_deref();
         mem.invalidate_6510_port_read_cache();
+
+        if beam_capture_active {
+            mem.beam_enabled = true;
+            mem.beam_nlines = beam_nlines;
+            mem.beam_vic_ptr = beam_vic_ptr_usize as *mut u8;
+            mem.beam_cia2_ptr = beam_cia2_ptr_usize as *mut u8;
+        }
 
         let mut resid_box: Option<Box<ResidSession>> =
             match (&resid_lib_path, resid_ptr) {
@@ -290,10 +347,12 @@ fn run_fast_batch_py<'py>(
             mem.cia1_timer_b.one_shot,
             mem.cia1_timer_b.input_mode,
         );
+        mem.beam_vic_ptr = std::ptr::null_mut();
+        mem.beam_cia2_ptr = std::ptr::null_mut();
+        mem.beam_enabled = false;
         Ok((out, backing, pcm_bytes, vpack))
-    })();
-    let (out, backing_out, pcm_bytes, vpack) =
-        result.map_err(|e: String| PyValueError::new_err(e))?;
+    })());
+    let (out, backing_out, pcm_bytes, vpack) = result.map_err(|e: String| PyValueError::new_err(e))?;
     let dst = unsafe { ram.as_bytes_mut() };
     dst.copy_from_slice(&backing_out);
 
@@ -331,6 +390,9 @@ fn run_fast_batch_py<'py>(
     ) = out;
     let vic_bytes = PyBytes::new(py, &vregs);
     let pcm_py = PyBytes::new(py, &pcm_bytes);
+    // Beam data is written in-place into Python bytearrays; keep empty trailers for tuple shape.
+    let beam_vic_py = PyBytes::new(py, &[]);
+    let beam_cia2_py = PyBytes::new(py, &[]);
     PyTuple::new(
         py,
         [
@@ -379,6 +441,8 @@ fn run_fast_batch_py<'py>(
             vpack[11].into_bound_py_any(py)?,
             vpack[12].into_bound_py_any(py)?,
             vpack[13].into_bound_py_any(py)?,
+            beam_vic_py.into_any(),
+            beam_cia2_py.into_any(),
         ],
     )
 }

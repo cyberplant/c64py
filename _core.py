@@ -6,7 +6,10 @@ Build/install: from repo root, with ``maturin`` installed::
     maturin develop --manifest-path rust/c64py-core/Cargo.toml
 
 If the extension is missing, ``is_available`` is False and callers keep using
-the pure-Python ``CPU6502.step`` path.
+the pure-Python ``CPU6502.step`` loop instead of batched Rust execution when the
+emulator would otherwise use it: ``--vic-emulation fast`` and ``accurate-rust``.
+``accurate-python`` always steps in Python with cycle-accurate VIC in Python and
+never uses this batch path, with or without the extension.
 """
 
 from __future__ import annotations
@@ -91,6 +94,27 @@ def run_fast_batch(
         peer_clk = True
         peer_data = True
 
+    beam_enabled = bool(getattr(memory, "beam_render_enabled", False))
+    beam_n = 0
+    bv_ba: Optional[bytearray] = None
+    bc_ba: Optional[bytearray] = None
+    if beam_enabled:
+        memory.ensure_beam_buffers()
+        vf = getattr(memory, "beam_vic_flat", None)
+        cf = getattr(memory, "beam_cia2_flat", None)
+        blines = memory.beam_vic_lines
+        if (
+            vf is not None
+            and cf is not None
+            and blines is not None
+            and len(vf) == len(blines) * 64
+            and len(cf) == len(blines)
+        ):
+            beam_n = len(blines)
+            bv_ba = vf
+            bc_ba = cf
+    beam_rust = bool(beam_enabled and beam_n > 0 and bv_ba is not None and bc_ba is not None)
+
     t = _rust.run_fast_batch_py(
         ram,
         max_instructions,
@@ -147,6 +171,10 @@ def run_fast_batch(
         iec_enabled,
         peer_clk,
         peer_data,
+        beam_rust,
+        beam_n if beam_rust else 0,
+        bv_ba if beam_rust else None,
+        bc_ba if beam_rust else None,
     )
     (
         ins,
@@ -194,6 +222,8 @@ def run_fast_batch(
         v_sprite_enable_mask,
         v_cycles_per_line,
         v_num_raster_lines,
+        beam_vic_bytes,
+        beam_cia2_bytes,
     ) = t
     memory.raster_line = rline
     memory.raster_cycles = rcycles
@@ -246,4 +276,7 @@ def run_fast_batch(
         memory.sid.extend_pcm_from_rust(pcm_bytes)
     if memory.iec_bus is not None:
         memory.apply_cia2_port_a_to_iec_bus()
+    # Beam VIC/CIA2: Rust wrote in-place into memory.beam_vic_flat / beam_cia2_flat.
+    if beam_rust and beam_n > 0 and getattr(memory, "beam_vic_flat", None) is not None:
+        memory.beam_snapshots_primed = True
     return ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped

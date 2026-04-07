@@ -19,7 +19,7 @@ This implementation adds basic D64 disk image support to the C64 emulator.
 - Supports multiple drives (devices 8-11)
 
 ### CLI Integration (`C64.py`)
-- New `--disk <file.d64>` option to attach a disk on startup
+- Pass a `.d64` file as the optional positional argument to attach a disk on startup
 - Automatically injects `LOAD"$",8` into keyboard buffer after BASIC boots
 - Shows disk attachment status in debug logs
 
@@ -69,7 +69,7 @@ To make disk operations work end-to-end, one of these approaches would be needed
 ### Command Line
 ```bash
 # Attach a disk on startup
-python3 C64.py --disk test-disk.d64
+python3 C64.py test-disk.d64
 
 # The emulator will:
 # 1. Boot BASIC

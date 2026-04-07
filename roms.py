@@ -77,6 +77,15 @@ DRIVE_1541_ROMS: Sequence[RomSpec] = (
     ),
 )
 
+# VICE ``DRIVES/`` often uses one file named ``dos1541-<chip>+<chip>.bin`` which is the full
+# 16 KiB DOS ROM ($C000–$FFFF); the ``+`` labels the chip IDs, not a second concatenated ROM.
+# Some archives use a rare 24 KiB image (16 KiB DOS + 8 KiB serial); we accept both sizes.
+DRIVE_1541_VICE_PLUS_NAME_ALIASES: Sequence[str] = (
+    "dos1541-325302-01+901229-05.bin",
+    "dos1541-325302-01+901229-06.bin",
+)
+DRIVE_1541_DOS_PLUS_SERIAL_SIZE = 16384 + 8192  # optional single-file DOS+serial dump
+
 
 def _required_rom_specs(*, require_char_rom: bool = True) -> Sequence[RomSpec]:
     if require_char_rom:
@@ -415,17 +424,71 @@ def ensure_roms_available(
             shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def _try_read_vice_style_1541_bundle(
+    rom_dir: Path,
+) -> Optional[tuple[bytes, Optional[bytes]]]:
+    """Parse VICE-style ``dos1541*+*.bin`` in *rom_dir*.
+
+    Returns ``(dos_16k, serial_8k_or_none)``:
+    - **16384 bytes:** entire file is the DOS ROM (usual VICE ``DRIVES/`` layout).
+    - **24576 bytes:** DOS then serial in one file (less common); serial is the trailing 8 KiB.
+    """
+    if not rom_dir.is_dir():
+        return None
+
+    def try_path(rom_path: Path) -> Optional[tuple[bytes, Optional[bytes]]]:
+        try:
+            data = rom_path.read_bytes()
+        except OSError:
+            return None
+        n = len(data)
+        if n == 16384:
+            return (data, None)
+        if n == DRIVE_1541_DOS_PLUS_SERIAL_SIZE:
+            return (data[:16384], data[16384:])
+        return None
+
+    seen: set[Path] = set()
+    for name in DRIVE_1541_VICE_PLUS_NAME_ALIASES:
+        p = (rom_dir / name).resolve()
+        if p in seen:
+            continue
+        seen.add(p)
+        if not p.is_file():
+            continue
+        got = try_path(Path(p))
+        if got is not None:
+            return got
+
+    try:
+        for rom_path in sorted(rom_dir.glob("dos1541*+*.bin")):
+            p = rom_path.resolve()
+            if p in seen:
+                continue
+            seen.add(p)
+            got = try_path(rom_path)
+            if got is not None:
+                return got
+    except OSError:
+        pass
+    return None
+
+
 def find_drive_rom(
     rom_key: str,
     explicit_rom_dir: Optional[str] = None,
 ) -> Optional[bytes]:
     """
     Find and load a 1541 drive ROM.
-    
+
+    Looks for separate DOS (16 KiB) and serial (8 KiB) files, or a VICE-style
+    ``dos1541*+*.bin`` name: usually **16 KiB** (full DOS ROM only), or **24 KiB**
+    (16 KiB DOS + 8 KiB serial concatenated).
+
     Args:
         rom_key: "dos1541" or "serial1541"
         explicit_rom_dir: Optional explicit ROM directory path
-        
+
     Returns:
         ROM data bytes if found, None otherwise
     """
@@ -437,13 +500,12 @@ def find_drive_rom(
             break
     if spec is None:
         return None
-    
-    # Search for ROM
-    candidate_dirs = []
+
+    candidate_dirs: list[Path] = []
     if explicit_rom_dir:
         candidate_dirs.append(Path(explicit_rom_dir).expanduser())
     candidate_dirs.extend(iter_candidate_rom_dirs())
-    
+
     for rom_dir in candidate_dirs:
         if not rom_dir.is_dir():
             continue
@@ -457,6 +519,20 @@ def find_drive_rom(
                         return data
                 except Exception:
                     continue
+
+    # VICE ``dos1541-…+….bin`` (16 KiB DOS, or 24 KiB DOS+serial)
+    for rom_dir in candidate_dirs:
+        if not rom_dir.is_dir():
+            continue
+        bundle = _try_read_vice_style_1541_bundle(rom_dir)
+        if bundle is None:
+            continue
+        dos16, ser8_opt = bundle
+        if rom_key == "dos1541":
+            return dos16
+        if ser8_opt is not None:
+            return ser8_opt
+
     return None
 
 

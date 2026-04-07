@@ -347,8 +347,8 @@ class TextualInterface(App):
                     if first_line:
                         self.add_debug_log(f"📝 Screen content: '{first_line}'")
 
-    def add_debug_log(self, message: str):
-        """Add a debug message"""
+    def add_debug_log(self, message: str, *, style: Optional[str] = None):
+        """Add a debug message. Use ``style='yellow'`` for prominent warnings."""
         # Skip debug logging in fullscreen mode
         if self.fullscreen:
             return
@@ -368,13 +368,16 @@ class TextualInterface(App):
 
         # Update widget if it's available
         if self.debug_logs:
-            # If this is the first time, write all buffered messages
             if not hasattr(self, '_debug_initialized'):
                 for msg in self.debug_messages:
                     self.debug_logs.write(msg)
                 self._debug_initialized = True
+            elif style == "yellow":
+                t = Text()
+                t.append(f"[{timestamp}] ")
+                t.append(message, style="bold yellow")
+                self.debug_logs.write(t)
             else:
-                # Just write the latest message
                 self.debug_logs.write(formatted_message)
 
     def _get_last_log_lines(self, count: int = 20) -> List[str]:

@@ -5,6 +5,7 @@ Pygame graphics interface for the C64 emulator.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from typing import List, Optional, Tuple, TYPE_CHECKING
@@ -28,6 +29,7 @@ from .presenter import RgbFrameBuffer
 
 if TYPE_CHECKING:
     from .emulator import C64
+    from .memory import MemoryMap
 
 
 def _env_truthy(name: str) -> bool:
@@ -105,7 +107,7 @@ class PygameInterface:
             15: (187, 187, 187),
         }
 
-    def add_debug_log(self, message: str) -> None:
+    def add_debug_log(self, message: str, *, style: Optional[str] = None) -> None:
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -113,7 +115,10 @@ class PygameInterface:
         self._log_messages.append(formatted_message)
         if len(self._log_messages) > self.max_logs:
             self._log_messages.pop(0)
-        print(formatted_message)
+        if style == "yellow" and sys.stdout.isatty():
+            print(f"\033[33m{formatted_message}\033[0m")
+        else:
+            print(formatted_message)
 
     def _get_last_log_lines(self, count: int = 20) -> List[str]:
         if not self._log_messages:
@@ -388,13 +393,11 @@ class PygameInterface:
 
                     pstats.Stats(prof).sort_stats("cumtime").print_stats(40)
 
-    def _fetch_glyph_rows(self, charset_ram_base: int, screen_code: int) -> bytes:
-        """Read 8 bytes of charset definition from the VIC 16K bank (video matrix RAM)."""
-        ram = self.emulator.memory.ram
-        addr = (charset_ram_base + screen_code * 8) & 0xFFFF
-        if addr <= 0xFFF8:
-            return bytes(ram[addr : addr + 8])
-        return bytes(ram[(addr + i) & 0xFFFF] for i in range(8))
+    def _fetch_glyph_rows(self, vic_bank_base: int, char_base: int, screen_code: int) -> bytes:
+        """Read 8 bytes of charset definition as the VIC-II fetches (incl. ROM mirror at bank+$1000)."""
+        return self.emulator.memory.read_vic_charset_glyph_rows(
+            vic_bank_base, char_base, screen_code & 0xFF
+        )
 
     def _plot_hires_text_cell(self, x: int, y: int, rows: bytes, fg_idx: int) -> None:
         """Draw an 8×8 hires glyph; unset bits leave the existing background."""
@@ -403,15 +406,6 @@ class PygameInterface:
 
     def _petscii_to_screen_code(self, petscii_char: int) -> int:
         return self.emulator._petscii_to_screen_code(petscii_char)
-
-    @staticmethod
-    def _read_wrapped_charset_block(ram: bytearray, base: int) -> bytes:
-        """Read 2048 bytes (256×8) for charset at *base*, wrapping at 64K."""
-        b = base & 0xFFFF
-        out = bytearray(2048)
-        for i in range(2048):
-            out[i] = ram[(b + i) & 0xFFFF]
-        return bytes(out)
 
     @staticmethod
     def _charset_matches_char_rom_slice(block: bytes, char_rom: Optional[bytes]) -> Optional[int]:
@@ -508,15 +502,50 @@ class PygameInterface:
                     glyph = glyphs[code][color_code]
                 dest.blit(glyph, (x, y))
 
+    @staticmethod
+    def _beam_vic_regb_view(mem: "MemoryMap", rl: int):
+        """64-byte VIC register row for raster index *rl* (flat buffer when Rust wrote in-place)."""
+        lines = mem.beam_vic_lines
+        n = len(lines) if lines else 0
+        if n <= 0:
+            return memoryview(b"")
+        rl %= n
+        flat = getattr(mem, "beam_vic_flat", None)
+        if flat is not None and len(flat) >= (rl + 1) * 64:
+            return memoryview(flat)[rl * 64 : (rl + 1) * 64]
+        if lines is not None and rl < len(lines):
+            return memoryview(lines[rl])
+        return memoryview(b"")
+
+    @staticmethod
+    def _beam_cia2_byte(mem: "MemoryMap", rl: int) -> int:
+        lines = mem.beam_cia2_lines
+        n = len(lines) if lines else 0
+        if n <= 0:
+            return 0
+        rl %= n
+        flat = getattr(mem, "beam_cia2_flat", None)
+        if flat is not None and rl < len(flat):
+            return flat[rl] & 0xFF
+        if lines is not None and rl < len(lines):
+            return lines[rl] & 0xFF
+        return 0
+
     def _render_frame_beam(self) -> None:
-        """Render using per-raster VIC snapshots (vertical splits; see docs/DEBUGGING.md)."""
+        """Accurate video rendering: one VIC/CIA2 bank sample per raster line (CLI ``--video-rendering accurate``).
+
+        Per-line data comes from :meth:`MemoryMap.beam_capture_raster_line` during Python CPU steps
+        and from the Rust fast batch when beam capture is enabled on :class:`MemoryMap`.
+        Prime once via :meth:`MemoryMap.prime_beam_snapshots_from_current_vic` so the first frame
+        is not all zeros.
+        """
         from .video_beam import content_row_to_raster_line
 
         mem = self.emulator.memory
         lines = mem.beam_vic_lines
         c2 = mem.beam_cia2_lines
         if not lines or not c2 or len(lines) != len(c2):
-            self._render_frame()
+            self._render_frame_latched()
             return
         vs = mem.video_standard
         ram = mem.ram
@@ -524,24 +553,55 @@ class PygameInterface:
         screen_top = self._screen_rect.top
         nlines = len(lines)
 
-        first_rl = content_row_to_raster_line(0, vs) % nlines
-        regb0 = lines[first_rl]
-        border_code0 = regb0[0x20] & 0x0F if len(regb0) > 0x20 else 0x0E
-        border_color0 = self._palette.get(border_code0, (0, 0, 0))
-        self._rgb_frame.fill(border_color0)
-
+        # If any content band is not plain hires text, use the fast latched renderer
+        # for interior pixels and only apply beam-accurate border colors.
+        non_text_mode = False
         for row in range(self.SCREEN_ROWS):
             rl = content_row_to_raster_line(row * self.CHAR_HEIGHT, vs) % nlines
-            regb = lines[rl]
-            pra = c2[rl] & 0xFF
-            mode_info = mem._display_mode_from_vic_bytes(regb)
+            regb_v = self._beam_vic_regb_view(mem, rl)
+            mode_info = mem._display_mode_from_vic_bytes(regb_v)
             if mode_info["bitmap_mode"] or mode_info.get("multicolor") or mode_info.get(
                 "extended_color", False
             ):
-                self._render_frame()
-                return
+                non_text_mode = True
+                break
+        if non_text_mode:
+            self._render_frame_latched()
+            self._paint_border_from_beam(mem, vs)
+            return
+
+        # Paint full frame border per raster line (top/bottom effects, stable left/right).
+        total_lines = 263 if vs == "ntsc" else 312
+        content_first = content_row_to_raster_line(0, vs)
+        content_h = 200
+        top_lines = max(0, min(total_lines, content_first))
+        bottom_lines = max(0, total_lines - (content_first + content_h))
+        border_px = int(self.border_size)
+        native_h = int(self._native_size[1]) if hasattr(self, "_native_size") else (content_h + 2 * border_px)
+        for y in range(native_h):
+            if border_px > 0 and y < border_px:
+                rl = int((y * top_lines) / border_px) if top_lines > 0 else 0
+            elif y < border_px + content_h:
+                rl = content_first + (y - border_px)
+            else:
+                yy = y - (border_px + content_h)
+                rl = (content_first + content_h) + (int((yy * bottom_lines) / border_px) if border_px > 0 else 0)
+            rl %= nlines
+            regb = self._beam_vic_regb_view(mem, rl)
+            border_code = regb[0x20] & 0x0F if len(regb) > 0x20 else 0x0E
+            if border_code == 0 and not any(regb):
+                border_code = 0x0E
+            self._rgb_frame.fill_rect(0, y, self._rgb_frame.width, 1, self._palette.get(border_code, (0, 0, 0)))
+
+        for row in range(self.SCREEN_ROWS):
+            rl = content_row_to_raster_line(row * self.CHAR_HEIGHT, vs) % nlines
+            regb = self._beam_vic_regb_view(mem, rl)
+            pra = self._beam_cia2_byte(mem, rl)
+            mode_info = mem._display_mode_from_vic_bytes(regb)
             vic_bank = (3 - (pra & 0x03)) * 0x4000
             bg_code = regb[0x21] & 0x0F if len(regb) > 0x21 else 6
+            if bg_code == 0 and not any(regb):
+                bg_code = 6
             bg_color = self._palette.get(bg_code, (0, 0, 0))
             y = screen_top + row * self.CHAR_HEIGHT
             self._rgb_frame.fill_rect(
@@ -549,7 +609,7 @@ class PygameInterface:
             )
 
             screen_base = (vic_bank + mode_info["screen_base"]) & 0xFFFF
-            charset_ram_base = (vic_bank + mode_info["char_base"]) & 0xFFFF
+            char_base = mode_info["char_base"]
             color_base = COLOR_MEM
             row_offset = row * self.SCREEN_COLS
             cursor_color = ram[0x0286] & 0x0F
@@ -564,7 +624,7 @@ class PygameInterface:
                     raw_code &= 0x7F
                 code = self._petscii_to_screen_code(raw_code)
                 x = screen_left + col * self.CHAR_WIDTH
-                row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code)
                 if reverse:
                     cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
                     self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)
@@ -572,16 +632,59 @@ class PygameInterface:
                 else:
                     self._plot_hires_text_cell(x, y, row_bytes, color_code)
 
-    def _render_frame(self) -> None:
-        """Render one frame of the C64 screen into the back buffer.
-        
-        Uses ``get_render_display_mode()`` (latched at emulated raster line 0) so we do
-        not race IRQ handlers that toggle $D011/$D016 during the frame.
+    def _paint_border_from_beam(self, mem: "MemoryMap", video_standard: str) -> None:
+        """Overlay border color from per-line beam snapshots onto an existing frame."""
+        from .video_beam import content_row_to_raster_line
+
+        lines = mem.beam_vic_lines
+        nlines = len(lines) if lines else 0
+        if nlines <= 0:
+            return
+        total_lines = 263 if video_standard == "ntsc" else 312
+        content_first = content_row_to_raster_line(0, video_standard)
+        content_h = 200
+        top_lines = max(0, min(total_lines, content_first))
+        bottom_lines = max(0, total_lines - (content_first + content_h))
+        screen_left = int(self._screen_rect.left)
+        screen_top = int(self._screen_rect.top)
+        screen_w = int(self._screen_rect.width)
+        screen_h = int(self._screen_rect.height)
+        screen_right = screen_left + screen_w
+        border_px = int(self.border_size)
+        native_h = int(self._rgb_frame.height)
+        native_w = int(self._rgb_frame.width)
+
+        for y in range(native_h):
+            if border_px > 0 and y < border_px:
+                rl = int((y * top_lines) / border_px) if top_lines > 0 else 0
+            elif y < border_px + content_h:
+                rl = content_first + (y - border_px)
+            else:
+                yy = y - (border_px + content_h)
+                rl = (content_first + content_h) + (int((yy * bottom_lines) / border_px) if border_px > 0 else 0)
+            rl %= nlines
+            regb = self._beam_vic_regb_view(mem, rl)
+            border_code = regb[0x20] & 0x0F if len(regb) > 0x20 else 0x0E
+            if border_code == 0 and not any(regb):
+                border_code = 0x0E
+            c = self._palette.get(border_code, (0, 0, 0))
+            if y < screen_top or y >= screen_top + screen_h:
+                self._rgb_frame.fill_rect(0, y, native_w, 1, c)
+            else:
+                if screen_left > 0:
+                    self._rgb_frame.fill_rect(0, y, screen_left, 1, c)
+                if screen_right < native_w:
+                    self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
+
+    def _render_frame_latched(self) -> None:
+        """Render one frame using the per-frame VIC latch (non-beam path).
+
+        **Video rendering** (host output, separate from ``--vic-emulation``):
+        - *fast* (default): one VIC snapshot per host present (``snapshot_vic_render_state`` / latch).
+        - *accurate* (``--video-rendering accurate``): beam mode uses per-raster VIC samples;
+          with the Rust core, those samples are written in-place into shared flat buffers each batch.
         """
         mem = self.emulator.memory
-        if getattr(mem, "beam_render_enabled", False) and mem.beam_vic_lines:
-            self._render_frame_beam()
-            return
         if mem.vic_render_snapshots and not mem.vic_snapshot_each_emulated_frame:
             mem.snapshot_vic_render_state()
         mode_info = mem.get_render_display_mode()
@@ -608,11 +711,10 @@ class PygameInterface:
         if simple_hires_text:
             # Fast path only when the visible charset bytes match char ROM (one-time glyph build).
             # RAM-based cache on every byte change rebuilt ~262k set_at/frame and was slower than RGB glyphs.
-            cr = self.emulator.memory.char_rom
-            charset_ram_base = (
-                self.emulator.memory.get_render_vic_bank_base() + mode_info["char_base"]
-            ) & 0xFFFF
-            block = self._read_wrapped_charset_block(self.emulator.memory.ram, charset_ram_base)
+            mmap = self.emulator.memory
+            cr = mmap.char_rom
+            vic_bank = mmap.get_render_vic_bank_base()
+            block = mmap.read_vic_charset_block_2k(vic_bank, mode_info["char_base"])
             rom_off = self._charset_matches_char_rom_slice(block, cr)
             if rom_off is not None and cr is not None:
                 self._frame_surface.fill(border_color)
@@ -640,13 +742,26 @@ class PygameInterface:
 
         # Render sprites on top
         self._render_sprites(snap)
+
+    def _render_frame(self) -> None:
+        """Render one frame into the back buffer (beam or latched)."""
+        mem = self.emulator.memory
+        if (
+            getattr(mem, "beam_render_enabled", False)
+            and mem.beam_vic_lines
+            and getattr(mem, "beam_snapshots_primed", False)
+        ):
+            self._render_frame_beam()
+            return
+        self._render_frame_latched()
     
     def _render_text_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render text mode; charset definitions are read from VIC bank RAM (as the VIC would)."""
         mem = self.emulator.memory.ram
-        vic_bank = self.emulator.memory.get_render_vic_bank_base()
+        mmap = self.emulator.memory
+        vic_bank = mmap.get_render_vic_bank_base()
         screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
-        charset_ram_base = (vic_bank + mode_info['char_base']) & 0xFFFF
+        char_base = mode_info['char_base']
         multicolor_text = mode_info.get('multicolor') and not mode_info.get('extended_color')
 
         color_base = COLOR_MEM
@@ -695,7 +810,7 @@ class PygameInterface:
                     code &= 0x3F
                     char_bg_color = self._palette.get(bg_colors[bg_index], (0, 0, 0))
                     self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, char_bg_color)
-                    row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code)
                     if reverse:
                         cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
                         self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)
@@ -703,7 +818,7 @@ class PygameInterface:
                     else:
                         self._plot_hires_text_cell(x, y, row_bytes, color_code)
                 elif multicolor_text:
-                    row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code)
                     if reverse:
                         row_bytes = bytes(b ^ 0xFF for b in row_bytes)
                     if color_code & 0x08:
@@ -724,7 +839,7 @@ class PygameInterface:
                         else:
                             self._plot_hires_text_cell(x, y, row_bytes, color_code & 0x07)
                 else:
-                    row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code)
                     if reverse:
                         cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
                         self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)

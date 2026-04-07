@@ -9,10 +9,13 @@ from __future__ import annotations
 import queue
 import socket
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
     from .emulator import C64
+
+# Returned from _dispatch to close the client connection after sending a final line.
+_MONITOR_DISCONNECT = object()
 
 
 def _parse_hex(s: str) -> int:
@@ -68,7 +71,8 @@ class C64MonitorTcpServer:
             f = conn.makefile("rwb", buffering=0)
             self._send(
                 f,
-                "c64py monitor — commands: HELP REGS STEP GO M <addr> [n] BREAK <addr> CLEARBREAK\r\n",
+                "c64py monitor — commands: HELP REGS STEP GO HALT STOP M <addr> [n] "
+                "BREAK <addr> CLEARBREAK QUIT\r\n",
             )
             while self._running and self.emu.running:
                 line = f.readline()
@@ -83,6 +87,13 @@ class C64MonitorTcpServer:
                     out = self._dispatch(cmd, parts[1:], f)
                 except Exception as exc:
                     out = f"ERROR {exc!r}\r\n"
+                if out is _MONITOR_DISCONNECT:
+                    self._send(f, "OK bye\r\n")
+                    try:
+                        f.flush()
+                    except OSError:
+                        pass
+                    break
                 self._send(f, out)
         finally:
             try:
@@ -93,12 +104,12 @@ class C64MonitorTcpServer:
     def _send(self, f, s: str) -> None:
         f.write(s.encode("ascii", errors="replace"))
 
-    def _dispatch(self, cmd: str, args: list[str], f) -> str:
+    def _dispatch(self, cmd: str, args: list[str], f) -> Union[str, object]:
         emu = self.emu
         if cmd == "HELP" or cmd == "?":
             return (
-                "REGS | STEP | GO | M <hex> [count] | BREAK <hex> | CLEARBREAK | "
-                "HALT (force single-step) | QUIT\r\n"
+                "REGS | STEP | GO | HALT | STOP (stop emulator) | M <hex> [count] | "
+                "BREAK <hex> | CLEARBREAK | QUIT (close this connection)\r\n"
             )
         if cmd == "REGS":
             st = emu.cpu.state
@@ -121,6 +132,9 @@ class C64MonitorTcpServer:
         if cmd == "HALT":
             emu.cpu._monitor_force_single = True
             return "OK single-step mode\r\n"
+        if cmd == "STOP":
+            emu.running = False
+            return "OK emulator stop requested\r\n"
         if cmd == "M":
             if not args:
                 return "ERROR M <addr> [count]\r\n"
@@ -141,5 +155,5 @@ class C64MonitorTcpServer:
             emu.monitor_breakpoints.clear()
             return "OK\r\n"
         if cmd == "QUIT":
-            return "OK bye\r\n"
+            return _MONITOR_DISCONNECT
         return f"ERROR unknown {cmd}\r\n"
