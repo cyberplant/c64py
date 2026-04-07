@@ -39,6 +39,13 @@ buffer produced by ``_render_buffer`` — the **same** int16 mono PCM sent to py
 including underrun silence — is appended. On ``close()``, a WAV file is written (sample
 rate matches the emulator, default 44100 Hz). Optional ``C64PY_RESID_WAV_MAX_SEC`` caps
 how much audio is kept (float seconds).
+
+Playback smoothness (pygame mixer)
+-----------------------------------
+SDL only sees what we ``play``/``queue``. The worker used to sleep for half a mixer buffer
+when a chunk was already queued, which delayed the *next* queue and caused audible gaps even
+when ``_pcm_pending`` was healthy. Polling uses a short sleep (default ~1–4 ms, override with
+``C64PY_RESID_QUEUE_POLL_SEC``) and we prime one follow-up buffer immediately after ``play()``.
 """
 
 from __future__ import annotations
@@ -72,6 +79,17 @@ def _resid_trace_interval_sec() -> float:
 def _env_resid_wav_path() -> Optional[str]:
     p = os.environ.get("C64PY_RESID_WAV", "").strip()
     return p if p else None
+
+
+def _env_resid_queue_poll_sleep_sec(buffer_seconds: float) -> float:
+    """How long to sleep when pygame already has a sound queued (short = refill sooner)."""
+    raw = os.environ.get("C64PY_RESID_QUEUE_POLL_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.0003, float(raw))
+        except ValueError:
+            pass
+    return min(0.004, max(0.001, buffer_seconds / 32.0))
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +269,7 @@ class ReSIDEmulator:
         self._sample_rate = int(sample_rate)
         self._buffer_samples = max(64, int(self._sample_rate * buffer_ms / 1000))
         self._buffer_seconds = self._buffer_samples / self._sample_rate
+        self._queue_poll_sleep = _env_resid_queue_poll_sleep_sec(self._buffer_seconds)
         self._sampling_method = sampling_method
 
         # Clock frequency
@@ -714,7 +733,7 @@ class ReSIDEmulator:
                     continue
 
             if self._channel.get_queue() is not None:
-                time.sleep(self._buffer_seconds / 2)
+                time.sleep(self._queue_poll_sleep)
                 continue
 
             pcm_bytes = self._render_buffer()
@@ -722,6 +741,13 @@ class ReSIDEmulator:
             if not self._channel.get_busy():
                 self._current_sound = sound
                 self._channel.play(sound)
+                # Pygame allows at most one queued chunk after the current; prime it
+                # immediately so SDL is less likely to underrun before the next loop.
+                if self._running and self._channel.get_queue() is None:
+                    pcm2 = self._render_buffer()
+                    s2 = self._pygame.mixer.Sound(buffer=pcm2)
+                    self._queued_sound = s2
+                    self._channel.queue(s2)
             else:
                 self._queued_sound = sound
                 self._channel.queue(sound)
