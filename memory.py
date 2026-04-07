@@ -3,7 +3,7 @@ C64 Memory Map
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, Union
+from typing import List, Optional, TYPE_CHECKING, Union
 
 from .constants import (
     ROM_BASIC_START, ROM_BASIC_END,
@@ -68,6 +68,10 @@ class MemoryMap:
     # When False (fast VIC + --graphics), pygame latches once per host present instead — matches
     # pre-snapshot throughput while keeping stable regs for the drawn frame.
     vic_snapshot_each_emulated_frame: bool = True
+    # Per-raster-line VIC snapshots for beam-accurate pygame (see docs/DEBUGGING.md).
+    beam_render_enabled: bool = False
+    beam_vic_lines: Optional[List[bytes]] = None
+    beam_cia2_lines: Optional[List[int]] = None
     # Cached 6510 $01 effective value for MemoryMap.read() hot path (invalidated on $00/$01 writes).
     _port01_read_cache_valid: bool = field(default=False, init=False, repr=False)
     _port01_read_cache_value: int = field(default=0, init=False, repr=False)
@@ -500,6 +504,34 @@ class MemoryMap:
             # Bits 5-6: Input mode
             self.cia1_timer_b.input_mode = (value >> 5) & 0x03
 
+    def apply_cia2_port_a_to_iec_bus(self) -> None:
+        """Apply current ``cia2_pra`` to the IEC bus (same as a write to CIA2 port A)."""
+        if self.iec_bus is None:
+            return
+        v = self.cia2_pra & 0xFF
+        atn_state = (v & 0x08) != 0
+        self.iec_bus.set_atn(atn_state)
+        self.iec_bus.set_clk("c64", (v & 0x10) != 0)
+        self.iec_bus.set_data("c64", (v & 0x20) != 0)
+
+    def ensure_beam_buffers(self) -> None:
+        """Allocate per-line VIC/CIA2 snapshot arrays for the current video standard."""
+        n = 312 if self.video_standard == "pal" else 263
+        if self.beam_vic_lines is None or len(self.beam_vic_lines) != n:
+            self.beam_vic_lines = [bytes(64) for _ in range(n)]
+            self.beam_cia2_lines = [0] * n
+
+    def beam_capture_raster_line(self, line: int) -> None:
+        """Record VIC + CIA2 PA for *line* (used by beam-accurate rendering)."""
+        if not self.beam_render_enabled:
+            return
+        self.ensure_beam_buffers()
+        assert self.beam_vic_lines is not None and self.beam_cia2_lines is not None
+        n = len(self.beam_vic_lines)
+        line %= n
+        self.beam_vic_lines[line] = bytes(self._vic_regs[:0x40])
+        self.beam_cia2_lines[line] = self.cia2_pra & 0xFF
+
     def _read_cia2(self, reg: int) -> int:
         """Read CIA2 register.
         
@@ -538,19 +570,8 @@ class MemoryMap:
         """
         if reg == 0x00:  # Port A (IEC bus control)
             self.cia2_pra = value
-            # If IEC bus is attached, update bus state
             if self.iec_bus is not None:
-                # ATN is controlled by bit 3 (inverted: 0=asserted, 1=released)
-                atn_state = (value & 0x08) != 0
-                self.iec_bus.set_atn(atn_state)
-                
-                # CLK OUT is controlled by bit 4 (inverted: 0=asserted, 1=released)
-                clk_state = (value & 0x10) != 0
-                self.iec_bus.set_clk("c64", clk_state)
-                
-                # DATA OUT is controlled by bit 5 (inverted: 0=asserted, 1=released)
-                data_state = (value & 0x20) != 0
-                self.iec_bus.set_data("c64", data_state)
+                self.apply_cia2_port_a_to_iec_bus()
         elif reg == 0x02:  # Data direction register A
             self.cia2_ddra = value
 

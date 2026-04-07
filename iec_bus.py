@@ -130,33 +130,43 @@ class IECBus:
             True if DATA is high (released), False if low (asserted)
         """
         return self.data
+
+    def peer_clk_high(self) -> bool:
+        """True if CLK is high when ignoring only the C64's contribution.
+
+        Used to merge CIA2 port A reads in the Rust fast path: the C64 pulls CLK
+        low when bit 4 of PR is 0 (released=False in ``set_clk`` terms).
+        """
+        pullers = self.clk_pullers - {"c64"}
+        return len(pullers) == 0
+
+    def peer_data_high(self) -> bool:
+        """True if DATA is high when ignoring only the C64's contribution."""
+        pullers = self.data_pullers - {"c64"}
+        return len(pullers) == 0
         
     def send_byte(self, byte: int, eoi: bool = False) -> bool:
-        """Send a byte from C64 to listener device.
-        
-        This implements the C64 side of the IEC protocol for sending data.
-        
-        Args:
-            byte: Byte to send (0-255)
-            eoi: True if this is the last byte (End Of Indicator)
-            
-        Returns:
-            True if byte was acknowledged, False on error
+        """Deliver a data byte from the C64 side to the current LISTEN device.
+
+        Full IEC bit-level timing is not modeled; this hooks the logical layer for
+        tests and future KERNAL integration.
         """
-        # This will be implemented with proper timing
-        # For now, just a placeholder
-        return True
+        self.eoi = bool(eoi)
+        if self.listener is None:
+            return False
+        for device in self.devices:
+            if device.device_number == self.listener:
+                device.receive_byte(byte & 0xFF)
+                return True
+        return False
         
     def receive_byte(self) -> Optional[int]:
-        """Receive a byte from talker device to C64.
-        
-        This implements the C64 side of the IEC protocol for receiving data.
-        
-        Returns:
-            Byte received (0-255), or None on error/timeout
-        """
-        # This will be implemented with proper timing
-        # For now, just a placeholder
+        """Pull one byte from the current TALK device, if any."""
+        if self.talker is None:
+            return None
+        for device in self.devices:
+            if device.device_number == self.talker:
+                return device.send_byte()
         return None
         
     def send_command(self, command: int) -> bool:

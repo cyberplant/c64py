@@ -5,6 +5,7 @@ C64 Emulator Main Class
 from __future__ import annotations
 
 import os
+import queue
 import struct
 import sys
 import threading
@@ -81,12 +82,19 @@ class C64:
         enable_sid: bool = False,
         enable_resid: bool = False,
         vic_emulation: str = "fast",
+        disk_emulation: str = "fast",
     ):
         allowed_vic = frozenset({"fast", "accurate-python", "accurate-rust"})
         if vic_emulation not in allowed_vic:
             raise ValueError(
                 f"vic_emulation must be one of {sorted(allowed_vic)}, got {vic_emulation!r}"
             )
+        allowed_disk = frozenset({"fast", "accurate"})
+        if disk_emulation not in allowed_disk:
+            raise ValueError(
+                f"disk_emulation must be one of {sorted(allowed_disk)}, got {disk_emulation!r}"
+            )
+        self.disk_emulation = disk_emulation
         self.vic_emulation = vic_emulation
         accurate_vic = vic_emulation != "fast"
         rust_hybrid_vic = vic_emulation == "accurate-rust"
@@ -133,6 +141,12 @@ class C64:
         # Disk drives (devices 8-11)
         self.drives: Dict[int, DiskDrive] = {}
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
+
+        self.monitor_server = None  # type: ignore[var-annotated]
+        self.monitor_breakpoints: set[int] = set()
+        self._monitor_cmd_queue: Optional[queue.Queue] = None
+        self._monitor_reply_queue: Optional[queue.Queue] = None
+        self._monitor_pending_step_ack = False
 
         # IEC serial bus for 1541 drive emulation (optional, created when needed)
         self.iec_bus: Optional[IECBus] = None
@@ -753,6 +767,9 @@ class C64:
         
         # Attach disk
         self.drives[device].attach_disk(d64, disk_path)
+        iec = self.iec_drives.get(device)
+        if iec is not None:
+            iec.attach_disk(d64, disk_path)
         
         if self.interface:
             disk_name, disk_id = d64.read_bam()
@@ -796,6 +813,9 @@ class C64:
         Returns:
             True if IEC bus was successfully initialized
         """
+        if self.iec_bus is not None:
+            return self.use_iec_bus
+
         # Try to load 1541 DOS ROM
         dos_rom = find_drive_rom("dos1541", rom_dir)
         if dos_rom is None:
@@ -1051,6 +1071,14 @@ class C64:
         self._kernal_hook_rts_return()
         return True
 
+    def _step_iec_drives(self, host_cycles: int) -> None:
+        """Advance 1541 CPUs in proportion to host C64 cycles (IEC accurate mode)."""
+        if not self.use_iec_bus:
+            return
+        n = max(1, min(int(host_cycles), 128))
+        for d in self.iec_drives.values():
+            d.step(n)
+
     def run_cpu_instruction_quantum(self, cycles_before: int) -> int:
         """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
         if self._handle_kernal_load():
@@ -1145,12 +1173,38 @@ class C64:
                             self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
                         self.disk_image_path = None  # Clear path even on error
 
+            cmd_queue = self._monitor_cmd_queue
+            if cmd_queue is not None:
+                try:
+                    while True:
+                        item = cmd_queue.get_nowait()
+                        if not item:
+                            continue
+                        if item[0] == "STEP":
+                            self.cpu._monitor_force_single = True
+                            self._monitor_pending_step_ack = True
+                        elif item[0] == "GO":
+                            self.cpu._monitor_force_single = False
+                except queue.Empty:
+                    pass
+
             step_cycles = self.run_cpu_instruction_quantum(cycles)
+            reply_queue = self._monitor_reply_queue
+            if reply_queue is not None and self._monitor_pending_step_ack:
+                self._monitor_pending_step_ack = False
+                st = self.cpu.state
+                reply_queue.put(
+                    f"PC=${st.pc:04X} A=${st.a:02X} X=${st.x:02X} Y=${st.y:02X} "
+                    f"SP=${st.sp:02X} P=${st.p:02X} CYCLES={cycles} STEP_CYCLES={step_cycles}\r\n"
+                )
             if step_cycles == 0:
                 continue
 
             cycles += step_cycles
             self.current_cycles = cycles
+            self._step_iec_drives(step_cycles)
+            if self.cpu.state.pc in self.monitor_breakpoints:
+                self.cpu._monitor_force_single = True
             self.memory.sync_joystick_inject(cycles)
             self._process_scheduled_inject_keys(
                 cycles, time.perf_counter() - inject_wall_t0

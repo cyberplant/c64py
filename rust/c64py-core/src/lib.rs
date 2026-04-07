@@ -47,8 +47,9 @@ fn rust_core_version() -> &'static str {
     v_raster_line=0, v_raster_cycle=0, v_allow_bad_lines=false, v_bad_line=false,
     v_ysmooth=0, v_den=false, v_raster_irq_line=0, v_raster_irq_triggered=false,
     v_prefetch_cycles=0, v_first_dma_line=48, v_last_dma_line=247,
-    v_sprite_enable_mask=0, v_cycles_per_line=63, v_num_raster_lines=312,
+    v_sprite_enable_mask=0,     v_cycles_per_line=63, v_num_raster_lines=312,
     resid_lib_path=None, resid_ptr=None,
+    iec_enabled=false, iec_peer_clk_high=true, iec_peer_data_high=true,
 ))]
 fn run_fast_batch_py<'py>(
     py: Python<'py>,
@@ -104,6 +105,9 @@ fn run_fast_batch_py<'py>(
     v_num_raster_lines: u16,
     resid_lib_path: Option<String>,
     resid_ptr: Option<u64>,
+    iec_enabled: bool,
+    iec_peer_clk_high: bool,
+    iec_peer_data_high: bool,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
         1u8
@@ -187,6 +191,9 @@ fn run_fast_batch_py<'py>(
         mem.cia1_icr = cia1_icr;
         mem.cia2_pra = cia2_pra;
         mem.cia2_ddra = cia2_ddra;
+        mem.iec_merge_cia2 = iec_enabled;
+        mem.iec_peer_clk_high = iec_peer_clk_high;
+        mem.iec_peer_data_high = iec_peer_data_high;
         mem.cia1_timer_a = CiaTimer {
             latch: ta_latch,
             counter: ta_counter,

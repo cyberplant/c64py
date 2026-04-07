@@ -137,6 +137,7 @@ class CPU6502:
         while self.memory.raster_cycles >= cycles_per_line:
             self.memory.raster_cycles -= cycles_per_line
             self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
+            self.memory.beam_capture_raster_line(self.memory.raster_line)
             if self.memory.raster_line == 0 and self.memory.vic_snapshot_each_emulated_frame:
                 self.memory.snapshot_vic_render_state()
 
@@ -147,8 +148,11 @@ class CPU6502:
         ba_low, ba_blocks_cpu, irq_edge = self.vic.tick()
 
         # Mirror VIC raster state into MemoryMap for $D011/$D012 reads.
+        prev_line = self.memory.raster_line
         self.memory.raster_line = self.vic.raster_line
         self.memory.raster_cycles = self.vic.raster_cycle
+        if self.memory.raster_line != prev_line:
+            self.memory.beam_capture_raster_line(self.memory.raster_line)
 
         if irq_edge:
             self.memory.trigger_vic_irq(0x01)
@@ -1088,6 +1092,8 @@ class CPU6502:
         except ValueError:
             batch_n = 64
         batch_n = max(1, min(batch_n, 10_000))
+        if getattr(self, "_monitor_force_single", False):
+            batch_n = 1
         stops = self._rust_delegate_stop_pcs()
         ins, cyc = self.step_fast_batch(batch_n, stop_pcs=stops)
         if ins == 0:

@@ -81,6 +81,16 @@ def run_fast_batch(
     else:
         stops = [int(x) & 0xFFFF for x in stop_pcs]
 
+    if memory.iec_bus is not None:
+        memory.apply_cia2_port_a_to_iec_bus()
+        iec_enabled = True
+        peer_clk = bool(memory.iec_bus.peer_clk_high())
+        peer_data = bool(memory.iec_bus.peer_data_high())
+    else:
+        iec_enabled = False
+        peer_clk = True
+        peer_data = True
+
     t = _rust.run_fast_batch_py(
         ram,
         max_instructions,
@@ -134,6 +144,9 @@ def run_fast_batch(
         312 if vic_engine is None else int(getattr(vic_engine, "num_raster_lines", 312)),
         resid_lib_path,
         None if resid_ptr is None else int(resid_ptr),
+        iec_enabled,
+        peer_clk,
+        peer_data,
     )
     (
         ins,
@@ -231,4 +244,6 @@ def run_fast_batch(
     memory.invalidate_6510_port_read_cache()
     if pcm_bytes and hasattr(memory.sid, "extend_pcm_from_rust"):
         memory.sid.extend_pcm_from_rust(pcm_bytes)
+    if memory.iec_bus is not None:
+        memory.apply_cia2_port_a_to_iec_bus()
     return ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped

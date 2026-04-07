@@ -508,6 +508,70 @@ class PygameInterface:
                     glyph = glyphs[code][color_code]
                 dest.blit(glyph, (x, y))
 
+    def _render_frame_beam(self) -> None:
+        """Render using per-raster VIC snapshots (vertical splits; see docs/DEBUGGING.md)."""
+        from .video_beam import content_row_to_raster_line
+
+        mem = self.emulator.memory
+        lines = mem.beam_vic_lines
+        c2 = mem.beam_cia2_lines
+        if not lines or not c2 or len(lines) != len(c2):
+            self._render_frame()
+            return
+        vs = mem.video_standard
+        ram = mem.ram
+        screen_left = self._screen_rect.left
+        screen_top = self._screen_rect.top
+        nlines = len(lines)
+
+        first_rl = content_row_to_raster_line(0, vs) % nlines
+        regb0 = lines[first_rl]
+        border_code0 = regb0[0x20] & 0x0F if len(regb0) > 0x20 else 0x0E
+        border_color0 = self._palette.get(border_code0, (0, 0, 0))
+        self._rgb_frame.fill(border_color0)
+
+        for row in range(self.SCREEN_ROWS):
+            rl = content_row_to_raster_line(row * self.CHAR_HEIGHT, vs) % nlines
+            regb = lines[rl]
+            pra = c2[rl] & 0xFF
+            mode_info = mem._display_mode_from_vic_bytes(regb)
+            if mode_info["bitmap_mode"] or mode_info.get("multicolor") or mode_info.get(
+                "extended_color", False
+            ):
+                self._render_frame()
+                return
+            vic_bank = (3 - (pra & 0x03)) * 0x4000
+            bg_code = regb[0x21] & 0x0F if len(regb) > 0x21 else 6
+            bg_color = self._palette.get(bg_code, (0, 0, 0))
+            y = screen_top + row * self.CHAR_HEIGHT
+            self._rgb_frame.fill_rect(
+                screen_left, y, self._screen_rect.width, self.CHAR_HEIGHT, bg_color
+            )
+
+            screen_base = (vic_bank + mode_info["screen_base"]) & 0xFFFF
+            charset_ram_base = (vic_bank + mode_info["char_base"]) & 0xFFFF
+            color_base = COLOR_MEM
+            row_offset = row * self.SCREEN_COLS
+            cursor_color = ram[0x0286] & 0x0F
+
+            for col in range(self.SCREEN_COLS):
+                idx = row_offset + col
+                raw_code = ram[(screen_base + idx) & 0xFFFF]
+                color_code = ram[color_base + idx] & 0x0F
+                reverse = False
+                if raw_code & 0x80:
+                    reverse = True
+                    raw_code &= 0x7F
+                code = self._petscii_to_screen_code(raw_code)
+                x = screen_left + col * self.CHAR_WIDTH
+                row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                if reverse:
+                    cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                    self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)
+                    self._plot_hires_text_cell(x, y, row_bytes, bg_code)
+                else:
+                    self._plot_hires_text_cell(x, y, row_bytes, color_code)
+
     def _render_frame(self) -> None:
         """Render one frame of the C64 screen into the back buffer.
         
@@ -515,6 +579,9 @@ class PygameInterface:
         not race IRQ handlers that toggle $D011/$D016 during the frame.
         """
         mem = self.emulator.memory
+        if getattr(mem, "beam_render_enabled", False) and mem.beam_vic_lines:
+            self._render_frame_beam()
+            return
         if mem.vic_render_snapshots and not mem.vic_snapshot_each_emulated_frame:
             mem.snapshot_vic_render_state()
         mode_info = mem.get_render_display_mode()

@@ -177,6 +177,31 @@ def main():
         help="Directory containing ROM files (default: auto-detect common locations)",
     )
     ap.add_argument("--disk", type=str, help="D64 disk image to attach to drive 8")
+    ap.add_argument(
+        "--disk-emulation",
+        choices=("fast", "accurate"),
+        default="fast",
+        help=(
+            "fast: KERNAL hooks + virtual DiskDrive (default). "
+            "accurate: also initialize IEC bus + 1541 ROM drives when DOS ROM is found; "
+            "interleaved drive stepping; Rust CIA2 IEC merge when IEC is active."
+        ),
+    )
+    ap.add_argument(
+        "--render-beam",
+        action="store_true",
+        help=(
+            "Pygame: sample VIC/CIA2 per raster line for vertical effects (best with "
+            "--vic-emulation accurate-python; see docs/DEBUGGING.md)."
+        ),
+    )
+    ap.add_argument(
+        "--monitor-port",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="TCP port for minimal debugger (REGS, STEP, M, BREAK); see docs/DEBUGGING.md",
+    )
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
@@ -359,6 +384,7 @@ def main():
         enable_sid=args.enable_sid,
         enable_resid=args.enable_resid,
         vic_emulation=vic_emulation,
+        disk_emulation=args.disk_emulation,
     )
     # Pygame needs latched VIC regs for rendering; headless skips copies for throughput.
     emu.memory.vic_render_snapshots = bool(args.graphics)
@@ -393,7 +419,7 @@ def main():
         except ValueError as exc:
             print(f"ERROR: --inject-keys: {exc}", file=sys.stderr)
             sys.exit(1)
-    print(f"VIC emulation: {vic_emulation}")
+    print(f"VIC emulation: {vic_emulation}  |  disk emulation: {args.disk_emulation}")
     if args.debug:
         emu.cpu.enable_trace(1024)
     supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")
@@ -442,6 +468,10 @@ def main():
         if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
+        emu.memory.beam_render_enabled = bool(args.render_beam)
+        if args.render_beam:
+            emu.memory.ensure_beam_buffers()
+
         # Load ROMs (auto-detect common locations if not provided).
         # Import ROM helper with support for both package and script execution.
         try:
@@ -463,6 +493,18 @@ def main():
             emu.load_roms(str(rom_dir_path), require_char_rom=args.graphics)
             if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"💾 ROM directory: {rom_dir_path}")
+
+            if args.disk_emulation == "accurate":
+                iec_ok = emu.initialize_iec_bus(str(rom_dir_path))
+                if show_ui_logs and emu.interface is not None:
+                    if iec_ok:
+                        emu.interface.add_debug_log("📀 Disk emulation: accurate (IEC bus active)")
+                    else:
+                        emu.interface.add_debug_log(
+                            "📀 Disk emulation: accurate requested; IEC init failed — fast hooks only"
+                        )
+            elif show_ui_logs and emu.interface is not None:
+                emu.interface.add_debug_log("📀 Disk emulation: fast (KERNAL hooks)")
         except Exception as e:
             # Ensure UI is not left running, then show a clear error.
             try:
@@ -500,6 +542,16 @@ def main():
             emu.interface.add_debug_log(
                 f"📺 Screen memory sample ($0400-$040F): {[hex(emu.memory.ram[0x0400 + i]) for i in range(16)]}"
             )
+
+        if args.monitor_port is not None:
+            try:
+                from .monitor_tcp import C64MonitorTcpServer
+            except ImportError:
+                from c64py.monitor_tcp import C64MonitorTcpServer
+
+            emu.monitor_server = C64MonitorTcpServer(emu, int(args.monitor_port))
+            emu.monitor_server.start()
+            print(f"Monitor TCP on 127.0.0.1:{int(args.monitor_port)} (see docs/DEBUGGING.md)")
 
         # Start server if requested (runs in parallel with UI)
         server = None
