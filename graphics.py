@@ -278,6 +278,7 @@ class PygameInterface:
                 max_cycles = self.max_cycles
                 last_pc = None
                 stuck_count = 0
+                inject_wall_t0 = time.perf_counter()
 
                 # Prime render latch so pygame sees consistent regs before first PAL frame completes.
                 self.emulator.memory.snapshot_vic_render_state()
@@ -324,6 +325,10 @@ class PygameInterface:
 
                     cycles += step_cycles
                     self.emulator.current_cycles = cycles
+                    self.emulator.memory.sync_joystick_inject(cycles)
+                    self.emulator._process_scheduled_inject_keys(
+                        cycles, time.perf_counter() - inject_wall_t0
+                    )
                     self.emulator.throttle_emulation_if_needed(cycles)
 
                     pc = self.emulator.cpu.state.pc

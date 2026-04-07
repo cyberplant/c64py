@@ -9,7 +9,9 @@ import struct
 import sys
 import threading
 import time
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
+
+from .keyboard_inject import InjectKeyRule
 
 try:
     import numpy as np
@@ -78,8 +80,16 @@ class C64:
         interface_factory=None,
         enable_sid: bool = False,
         enable_resid: bool = False,
-        accurate_vic: bool = False,
+        vic_emulation: str = "fast",
     ):
+        allowed_vic = frozenset({"fast", "accurate-python", "accurate-rust"})
+        if vic_emulation not in allowed_vic:
+            raise ValueError(
+                f"vic_emulation must be one of {sorted(allowed_vic)}, got {vic_emulation!r}"
+            )
+        self.vic_emulation = vic_emulation
+        accurate_vic = vic_emulation != "fast"
+        rust_hybrid_vic = vic_emulation == "accurate-rust"
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -87,7 +97,12 @@ class C64:
             self.interface = interface_factory(self)
 
         # Create CPU with interface reference
-        self.cpu = CPU6502(self.memory, self.interface, accurate_vic=accurate_vic)
+        self.cpu = CPU6502(
+            self.memory,
+            self.interface,
+            accurate_vic=accurate_vic,
+            rust_hybrid_vic=rust_hybrid_vic,
+        )
         self.accurate_vic = accurate_vic
         self.sid = None
 
@@ -113,6 +128,7 @@ class C64:
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
         self.turbo = False  # When True, no wall-clock throttling (see --turbo)
+        self.inject_key_rules: List[InjectKeyRule] = []
 
         # Disk drives (devices 8-11)
         self.drives: Dict[int, DiskDrive] = {}
@@ -575,6 +591,7 @@ class C64:
 
     def set_video_standard(self, standard: str) -> None:
         self.memory.video_standard = standard
+        self.cpu.apply_video_standard_geometry()
         if self.sid:
             self.sid.set_video_standard(standard)
 
@@ -657,6 +674,41 @@ class C64:
         
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
+
+    def _fire_inject_key_rule(self, rule: InjectKeyRule, cpu_cycles: int) -> None:
+        """Apply one ``--inject-keys`` rule (keyboard + optional joystick hold)."""
+        from .keyboard_inject import expand_inject_payload
+
+        kb, j1, j2, hold = expand_inject_payload(rule.payload_raw)
+        dropped = 0
+        for b in kb:
+            if not self.send_petscii(int(b)):
+                dropped += 1
+        if dropped and self.interface:
+            self.interface.add_debug_log(
+                f"⌨️ inject-keys: {dropped} byte(s) dropped (keyboard buffer full)"
+            )
+        until = cpu_cycles + max(hold, 0)
+        if j1:
+            self.memory.arm_joystick_inject(1, j1, until)
+        if j2:
+            self.memory.arm_joystick_inject(2, j2, until)
+        if self.interface:
+            self.interface.add_debug_log(
+                f"⌨️ inject-keys fired at cycle {cpu_cycles}: {rule.payload_raw!r}"
+            )
+
+    def _process_scheduled_inject_keys(self, cpu_cycles: int, wall_seconds: float) -> None:
+        for rule in self.inject_key_rules:
+            if rule.fired:
+                continue
+            if rule.when_cycles is not None:
+                if cpu_cycles >= rule.when_cycles:
+                    rule.fired = True
+                    self._fire_inject_key_rule(rule, cpu_cycles)
+            elif rule.when_seconds is not None and wall_seconds >= rule.when_seconds:
+                rule.fired = True
+                self._fire_inject_key_rule(rule, cpu_cycles)
 
     def _inject_load_directory_command(self, device: int = 8) -> None:
         """Inject 'LOAD"$",device' command into keyboard buffer to list disk directory."""
@@ -1052,6 +1104,7 @@ class C64:
         # Main CPU emulation loop (runs as fast as possible)
         last_time = time.time()
         last_cycle_check = 0
+        inject_wall_t0 = time.perf_counter()
 
         while self.running:
             pc = self.cpu.state.pc
@@ -1098,6 +1151,10 @@ class C64:
 
             cycles += step_cycles
             self.current_cycles = cycles
+            self.memory.sync_joystick_inject(cycles)
+            self._process_scheduled_inject_keys(
+                cycles, time.perf_counter() - inject_wall_t0
+            )
             self.throttle_emulation_if_needed(cycles)
 
             # Check if we've reached max cycles

@@ -162,8 +162,10 @@ run_one() {
   trap "rm -f '$argvf'" RETURN
 
   CMD=("C64.py" "--benchmark" "--max-cycles" "$CYCLES")
-  if [[ "$vic" != "fast" ]]; then
-    CMD+=(--accurate-vic)
+  if [[ "$vic" == "fast" ]]; then
+    CMD+=(--vic-emulation fast)
+  else
+    CMD+=(--vic-emulation accurate-python)
   fi
   if [[ "$stack" != "headless" ]]; then
     CMD+=(--graphics --enable-resid)

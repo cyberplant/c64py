@@ -11,6 +11,7 @@ name = "c64py_rust_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+libloading = "0.8"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 
 [profile.release]

@@ -56,10 +56,18 @@ if TYPE_CHECKING:
 class CPU6502:
     """6502 CPU emulator"""
 
-    def __init__(self, memory: MemoryMap, interface=None, accurate_vic: bool = False):
+    def __init__(
+        self,
+        memory: MemoryMap,
+        interface=None,
+        accurate_vic: bool = False,
+        rust_hybrid_vic: bool = False,
+    ):
         self.memory = memory
         self.interface = interface
         self.accurate_vic = accurate_vic
+        # PAL Rust VIC cycle engine during fast batch (see --vic-emulation accurate-rust).
+        self.rust_hybrid_vic = bool(rust_hybrid_vic)
         self.state = CPUState()
         # PC will be set from reset vector after ROMs are loaded
         # Don't read it here as ROMs might not be loaded yet
@@ -83,10 +91,31 @@ class CPU6502:
         self.debug_inject_writes: list[tuple[Union[int, str], int]] = []
         self.debug_inject_done: bool = False
 
-        # VICE-aligned VIC-II cycle engine (PAL 6569R3 for now).
+        # VICE-aligned VIC-II cycle engine (PAL 6569R3 / NTSC 6567R8 cycle tables).
         self.vic = ViciiCycleEngine()
         # Last (D011, D012, D015) shadow tuple applied to ViciiCycleEngine (hot path).
         self._vic_shadow_tuple: Optional[tuple[int, int, int]] = None
+        self.apply_video_standard_geometry()
+
+    def apply_video_standard_geometry(self) -> None:
+        """Set VIC cycle engine line length and raster height for PAL vs NTSC."""
+        std = (self.memory.video_standard or "pal").lower()
+        self.vic.video_standard = std
+        if std == "ntsc":
+            self.vic.cycles_per_line = 65
+            self.vic.num_raster_lines = 263
+        else:
+            self.vic.cycles_per_line = 63
+            self.vic.num_raster_lines = 312
+
+    def _rust_hybrid_vic_effective(self) -> bool:
+        """True when Rust batch should drive PAL VIC stepping (optional env opt-out)."""
+        if not self.rust_hybrid_vic:
+            return False
+        v = os.environ.get("C64PY_RUST_HYBRID_VIC", "").strip().lower()
+        if v in ("0", "no", "false", "off"):
+            return False
+        return True
 
     def _vic_sync_engine_shadow_regs(self) -> None:
         """Apply MemoryMap VIC shadow regs to ViciiCycleEngine only when they change."""
@@ -471,6 +500,7 @@ class CPU6502:
         if self._trace_sync_pc is not None and pc == self._trace_sync_pc:
             if self.accurate_vic:
                 self.vic = ViciiCycleEngine()
+                self.apply_video_standard_geometry()
             self.memory.raster_line = 0
             self.memory.raster_cycles = 0
 
@@ -920,7 +950,8 @@ class CPU6502:
             return False
         if not _core.is_available:
             return False
-        if self.accurate_vic:
+        hybrid_vic = self._rust_hybrid_vic_effective()
+        if self.accurate_vic and not hybrid_vic:
             return False
         if self.trace_enabled:
             return False
@@ -929,8 +960,14 @@ class CPU6502:
         if self.debug_inject_at_cycle is not None or self.debug_inject_writes:
             return False
         sid = self.memory.sid
-        if sid is not None and getattr(sid, "_cpu_lockstep", True):
-            return False
+        if sid is not None:
+            resid_ok = (
+                os.environ.get("C64PY_RUST_RESID_LOCKSTEP", "1").strip().lower() not in ("0", "no", "false")
+                and hasattr(sid, "rust_batch_sid_ptr")
+                and hasattr(sid, "find_resid_lib")
+            )
+            if not resid_ok:
+                return False
         if not isinstance(self.memory.ram, bytearray):
             return False
         return True
@@ -981,22 +1018,44 @@ class CPU6502:
         from . import _core
 
         stops = self._rust_delegate_stop_pcs() if stop_pcs is None else stop_pcs
-        ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped = _core.run_fast_batch(
-            self.memory,
-            max_instructions=max_instructions,
-            pc=self.state.pc,
-            a=self.state.a,
-            x=self.state.x,
-            y=self.state.y,
-            sp=self.state.sp,
-            p=self.state.p,
-            cycles=self.state.cycles,
-            stopped=self.state.stopped,
-            basic_rom=self.memory.basic_rom,
-            kernal_rom=self.memory.kernal_rom,
-            char_rom=self.memory.char_rom,
-            stop_pcs=stops,
-        )
+        hybrid_vic = self.accurate_vic and self._rust_hybrid_vic_effective()
+        sid = self.memory.sid
+        use_rust_resid = False
+        resid_lib_path = None
+        resid_ptr = None
+        if (
+            sid is not None
+            and os.environ.get("C64PY_RUST_RESID_LOCKSTEP", "1").strip().lower() not in ("0", "no", "false")
+            and hasattr(sid, "rust_batch_sid_ptr")
+            and hasattr(sid, "find_resid_lib")
+        ):
+            resid_ptr = int(sid.rust_batch_sid_ptr())
+            resid_lib_path = sid.find_resid_lib()
+            use_rust_resid = bool(resid_ptr and resid_lib_path)
+
+        def _run_batch():
+            return _core.run_fast_batch(
+                self.memory,
+                max_instructions=max_instructions,
+                pc=self.state.pc,
+                a=self.state.a,
+                x=self.state.x,
+                y=self.state.y,
+                sp=self.state.sp,
+                p=self.state.p,
+                cycles=self.state.cycles,
+                stopped=self.state.stopped,
+                basic_rom=self.memory.basic_rom,
+                kernal_rom=self.memory.kernal_rom,
+                char_rom=self.memory.char_rom,
+                stop_pcs=stops,
+                hybrid_vic_pal=hybrid_vic,
+                vic_engine=self.vic if hybrid_vic else None,
+                resid_lib_path=resid_lib_path if use_rust_resid else None,
+                resid_ptr=resid_ptr if use_rust_resid else None,
+            )
+
+        ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped = _run_batch()
         self.state.pc = opc
         self.state.a = oa
         self.state.x = ox
@@ -1005,7 +1064,8 @@ class CPU6502:
         self.state.p = op
         self.state.cycles = ocycles
         self.state.stopped = ostopped
-        self.memory.sid_tick_cpu_cycles(cyc)
+        if not use_rust_resid:
+            self.memory.sid_tick_cpu_cycles(cyc)
         return ins, cyc
 
     def cpu_step_quantum(

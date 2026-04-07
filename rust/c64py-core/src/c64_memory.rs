@@ -1,5 +1,7 @@
 //! C64 memory decode (6510 banking + I/O). Mirrors [memory.py](memory.py) read/write fast path.
 
+use crate::resid_session::ResidSession;
+
 pub const ROM_BASIC_START: u16 = 0xA000;
 pub const ROM_BASIC_END: u16 = 0xC000;
 pub const ROM_CHAR_START: u16 = 0xD000;
@@ -77,6 +79,8 @@ pub struct C64MemoryMap<'a> {
     pub cia2_ddra: u8,
     port01_cache_valid: bool,
     port01_cache_value: u8,
+    /// Set during ``run_fast_batch`` when Rust drives reSID; must be null otherwise.
+    pub resid: *mut ResidSession,
 }
 
 impl<'a> C64MemoryMap<'a> {
@@ -99,6 +103,7 @@ impl<'a> C64MemoryMap<'a> {
             cia2_ddra: 0xFF,
             port01_cache_valid: false,
             port01_cache_value: 0,
+            resid: std::ptr::null_mut(),
         }
     }
 
@@ -324,6 +329,10 @@ impl<'a> C64MemoryMap<'a> {
             return self.read_vic(addr - VIC_BASE as usize);
         }
         if (SID_BASE as usize) <= addr && addr < (SID_BASE as usize) + 0x20 {
+            if !self.resid.is_null() {
+                let off = (addr - SID_BASE as usize) as u8;
+                return unsafe { (*self.resid).read_reg(off) };
+            }
             return 0;
         }
         if (CIA1_BASE as usize) <= addr && addr < (CIA1_BASE as usize) + 0x10 {
@@ -346,6 +355,12 @@ impl<'a> C64MemoryMap<'a> {
             return;
         }
         if (SID_BASE as usize) <= addr_us && addr_us < (SID_BASE as usize) + 0x20 {
+            if !self.resid.is_null() {
+                let off = (addr_us - SID_BASE as usize) as u8;
+                unsafe {
+                    (*self.resid).write_reg(off, value);
+                }
+            }
             return;
         }
         if (CIA1_BASE as usize) <= addr_us && addr_us < (CIA1_BASE as usize) + 0x10 {

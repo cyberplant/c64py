@@ -45,9 +45,9 @@ Pure-Python installs are unchanged; omit the step above if you do not need the n
 `CPU6502.step_fast_batch(n)` calls Rust only if **all** of the following hold:
 
 - Extension import succeeds and `C64PY_USE_RUST_FAST` is not `0` / `false`.
-- **Fast VIC** (`accurate_vic` is false).
+- Either **fast VIC** (`--vic-emulation fast`) or **hybrid accurate-VIC in Rust** (CPU `rust_hybrid_vic`; **PAL or NTSC** cycle table; CLI default **`accurate-rust`**). Set `C64PY_RUST_HYBRID_VIC=0` to disable the Rust VIC step while still using other accurate semantics.
 - No **trace** (`trace_enabled` false), no **trace sync PC** env hook, no **debug inject** fields set.
-- **SID** is absent or ReSID/SID is in **decoupled** mode (`_cpu_lockstep` is false). Lockstep audio forces the Python `step()` path.
+- **SID** is absent, decoupled (`_cpu_lockstep` false), or lockstep ReSID is enabled for Rust (`C64PY_RUST_RESID_LOCKSTEP!=0` and `resid_c` path + SID pointer available).
 - `memory.ram` is a **`bytearray`** (shared copy-in/copy-out in Rust).
 
 Otherwise the same API runs **n** Python `step()` calls.
@@ -73,12 +73,13 @@ If you add new **pre-`_execute_opcode`** shortcuts in `step()`, extend **`_pytho
 ### Known gaps vs full `step()`
 
 - **CHROUT / CINT / CHRIN** shortcuts and **interface**-dependent behavior remain on the Python **`step()`** path; Rust stops at the PCs above instead of duplicating them.
-- **`--accurate-vic`**, **UDP / VICE trace**, **lockstep SID**, and **badline extra cycles** are out of scope for the Rust batch (see [emulation_modes.md](emulation_modes.md)).
-- **SID** is advanced in Python after the batch via `memory.sid_tick_cpu_cycles(total_cycles)` (decoupled mode).
+- **UDP / VICE trace** remain Python-only.
+- Hybrid PAL accurate-VIC in Rust currently omits BA/CPU stall arbitration (known gap vs full accurate-vic).
+- In lockstep ReSID mode, Rust clocks `resid_c` during the batch and returns PCM bytes for Python to append to the existing pygame queue path.
 
 ### Trying it with `C64.py`
 
-- **Rust batching is off when you pass `--accurate-vic`.** That mode uses Python `step()` with cycle-accurate VIC/BA stalls, so throughput stays similar to pre-Rust. To measure the fast core, run **without** `--accurate-vic` (default is fast VIC).
+- **`C64.py`** defaults to **`--vic-emulation accurate-rust`** (PAL hybrid in Rust when the extension is built). Use **`--vic-emulation accurate-python`** or deprecated **`--accurate-vic`** for the pure-Python per-cycle path. **`--vic-emulation fast`** restores coarse raster only.
 - **Build the extension** in the same venv you use for `python C64.py` (`maturin develop` as above). If `c64py_rust_core` is missing, the emulator silently falls back to Python `step()` only.
 - **Optional checks**
   - `C64PY_USE_RUST_FAST=0` — force the Python path (compare speed or debug).

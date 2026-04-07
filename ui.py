@@ -178,6 +178,7 @@ class TextualInterface(App):
             max_cycles = self.max_cycles
             last_pc = None
             stuck_count = 0
+            inject_wall_t0 = time.perf_counter()
 
             while self.emulator.running:
                 if max_cycles is not None and cycles >= max_cycles:
@@ -223,6 +224,10 @@ class TextualInterface(App):
 
                 cycles += step_cycles
                 self.emulator.current_cycles = cycles
+                self.emulator.memory.sync_joystick_inject(cycles)
+                self.emulator._process_scheduled_inject_keys(
+                    cycles, time.perf_counter() - inject_wall_t0
+                )
                 self.emulator.throttle_emulation_if_needed(cycles)
 
                 # Stuck detection

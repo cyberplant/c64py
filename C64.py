@@ -106,7 +106,8 @@ def _print_benchmark_record(args: Namespace, emu: "C64", *, wall_start_fallback:
     prg = getattr(args, "prg_file", None)
     rec = {
         "C64PY_BENCHMARK": 1,
-        "accurate_vic": bool(args.accurate_vic),
+        "accurate_vic": bool(emu.accurate_vic),
+        "vic_emulation": getattr(emu, "vic_emulation", "fast"),
         "cycles": cycles,
         "emulated_cpu_mhz": round(mhz, 4),
         "enable_resid": bool(args.enable_resid),
@@ -216,6 +217,18 @@ def main():
             "(requires resid_c.so – see src/resid_wrapper/README.md)"
         ),
     )
+    ap.add_argument(
+        "--inject-keys",
+        action="append",
+        default=None,
+        metavar="WHEN:WHAT",
+        help=(
+            "Schedule one keyboard/joystick inject (repeat flag for multiple). Format: "
+            "<int>c:<what> or <float>s:<what>. Only the first : splits; <what> is sent verbatim "
+            "(may start with spaces or contain text like 1c:foo). Escapes \\\\n \\\\r \\\\t; "
+            "braced {F1}-{F8}, {joy1-left}, etc. See keyboard_inject module docstring."
+        ),
+    )
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
     ap.add_argument("--vice-trace", type=str, metavar="FILE", help="Write VICE-compatible CPU trace to FILE for comparison debugging")
@@ -231,9 +244,19 @@ def main():
     )
     ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
     ap.add_argument(
+        "--vic-emulation",
+        choices=("fast", "accurate-python", "accurate-rust"),
+        default="accurate-rust",
+        help=(
+            "VIC timing: fast (coarse raster); accurate-python (per-cycle Python VIC+BA stalls); "
+            "accurate-rust (PAL hybrid VIC in optional Rust core when built — default). "
+            "NTSC accurate-rust falls back to Python accurate path."
+        ),
+    )
+    ap.add_argument(
         "--accurate-vic",
         action="store_true",
-        help="Enable cycle-accurate VIC/BA timing (slower, more accurate). Default is fast coarse VIC timing.",
+        help="Deprecated: same as --vic-emulation accurate-python (pure Python cycle VIC).",
     )
     ap.add_argument(
         "--debug-inject-at-cycle",
@@ -268,6 +291,17 @@ def main():
     )
 
     args = ap.parse_args()
+
+    if args.accurate_vic:
+        if args.vic_emulation != "accurate-python":
+            print(
+                "WARNING: --accurate-vic is deprecated; using --vic-emulation accurate-python "
+                f"(was {args.vic_emulation!r}).",
+                file=sys.stderr,
+            )
+        vic_emulation = "accurate-python"
+    else:
+        vic_emulation = args.vic_emulation
 
     has_inject_src = bool(args.debug_inject_map or args.debug_inject_file)
     if args.debug_inject_at_cycle is not None and not has_inject_src:
@@ -324,13 +358,13 @@ def main():
         interface_factory=interface_factory,
         enable_sid=args.enable_sid,
         enable_resid=args.enable_resid,
-        accurate_vic=args.accurate_vic,
+        vic_emulation=vic_emulation,
     )
     # Pygame needs latched VIC regs for rendering; headless skips copies for throughput.
     emu.memory.vic_render_snapshots = bool(args.graphics)
     # Fast VIC: latch when pygame presents (~Hz), not every emulated PAL frame (turbo regression).
     # Accurate VIC: keep CPU-thread snapshot at each emulated frame for cycle-stable sampling.
-    emu.memory.vic_snapshot_each_emulated_frame = bool(args.graphics) and bool(args.accurate_vic)
+    emu.memory.vic_snapshot_each_emulated_frame = bool(args.graphics) and bool(emu.accurate_vic)
     if args.debug_inject_at_cycle is not None:
         inject_pairs: list[tuple[int | str, int]] = []
         if args.debug_inject_file:
@@ -347,8 +381,19 @@ def main():
     emu.turbo = args.turbo
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
-    vic_mode_name = "accurate" if args.accurate_vic else "fast"
-    print(f"VIC mode: {vic_mode_name}")
+    emu.inject_key_rules = []
+    _inject_entries = args.inject_keys or []
+    if _inject_entries:
+        try:
+            from .keyboard_inject import parse_inject_key_entries
+        except ImportError:
+            from c64py.keyboard_inject import parse_inject_key_entries
+        try:
+            emu.inject_key_rules = parse_inject_key_entries(_inject_entries)
+        except ValueError as exc:
+            print(f"ERROR: --inject-keys: {exc}", file=sys.stderr)
+            sys.exit(1)
+    print(f"VIC emulation: {vic_emulation}")
     if args.debug:
         emu.cpu.enable_trace(1024)
     supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")

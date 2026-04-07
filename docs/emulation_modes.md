@@ -1,34 +1,51 @@
 # Emulation modes (VIC and audio)
 
-c64py exposes two main **VIC timing** modes and ties **ReSID** lockstep to that choice.
+c64py selects **VIC timing** via **`--vic-emulation`** and ties **ReSID** lockstep to whether the CPU path is “accurate” (non-fast) or not.
 
-## Fast VIC (default)
+## CLI: `--vic-emulation`
 
-- **CLI:** omit `--accurate-vic` (this is the default).
-- **Behavior:** Raster uses **`_advance_raster` once per completed instruction** (batched by the instruction’s cycle count), not once per CPU bus access. That matches older c64py throughput; stepping raster/CIA on every `_mr`/`_mw` was a large regression for fast mode.
-- **Throughput:** Much faster than accurate mode; suitable for games and demos when cycle-exact VIC IRQ/badline behavior is not required.
-- **Graphics:** With `--graphics`, the pygame thread uses a **latched VIC + CIA2 bank snapshot** for compositing (`MemoryMap.snapshot_vic_render_state`). **Fast VIC** sets `vic_snapshot_each_emulated_frame = False`, so the latch updates **once per host present** (before `_render_frame`), not on every emulated raster wrap — this restores throughput vs older builds while keeping stable regs for what you draw. **`--accurate-vic`** keeps **per-emulated-frame** CPU-thread snapshots for cycle-aligned sampling. **Headless** sets `vic_render_snapshots = False` so snapshots are skipped entirely.
-- **ReSID (`--enable-resid`):** The SID runs in **decoupled** mode: the CPU thread does not call into reSID every emulated cycle; the audio path advances the emulated SID clock in **larger chunks** when filling PCM buffers. Audio should still track the program well for typical music playback; **SID register readback** timing vs the CPU is **not** cycle-accurate in this mode.
+| Mode | Meaning |
+|------|---------|
+| **`accurate-rust`** | **Default for `C64.py`.** Cycle-accurate CPU stepping with VIC raster advanced in the optional **Rust** batch using the **PAL 6569** or **NTSC 6567R8** cycle table (VICE `cycle_tab_*`; hybrid, no BA CPU stalls in Rust). |
+| **`accurate-python`** | Full Python path: one **`ViciiCycleEngine.tick()`** per **CPU cycle** (BA stalls included). Same as deprecated **`--accurate-vic`**. |
+| **`fast`** | Coarse raster: **`_advance_raster` once per completed instruction** — highest throughput; less exact VIC IRQ/badline behavior. |
 
-## Accurate VIC (`--accurate-vic`)
+Opt out of the Rust VIC step while keeping **`accurate-rust`** selected: set **`C64PY_RUST_HYBRID_VIC=0`** (Python accurate VIC during batches).
 
-- **Behavior:** One **`ViciiCycleEngine.tick()`** per **CPU cycle**, aligned with the current PAL/NTSC model. IRQ and badline-related cases match VICE much more closely.
-- **Cost:** Substantially slower; intended for regression tests and difficult VIC timing.
-- **ReSID:** **`cpu_lockstep=True`** — SID advancement stays tied to the CPU thread per emulated cycle (slower, closer for code that polls SID state).
+Programmatic **`C64(..., vic_emulation=...)`** defaults to **`fast`** so tests and embedders keep the lighter path unless they opt in.
+
+## Fast VIC (`--vic-emulation fast`)
+
+- **Behavior:** Raster uses **`_advance_raster` once per completed instruction** (batched by the instruction’s cycle count), not once per CPU bus access.
+- **Throughput:** Much faster than accurate modes; suitable when cycle-exact VIC IRQ/badline behavior is not required.
+- **Graphics:** With `--graphics`, **fast** uses **present-time** latching (`vic_snapshot_each_emulated_frame = False` in `C64.py`): the latch updates around each host **present**, not every emulated frame.
+- **ReSID (`--enable-resid`):** **Decoupled** mode — the audio thread advances reSID in larger chunks; SID readback vs CPU is not cycle-accurate.
+
+## Accurate Python (`--vic-emulation accurate-python` or `--accurate-vic`)
+
+- **Behavior:** One **`ViciiCycleEngine.tick()`** per **CPU cycle**, with BA stall rules. IRQ and badline-related cases match VICE much more closely.
+- **Cost:** Slowest; intended for regression tests and difficult VIC timing.
+- **ReSID:** **`cpu_lockstep=True`** when ReSID is enabled — SID tied to the CPU thread per emulated cycle.
+
+## Accurate Rust (`--vic-emulation accurate-rust`, default)
+
+- **Behavior:** Same CPU instruction semantics as accurate modes; on **PAL** with **`c64py_rust_core`** installed, the inner batch advances VIC via the Rust hybrid engine (see [rust_core_future.md](rust_core_future.md)). **Known gap:** no BA/CPU stall arbitration in Rust vs full Python accurate path.
+- **ReSID:** With **`--enable-resid`**, Rust can drive **`resid_c`** during batches when the shared library is found; PCM is queued for pygame as today.
+- **Graphics + PAL:** Frame snapshots after Rust batches match the Python accurate path so pygame sees stable latched regs.
 
 ## Choosing a mode
 
 | Goal | Suggestion |
 |------|------------|
-| Everyday play, benchmarks, pygame + music | Fast VIC (default) |
-| VIC IRQ / raster / badline tests, VICE parity | `--accurate-vic` |
-| SID readback / sample timing vs CPU | `--accurate-vic` + `--enable-resid` |
+| Normal `C64.py` use (default) | **`accurate-rust`** (build Rust core for full speed) |
+| Maximum headless throughput | **`--vic-emulation fast`** |
+| VICE parity / BA stalls | **`accurate-python`** or **`--accurate-vic`** |
 
 ## Related code
 
-- `C64.py` / `emulator.py`: `accurate_vic` passed into `CPU6502` and ReSID construction.
-- `cpu.py`: `accurate_vic` selects `_vic_tick_one` vs `_advance_raster` in the step loop.
-- `resid.py`: `ReSIDEmulator(..., cpu_lockstep=...)`.
-- `memory.py`: `vic_render_snapshots` enables snapshot copies; `vic_snapshot_each_emulated_frame` selects **CPU-thread** (accurate + graphics) vs **present-time** (fast + graphics) latching — wired in `C64.py`.
+- `C64.py`: resolves **`vic_emulation`**; deprecated **`--accurate-vic`** → **`accurate-python`**.
+- `emulator.py` / `cpu.py`: **`vic_emulation`** → **`accurate_vic`**, **`rust_hybrid_vic`**, **`CPU6502`** construction.
+- `resid.py`: **`ReSIDEmulator(..., cpu_lockstep=accurate_vic)`**.
+- `memory.py`: **`vic_render_snapshots`**, **`vic_snapshot_each_emulated_frame`**.
 
 See [performance.md](performance.md) for benchmark commands and the **graphics + ReSID + turbo** regression canary.

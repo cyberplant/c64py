@@ -47,6 +47,10 @@ def run_fast_batch(
     kernal_rom: Optional[bytes] = None,
     char_rom: Optional[bytes] = None,
     stop_pcs: Optional[Sequence[int]] = None,
+    hybrid_vic_pal: bool = False,  # misnomer: enables Rust hybrid VIC for PAL or NTSC
+    vic_engine: Optional[object] = None,
+    resid_lib_path: Optional[str] = None,
+    resid_ptr: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, int, bool]:
     """Run the Rust fast batch; sync ``memory.ram`` via a shared ``bytearray``.
 
@@ -59,6 +63,8 @@ def run_fast_batch(
     ram = memory.ram
     if not isinstance(ram, bytearray):
         raise TypeError("memory.ram must be a bytearray for the Rust fast path")
+    old_v_line = int(getattr(vic_engine, "raster_line", 0)) if vic_engine is not None else 0
+    old_v_cycle = int(getattr(vic_engine, "raster_cycle", 0)) if vic_engine is not None else 0
     vic = memory._vic_regs
     if len(vic) != 64:
         raise ValueError("VIC register shadow must be 64 bytes")
@@ -111,6 +117,23 @@ def run_fast_batch(
         None if kernal_rom is None else bytes(kernal_rom),
         None if char_rom is None else bytes(char_rom),
         stops,
+        bool(hybrid_vic_pal),
+        0 if vic_engine is None else int(getattr(vic_engine, "raster_line", 0)),
+        0 if vic_engine is None else int(getattr(vic_engine, "raster_cycle", 0)),
+        False if vic_engine is None else bool(getattr(vic_engine, "allow_bad_lines", False)),
+        False if vic_engine is None else bool(getattr(vic_engine, "bad_line", False)),
+        0 if vic_engine is None else int(getattr(vic_engine, "ysmooth", 0)),
+        False if vic_engine is None else bool(getattr(vic_engine, "den", False)),
+        0 if vic_engine is None else int(getattr(vic_engine, "raster_irq_line", 0)),
+        False if vic_engine is None else bool(getattr(vic_engine, "raster_irq_triggered", False)),
+        0 if vic_engine is None else int(getattr(vic_engine, "prefetch_cycles", 0)),
+        48 if vic_engine is None else int(getattr(vic_engine, "first_dma_line", 48)),
+        247 if vic_engine is None else int(getattr(vic_engine, "last_dma_line", 247)),
+        0 if vic_engine is None else int(getattr(vic_engine, "sprite_enable_mask", 0)),
+        63 if vic_engine is None else int(getattr(vic_engine, "cycles_per_line", 63)),
+        312 if vic_engine is None else int(getattr(vic_engine, "num_raster_lines", 312)),
+        resid_lib_path,
+        None if resid_ptr is None else int(resid_ptr),
     )
     (
         ins,
@@ -143,6 +166,21 @@ def run_fast_batch(
         tbie,
         tbos,
         tbi,
+        pcm_bytes,
+        v_raster_line,
+        v_raster_cycle,
+        v_allow_bad_lines,
+        v_bad_line,
+        v_ysmooth,
+        v_den,
+        v_raster_irq_line,
+        v_raster_irq_triggered,
+        v_prefetch_cycles,
+        v_first_dma_line,
+        v_last_dma_line,
+        v_sprite_enable_mask,
+        v_cycles_per_line,
+        v_num_raster_lines,
     ) = t
     memory.raster_line = rline
     memory.raster_cycles = rcycles
@@ -164,5 +202,33 @@ def run_fast_batch(
     tb.irq_enabled = tbie
     tb.one_shot = tbos
     tb.input_mode = tbi
+    if vic_engine is not None:
+        vic_engine.raster_line = int(v_raster_line)
+        vic_engine.raster_cycle = int(v_raster_cycle)
+        vic_engine.allow_bad_lines = bool(v_allow_bad_lines)
+        vic_engine.bad_line = bool(v_bad_line)
+        vic_engine.ysmooth = int(v_ysmooth)
+        vic_engine.den = bool(v_den)
+        vic_engine.raster_irq_line = int(v_raster_irq_line)
+        vic_engine.raster_irq_triggered = bool(v_raster_irq_triggered)
+        vic_engine.prefetch_cycles = int(v_prefetch_cycles)
+        vic_engine.first_dma_line = int(v_first_dma_line)
+        vic_engine.last_dma_line = int(v_last_dma_line)
+        vic_engine.sprite_enable_mask = int(v_sprite_enable_mask)
+        vic_engine.cycles_per_line = int(v_cycles_per_line)
+        vic_engine.num_raster_lines = int(v_num_raster_lines)
+        if hybrid_vic_pal and memory.vic_snapshot_each_emulated_frame:
+            # Rust hybrid VIC advances per emulated CPU cycle; detect frame wrap(s) in batch and
+            # preserve the same render-latch behavior as Python accurate path.
+            frame_len = int(vic_engine.cycles_per_line) * int(vic_engine.num_raster_lines)
+            if frame_len > 0 and cyc > 0:
+                old_pos = old_v_line * int(vic_engine.cycles_per_line) + old_v_cycle
+                to_wrap = frame_len - old_pos
+                if to_wrap <= 0:
+                    to_wrap = frame_len
+                if cyc >= to_wrap:
+                    memory.snapshot_vic_render_state()
     memory.invalidate_6510_port_read_cache()
+    if pcm_bytes and hasattr(memory.sid, "extend_pcm_from_rust"):
+        memory.sid.extend_pcm_from_rust(pcm_bytes)
     return ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped
