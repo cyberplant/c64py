@@ -289,6 +289,7 @@ class PygameInterface:
                 self.emulator.memory.snapshot_vic_render_state()
 
                 while self.emulator.running:
+                    self.emulator.sync_keyboard_host_queue()
                     if max_cycles is not None and cycles >= max_cycles:
                         if hasattr(self.emulator, "autoquit") and self.emulator.autoquit:
                             self.emulator.running = False
@@ -330,6 +331,7 @@ class PygameInterface:
 
                     cycles += step_cycles
                     self.emulator.current_cycles = cycles
+                    self.emulator._step_iec_drives(step_cycles)
                     self.emulator.memory.sync_joystick_inject(cycles)
                     self.emulator._process_scheduled_inject_keys(
                         cycles, time.perf_counter() - inject_wall_t0

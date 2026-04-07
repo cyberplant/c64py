@@ -38,7 +38,7 @@ match opcode {
             return ldx_abs(cpu, mem);
             },
             0xb6 => {
-            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.y) & 0xFF;
+            let zp_addr = (mr(mem, cpu, cpu.pc.wrapping_add(1)) + cpu.y) & 0xFF;
             cpu.x = mr(mem, cpu, u16::from(zp_addr));
             update_nz(cpu, cpu.x);
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
@@ -110,7 +110,7 @@ match opcode {
             return 3;
             },
             0xa3 => {
-            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x) & 0xFF;
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
             let addr: u16 = u16::from(mr(mem, cpu, u16::from(zp_addr))) | (u16::from(mr(mem, cpu, zp_addr.wrapping_add(1) as u16)) << 8);
             cpu.a = mr(mem, cpu, addr);
             cpu.x = cpu.a;
@@ -120,11 +120,11 @@ match opcode {
             },
             0xc7 => {
             let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1));
-            let value = mr(mem, cpu, u16::from(zp_addr)).wrapping_sub(1);
+            let value = (mr(mem, cpu, u16::from(zp_addr)) - 1) & 0xFF;
             mw(mem, cpu, zp_addr as u16, value);
-            let result = i32::from(cpu.a) - i32::from(value);
+            let result = cpu.a - value;
             set_flag(cpu, 0x01, result >= 0);
-            set_flag(cpu, 0x02, (result & 0xFF) == 0);
+            set_flag(cpu, 0x02, result == 0);
             set_flag(cpu, 0x80, (result & 0x80) != 0);
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
             return 5;
@@ -157,7 +157,7 @@ match opcode {
             return sbc_zp(cpu, mem);
             },
             0xf5 => {
-            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x) & 0xFF;
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
             let value = mr(mem, cpu, u16::from(zp_addr));
             let carry: u8 = if (cpu.p & 0x01) != 0 { 1 } else { 0 };
             let result: i32 = i32::from(cpu.a) - i32::from(value) - (1 - i32::from(carry));
@@ -169,7 +169,7 @@ match opcode {
             return 4;
             },
             0xe1 => {
-            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x) & 0xFF;
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
             let addr_low = mr(mem, cpu, u16::from(zp_addr));
             let addr_high = mr(mem, cpu, zp_addr.wrapping_add(1) as u16);
             let addr: u16 = u16::from(addr_low) | (u16::from(addr_high) << 8);
@@ -324,7 +324,7 @@ match opcode {
             return cpy_abs(cpu, mem);
             },
             0xc1 => {
-            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x) & 0xFF;
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
             let addr: u16 = u16::from(mr(mem, cpu, u16::from(zp_addr))) | (u16::from(mr(mem, cpu, zp_addr.wrapping_add(1) as u16)) << 8);
             let value = mr(mem, cpu, addr);
             let result = cpu.a.wrapping_sub(value);
@@ -344,8 +344,37 @@ match opcode {
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
             return if page_crossed(base, cpu.y) { 6 } else { 5 };
             },
+            0xd5 => {
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
+            let value = mr(mem, cpu, u16::from(zp_addr));
+            let result = cpu.a.wrapping_sub(value);
+            set_flag(cpu, 0x01, cpu.a >= value);
+            update_nz(cpu, result);
+            cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
+            return 4;
+            },
+            0xd6 => {
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
+            let old = mr(mem, cpu, u16::from(zp_addr));
+            rmw_dummy_6510(mem, cpu, u16::from(zp_addr), old);
+            let value = old.wrapping_sub(1);
+            mw(mem, cpu, zp_addr as u16, value);
+            update_nz(cpu, value);
+            cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
+            return 6;
+            },
             0xe6 => {
             return inc_zp(cpu, mem);
+            },
+            0xf6 => {
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);
+            let old = mr(mem, cpu, u16::from(zp_addr));
+            rmw_dummy_6510(mem, cpu, u16::from(zp_addr), old);
+            let value = old.wrapping_add(1);
+            mw(mem, cpu, zp_addr as u16, value);
+            update_nz(cpu, value);
+            cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
+            return 6;
             },
             0xee => {
             return inc_abs(cpu, mem);
@@ -491,7 +520,7 @@ match opcode {
             return plp(cpu, mem);
             },
             0x7a => {
-            cpu.sp = cpu.sp.wrapping_add(1);
+            cpu.sp = (cpu.sp + 1) & 0xFF;
             cpu.y = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16));
             update_nz(cpu, cpu.y);
             cpu.pc = (cpu.pc.wrapping_add(1)) & 0xFFFF;
@@ -542,7 +571,7 @@ match opcode {
             0xff => {
             let base = read_word_at(mem, cpu.pc.wrapping_add(1));
             let addr = base.wrapping_add(cpu.x as u16);
-            let value = mr(mem, cpu, addr).wrapping_add(1);
+            let value = (mr(mem, cpu, addr) + 1) & 0xFF;
             mw(mem, cpu, addr, value);
             let carry: u8 = if (cpu.p & 0x01) != 0 { 1 } else { 0 };
             let result: i32 = i32::from(cpu.a) - i32::from(value) - (1 - i32::from(carry));

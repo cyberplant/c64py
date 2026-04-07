@@ -50,6 +50,8 @@ class MemoryMap:
     _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))
     # IEC serial bus (optional, for 1541 drive emulation)
     iec_bus: Optional['IECBus'] = None
+    # When True, Rust fast batch may run real KERNAL LOAD/SAVE (no $FFD5/$FFD8 delegate stops).
+    iec_disk_full_impl: bool = False
     # CIA2 Port A state (for IEC bus control)
     cia2_pra: int = 0xFF  # Port A data register
     cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)

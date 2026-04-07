@@ -309,6 +309,14 @@ def main():
         ),
     )
     ap.add_argument(
+        "--accurate",
+        action="store_true",
+        help=(
+            "Shortcut: set --disk-emulation accurate, --video-rendering accurate, "
+            "and --vic-emulation accurate-rust."
+        ),
+    )
+    ap.add_argument(
         "--monitor-port",
         type=int,
         default=None,
@@ -430,6 +438,11 @@ def main():
 
     args = ap.parse_args()
 
+    if args.accurate:
+        args.disk_emulation = "accurate"
+        args.video_rendering = "accurate"
+        args.vic_emulation = "accurate-rust"
+
     if args.accurate_vic:
         if args.vic_emulation != "accurate-python":
             print(
@@ -544,7 +557,7 @@ def main():
             sys.exit(1)
     print(
         f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}  "
-        f"|  disk emulation: {args.disk_emulation}"
+        f"|  disk emulation: {emu.disk_emulation}"
     )
     if args.debug:
         emu.cpu.enable_trace(1024)
@@ -633,6 +646,14 @@ def main():
                         file=sys.stderr,
                     )
                     sys.exit(1)
+                if disk_path:
+                    w = (
+                        "WARNING: Accurate disk emulation (IEC) is planned but not yet functional; "
+                        "LOAD from disk will show a stub error instead of hanging."
+                    )
+                    print(w, file=sys.stderr)
+                    if show_ui_logs and emu.interface is not None:
+                        emu.interface.add_debug_log(f"⚠ {w}")
                 if show_ui_logs and emu.interface is not None:
                     emu.interface.add_debug_log("📀 Disk emulation: accurate (IEC bus active)")
             elif show_ui_logs and emu.interface is not None:

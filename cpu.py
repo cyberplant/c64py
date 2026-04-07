@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import sys
 
-from typing import Optional, TYPE_CHECKING, Union
+from typing import Optional, TYPE_CHECKING, Sequence, Union
 
 from .vicii_cycle import ViciiCycleEngine
 
@@ -93,6 +93,11 @@ class CPU6502:
         # When True, Rust batch stops at $FFD5/$FFD8 and the emulator applies Python KERNAL disk hooks.
         # Set False when IEC 1541 emulation is active so the real KERNAL vectors run.
         self.kernal_disk_hook_vectors: bool = True
+        # Hot-path caches (invalidated when key changes; see _rust_delegate_stop_pcs / _python_only_step_pcs).
+        self._rust_delegate_stop_pcs_key: Optional[tuple] = None
+        self._rust_delegate_stop_pcs_cached: tuple[int, ...] = ()
+        self._python_only_stop_key: Optional[int] = None
+        self._python_only_stop_cache: Optional[frozenset[int]] = None
 
         # VICE-aligned VIC-II cycle engine (PAL 6569R3 / NTSC 6567R8 cycle tables).
         self.vic = ViciiCycleEngine()
@@ -480,6 +485,58 @@ class CPU6502:
         )
         print(msg, file=sys.stderr)
 
+    def _chrout_petscii_screen_effect(self, char: int) -> None:
+        """Update screen/cursor for one PETSCII character (CHROUT semantics, no RTS)."""
+        self.memory.write(0xD0, 0)
+        cursor_low = self.memory.read(0xD1)
+        cursor_high = self.memory.read(0xD2)
+        cursor_addr = cursor_low | (cursor_high << 8)
+        if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + 1000:
+            cursor_addr = SCREEN_MEM
+        self.last_chrout_char = char
+        if char == 0x0D:
+            row = (cursor_addr - SCREEN_MEM) // 40
+            if row < 24:
+                cursor_addr = SCREEN_MEM + (row + 1) * 40
+            else:
+                self.memory._scroll_screen_up()
+                cursor_addr = SCREEN_MEM + 24 * 40
+        elif char == 0x0A:
+            pass
+        elif char == 0x14:
+            if cursor_addr > SCREEN_MEM:
+                cursor_addr -= 1
+                if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
+                    self.memory.write(cursor_addr, 0x20)
+                    current_color = self.memory.read(0x0286) & 0x0F
+                    self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
+        elif char == 0x93:
+            for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
+                self.memory.write(addr, 0x20)
+            current_color = self.memory.read(0x0286) & 0x0F
+            for addr in range(COLOR_MEM, COLOR_MEM + 1000):
+                self.memory.write(addr, current_color)
+            cursor_addr = SCREEN_MEM
+        else:
+            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
+                self.memory.write(cursor_addr, char)
+                current_color = self.memory.read(0x0286) & 0x0F
+                self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
+                cursor_addr += 1
+                if cursor_addr >= SCREEN_MEM + 1000:
+                    self.memory._scroll_screen_up()
+                    cursor_addr = SCREEN_MEM + 24 * 40
+        self.memory.write(0xD1, cursor_addr & 0xFF)
+        self.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        self.memory.write(CURSOR_ROW_ADDR, row)
+        self.memory.write(CURSOR_COL_ADDR, col)
+
+    def apply_chrout_petscii(self, char: int) -> None:
+        """Emit one PETSCII character using the same screen rules as CHROUT (no JSR/RTS)."""
+        self._chrout_petscii_screen_effect(char & 0xFF)
+
     def step(self, udp_debug: Optional['UdpDebugLogger'] = None, current_cycles: int = 0,
              vice_trace=None) -> int:
         """Execute one instruction, return cycles"""
@@ -740,11 +797,9 @@ class CPU6502:
         # Keep a compatibility implementation so screen output works even when
         # the ROM screen editor path is not fully supported by the CPU core.
         if pc == 0xFFD2 and self.memory.kernal_shortcuts_enabled:
-            # This is CHROUT - character should be in accumulator
             char = self.state.a
             self.chrout_count += 1
 
-            # Debug: log CHROUT entry
             if udp_debug and udp_debug.enabled:
                 udp_debug.send('chrout_entry', {
                     'char': char,
@@ -754,112 +809,18 @@ class CPU6502:
                     'cycles': getattr(self, 'current_cycles', 0)
                 })
 
-            # KERNAL screen editor sets $D0 to 0 at start (quote mode flag)
-            # This is important for proper screen editor state
-            self.memory.write(0xD0, 0)
+            self._chrout_petscii_screen_effect(char)
 
-            # Get cursor position from zero-page
-            cursor_low = self.memory.read(0xD1)
-            cursor_high = self.memory.read(0xD2)
-            cursor_addr = cursor_low | (cursor_high << 8)
-
-            # If cursor is 0 or invalid, start at screen base
-            if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + 1000:
-                cursor_addr = SCREEN_MEM
-
-            # Track last character for loop detection
-            self.last_chrout_char = char
-
-            # Minimal CHROUT implementation to avoid loops
-            if char == 0x0D:  # Carriage return
-                # Move to next line, scroll if at bottom
-                row = (cursor_addr - SCREEN_MEM) // 40
-                if row < 24:
-                    # Just move to next row
-                    cursor_addr = SCREEN_MEM + (row + 1) * 40
-                else:
-                    # At bottom row, scroll screen up
-                    self.memory._scroll_screen_up()
-                    # Cursor stays at bottom row (24) after scroll
-                    cursor_addr = SCREEN_MEM + 24 * 40
-
-            elif char == 0x0A:  # Line feed (LF) - in PETSCII this is 'J', but C64 screen editor ignores it
-                # C64 screen editor ignores 0x0A - it has no effect on cursor positioning
-                # In PETSCII, 0x0A would display as 'J' if written, but the real C64 ignores it
-                # Don't write anything, don't advance cursor - just return
-                pass
-            elif char == 0x14:  # Backspace/Delete (PETSCII DEL)
-                # Move cursor left and erase character
-                # On C64, backspace moves left and deletes the character at the new position
-                if cursor_addr > SCREEN_MEM:
-                    cursor_addr -= 1
-                    # Erase character at cursor position (write space)
-                    if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-                        self.memory.write(cursor_addr, 0x20)  # Space
-                        # Update color RAM for the erased cell to current text color.
-                        current_color = self.memory.read(0x0286) & 0x0F
-                        self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
-                # If at start of screen, do nothing (can't backspace further)
-                # Note: cursor_addr is already updated above, so we continue to update cursor position
-            elif char == 0x93:  # Clear screen
-                for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
-                    self.memory.write(addr, 0x20)  # Space
-                # Clear color RAM to the current text color (C64 behavior).
-                current_color = self.memory.read(0x0286) & 0x0F
-                for addr in range(COLOR_MEM, COLOR_MEM + 1000):
-                    self.memory.write(addr, current_color)
-                cursor_addr = SCREEN_MEM
-            else:
-                # Write character to screen (no PETSCII conversion for now)
-                if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-                    # Just write the character as-is (PETSCII)
-                    self.memory.write(cursor_addr, char)
-                    # Also write the current text color to color RAM so BASIC output
-                    # reflects POKE 646 (and other color changes).
-                    current_color = self.memory.read(0x0286) & 0x0F
-                    self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
-                    cursor_addr += 1
-                    # Handle wrapping/scrolling when reaching end of screen
-                    if cursor_addr >= SCREEN_MEM + 1000:
-                        # At end of screen - scroll up and move to next line
-                        self.memory._scroll_screen_up()
-                        # Cursor moves to start of bottom row (row 24, column 0)
-                        cursor_addr = SCREEN_MEM + 24 * 40
-
-            # Update cursor position
-            self.memory.write(0xD1, cursor_addr & 0xFF)
-            self.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
-
-            # Also update row and column variables
-            row = (cursor_addr - SCREEN_MEM) // 40
-            col = (cursor_addr - SCREEN_MEM) % 40
-            self.memory.write(CURSOR_ROW_ADDR, row)  # Cursor row (TBLX)
-            self.memory.write(CURSOR_COL_ADDR, col)  # Cursor column (PNTR)
-
-            # CHROUT must return with carry CLEAR (CLC) - this is critical!
-            # The KERNAL code at $E10F checks BCS (Branch if Carry Set)
-            # If carry is set, it loops back to call CHROUT again
             self._clear_flag(0x01)  # Clear carry flag (bit 0)
 
-            # Return from JSR (RTS behavior)
-            # On JSR: pushes (return_address - 1)
-            #   High byte first at current SP, then SP--
-            #   Low byte second at new SP, then SP--
-            #   So after JSR, SP points below the low byte
-            # On RTS: pops in reverse order
-            #   Increment SP, read low byte
-            #   Increment SP, read high byte
-            #   PC = (high << 8) | low + 1
             sp_before = self.state.sp
             self.state.sp = (self.state.sp + 1) & 0xFF
             pc_low = self.memory.read(0x100 + self.state.sp)
             self.state.sp = (self.state.sp + 1) & 0xFF
             pc_high = self.memory.read(0x100 + self.state.sp)
-            # Reconstruct return address: (high << 8) | low + 1
             return_addr = ((pc_high << 8) | pc_low) + 1
             self.state.pc = return_addr & 0xFFFF
 
-            # Debug: log RTS
             if udp_debug and udp_debug.enabled:
                 udp_debug.send('chrout_rts', {
                     'sp_before': sp_before,
@@ -870,7 +831,6 @@ class CPU6502:
                     'new_pc': f'${self.state.pc:04X}'
                 })
 
-            # Safety check: if return address is invalid (e.g., $0000), something is wrong
             if self.state.pc == 0x0000:
                 if udp_debug and udp_debug.enabled:
                     udp_debug.send('chrout_error', {
@@ -880,12 +840,13 @@ class CPU6502:
                         'stack_low': pc_low,
                         'stack_high': pc_high
                     })
-                # Don't jump to $0000 - instead stop CPU or use a safe address
                 self.state.stopped = True
                 return 20
 
-            # Log CHROUT call
             if udp_debug and udp_debug.enabled:
+                cursor_low = self.memory.read(0xD1)
+                cursor_high = self.memory.read(0xD2)
+                cursor_addr = cursor_low | (cursor_high << 8)
                 udp_debug.send('chrout', {
                     'char': char,
                     'char_hex': f'${char:02X}',
@@ -979,29 +940,50 @@ class CPU6502:
             return False
         return True
 
-    def _rust_delegate_stop_pcs(self) -> list[int]:
+    def _rust_delegate_stop_pcs(self) -> tuple[int, ...]:
         """PCs where a Rust batch must hand off to Python (hooks + ``step()`` shortcuts).
 
         Includes LOAD/SAVE vectors when :attr:`kernal_disk_hook_vectors` is True so ``C64``
-        KERNAL hooks run between batches; omitted for IEC-accurate disk (real KERNAL).
+        KERNAL hooks run between batches. When IEC is active but :attr:`MemoryMap.iec_disk_full_impl`
+        is False, those vectors are still included so :meth:`emulator.C64Emulator.run_cpu_instruction_quantum`
+        can run the Python IEC stub (or hooks) before executing at those PCs.
+
+        Result is cached: this runs once per emulated instruction quantum in the hot path.
         """
-        pcs = [0xFFD2]
-        if self.kernal_disk_hook_vectors:
-            pcs.extend((0xFFD5, 0xFFD8))
-        if self.memory.kernal_rom is None:
-            pcs.extend((0xFF5B, 0xFFCF))
-        return sorted(set(pcs))
+        iec_stub = (
+            self.memory.iec_bus is not None
+            and not getattr(self.memory, "iec_disk_full_impl", False)
+        )
+        key = (
+            self.kernal_disk_hook_vectors,
+            iec_stub,
+            self.memory.kernal_rom is None,
+        )
+        if self._rust_delegate_stop_pcs_key != key:
+            pcs = [0xFFD2]
+            if self.kernal_disk_hook_vectors or iec_stub:
+                pcs.extend((0xFFD5, 0xFFD8))
+            if self.memory.kernal_rom is None:
+                pcs.extend((0xFF5B, 0xFFCF))
+            self._rust_delegate_stop_pcs_cached = tuple(sorted(set(pcs)))
+            self._rust_delegate_stop_pcs_key = key
+        return self._rust_delegate_stop_pcs_cached
 
     def _python_only_step_pcs(self) -> frozenset[int]:
         """PCs handled in :meth:`step` before ``_execute_opcode``; must match delegate stops where applicable."""
-        s = {0xFFD2}
-        if self.memory.kernal_rom is None:
-            s.add(0xFF5B)
-            s.add(0xFFCF)
-        return frozenset(s)
+        rom = self.memory.kernal_rom
+        key = id(rom)
+        if self._python_only_stop_key != key or self._python_only_stop_cache is None:
+            s = {0xFFD2}
+            if rom is None:
+                s.add(0xFF5B)
+                s.add(0xFFCF)
+            self._python_only_stop_cache = frozenset(s)
+            self._python_only_stop_key = key
+        return self._python_only_stop_cache
 
     def step_fast_batch(
-        self, max_instructions: int, stop_pcs: Optional[list[int]] = None
+        self, max_instructions: int, stop_pcs: Optional[Sequence[int]] = None
     ) -> tuple[int, int]:
         """Run up to ``max_instructions`` instructions.
 
@@ -1531,10 +1513,36 @@ class CPU6502:
             self._update_flags(result)
             self.state.pc = (self.state.pc + 2) & 0xFFFF
             return 6 if self._page_crossed(base, self.state.y) else 5
+        elif opcode == 0xD5:  # CMP zp,X
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            value = self._mr(zp_addr)
+            result = (self.state.a - value) & 0xFF
+            self._set_flag(0x01, self.state.a >= value)
+            self._update_flags(result)
+            self.state.pc = (self.state.pc + 2) & 0xFFFF
+            return 4
 
         # Increment/Decrement
+        elif opcode == 0xD6:  # DEC zp,X
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            old = self._mr(zp_addr)
+            self._rmw_dummy_write_6510(zp_addr, old)
+            value = (old - 1) & 0xFF
+            self._mw(zp_addr, value)
+            self._update_flags(value)
+            self.state.pc = (self.state.pc + 2) & 0xFFFF
+            return 6
         elif opcode == 0xE6:  # INC zp
             return self._inc_zp()
+        elif opcode == 0xF6:  # INC zp,X
+            zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+            old = self._mr(zp_addr)
+            self._rmw_dummy_write_6510(zp_addr, old)
+            value = (old + 1) & 0xFF
+            self._mw(zp_addr, value)
+            self._update_flags(value)
+            self.state.pc = (self.state.pc + 2) & 0xFFFF
+            return 6
         elif opcode == 0xEE:  # INC abs
             return self._inc_abs()
         elif opcode == 0xC6:  # DEC zp

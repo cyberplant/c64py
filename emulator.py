@@ -37,6 +37,7 @@ from .constants import (
     CURSOR_ROW_ADDR,
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
+    KEYBOARD_BUFFER_SIZE,
     ROM_KERNAL_START,
     ROM_KERNAL_END,
     SCREEN_MEM,
@@ -152,6 +153,11 @@ class C64:
         self.iec_bus: Optional[IECBus] = None
         self.iec_drives: Dict[int, Drive1541] = {}  # 1541 drives with ROM
         self.use_iec_bus = False  # Enable when 1541 ROMs are available
+        # True when full IEC byte protocol + 1541 VIA/IEC is implemented (LOAD works like hardware).
+        self._iec_disk_full_impl: bool = False
+        # Thread-safe queue: UI/server threads must not write $C6/$0277 directly (races KERNAL
+        # CHRIN on the CPU thread). Producers call send_petscii; CPU thread drains in sync_keyboard_host_queue.
+        self._keyboard_incoming: queue.Queue[int] = queue.Queue(maxsize=64)
 
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
@@ -843,6 +849,7 @@ class C64:
         
         self.use_iec_bus = True
         self.cpu.kernal_disk_hook_vectors = False
+        self.memory.iec_disk_full_impl = getattr(self, "_iec_disk_full_impl", False)
         if self.interface:
             self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
         return True
@@ -856,11 +863,45 @@ class C64:
         self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
         self.cpu.state.sp = (sp + 2) & 0xFF
 
+    def _handle_kernal_load_iec_stub(self) -> bool:
+        """Until full IEC/1541 is implemented, complete LOAD with a visible error (no hang)."""
+        device = self.memory.read(0xBA)
+        drive = self.get_drive(device)
+        if not drive or not drive.has_disk():
+            return False
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        filename_bytes = []
+        for i in range(filename_len):
+            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename = "".join(chr(b) if 32 <= b < 127 else "?" for b in filename_bytes)
+
+        # KERNAL-style order: newline after the LOAD line, then SEARCHING FOR <name>, then error.
+        # Status byte $90 is set after messages (same idea as real I/O completion).
+        self.cpu.apply_chrout_petscii(0x0D)
+        for ch in f"SEARCHING FOR {filename}":
+            self.cpu.apply_chrout_petscii(ord(ch))
+        self.cpu.apply_chrout_petscii(0x0D)
+        for ch in "ERROR: NOT IMPLEMENTED YET":
+            self.cpu.apply_chrout_petscii(ord(ch))
+        self.cpu.apply_chrout_petscii(0x0D)
+
+        if self.interface:
+            self.interface.add_debug_log(
+                f"IEC disk LOAD not implemented yet (device={device} file={filename!r}) — stub error"
+            )
+
+        self.memory.write(0x90, 0x40)
+        self.cpu.state.p |= 0x01
+        self._kernal_hook_rts_return()
+        return True
+
     def _handle_kernal_load(self) -> bool:
         """Handle KERNAL LOAD operation for virtual disk drives.
         
         This intercepts LOAD calls when PC is at $FFD5 and device is 8-11.
-        Skipped when :attr:`use_iec_bus` is True (real KERNAL + 1541 ROM handle I/O).
+        When :attr:`use_iec_bus` is True and full IEC disk I/O is not implemented yet,
+        :meth:`_handle_kernal_load_iec_stub` prints a stub message and returns with error.
         Returns True if LOAD was handled, False otherwise.
         
         KERNAL LOAD calling convention:
@@ -873,7 +914,14 @@ class C64:
         - $B9: Secondary address (0 = use address in X/Y, 1 = use address from file)
         """
         if self.use_iec_bus:
-            return False
+            if self.cpu.state.pc != 0xFFD5:
+                return False
+            if getattr(self, "_iec_disk_full_impl", False):
+                return False
+            device = self.memory.read(0xBA)
+            if device < 8 or device > 11:
+                return False
+            return self._handle_kernal_load_iec_stub()
         # Check if we're at the LOAD entry point
         if self.cpu.state.pc != 0xFFD5:
             return False
@@ -1086,6 +1134,10 @@ class C64:
         """
         if not self.use_iec_bus:
             return
+        # Current accurate-disk mode is a KERNAL LOAD/SAVE stub unless full IEC is enabled.
+        # In stub mode, stepping four Python 1541 CPUs every host quantum destroys throughput.
+        if not getattr(self, "_iec_disk_full_impl", False):
+            return
         n = max(1, int(host_cycles))
         for d in self.iec_drives.values():
             d.step(n)
@@ -1146,6 +1198,8 @@ class C64:
         inject_wall_t0 = time.perf_counter()
 
         while self.running:
+            # Drain host key queue on the CPU thread only (avoids races with KERNAL CHRIN).
+            self.sync_keyboard_host_queue()
             pc = self.cpu.state.pc
 
             # Load program if pending (after BASIC boot completes)
@@ -1733,16 +1787,26 @@ class C64:
         return row, col, line_codes
 
     def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
-        """Enqueue a PETSCII code into the KERNAL keyboard buffer."""
-        kb_buf_base = KEYBOARD_BUFFER_BASE
-        kb_buf_len = self.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
-        if kb_buf_len >= 10:
+        """Queue a key for the CPU thread to place in the KERNAL buffer (thread-safe)."""
+        code = petscii_code & 0xFF
+        try:
+            self._keyboard_incoming.put_nowait(code)
+        except queue.Full:
             return False
-
-        self.memory.write(kb_buf_base + kb_buf_len, petscii_code & 0xFF)
-        kb_buf_len += 1
-        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
         return True
+
+    def sync_keyboard_host_queue(self) -> None:
+        """CPU-thread only: move queued keys into the 10-byte KERNAL buffer when space exists."""
+        while True:
+            kb_buf_len = self.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
+            if kb_buf_len >= KEYBOARD_BUFFER_SIZE:
+                break
+            try:
+                code = self._keyboard_incoming.get_nowait()
+            except queue.Empty:
+                break
+            self.memory.write(KEYBOARD_BUFFER_BASE + kb_buf_len, code)
+            self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len + 1)
 
     def send_petscii(self, petscii_code: int) -> bool:
         """Send a PETSCII key to the KERNAL keyboard queue."""

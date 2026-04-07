@@ -294,7 +294,10 @@ fn run_fast_batch_py<'py>(
             stopped,
         };
         let mut stops = stop_pcs.unwrap_or_default();
-        stops.sort_unstable();
+        // Python passes a sorted tuple from CPU6502::_rust_delegate_stop_pcs; skip work when already sorted.
+        if stops.len() > 1 && !stops.is_sorted() {
+            stops.sort_unstable();
+        }
         stops.dedup();
         let (ins, cyc) = run_fast_batch(
             &mut cpu,

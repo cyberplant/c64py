@@ -117,6 +117,15 @@ def test_rust_stop_pcs_omit_disk_vectors_when_kernal_disk_hooks_off() -> None:
     assert 0xFFD8 not in stops
     assert 0xFFD2 in stops
 
+    cpu.memory.iec_bus = object()  # IEC active, stub mode (not full KERNAL disk in Rust)
+    stops = cpu._rust_delegate_stop_pcs()
+    assert 0xFFD5 in stops
+    assert 0xFFD8 in stops
+    cpu.memory.iec_disk_full_impl = True
+    stops = cpu._rust_delegate_stop_pcs()
+    assert 0xFFD5 not in stops
+    assert 0xFFD8 not in stops
+
 
 def test_initialize_iec_idempotent(tmp_path) -> None:
     """Without drive ROMs in the given dir, IEC init fails; must not scan other paths."""
