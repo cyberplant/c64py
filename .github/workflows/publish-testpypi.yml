@@ -1,5 +1,6 @@
 name: Publish to TestPyPI
 
+# Publish only from the canonical repository (avoid duplicate publishes from forks/clones).
 on:
   push:
     branches:
@@ -9,6 +10,7 @@ on:
 
 jobs:
   publish:
+    if: github.repository == 'cyberplant/c64py'
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
