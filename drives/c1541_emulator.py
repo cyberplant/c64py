@@ -22,6 +22,7 @@ be chained, or an ESP32/microcontroller can implement the same interface.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, Iterator, TYPE_CHECKING
 
@@ -490,20 +491,24 @@ class Drive1541(IECDriveBackend):
 def _run_server(device: int, port: int, disk_path: Optional[str],
                 dos_rom_path: Optional[str], serial_rom_path: Optional[str],
                 interface: str = "headless",
-                emulation: str = "fast") -> None:
-    """Run an asyncio TCP server wrapping a Drive1541 instance."""
+                emulation: str = "fast",
+                log_level: int = logging.INFO) -> None:
+    """Run an asyncio TCP server wrapping a Drive1541 instance.
+
+    ``log_level`` is a :mod:`logging` numeric level (e.g. ``logging.DEBUG``).
+    """
     import asyncio
     import json
-    import logging
     import sys
 
     import collections
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format=f"%(asctime)s [drive{device}] %(levelname)s %(message)s",
     )
     log = logging.getLogger(f"c1541.drive{device}")
+    log.setLevel(log_level)
 
     # Shared ring buffer: every handler appends (timestamp_str, level, message).
     # The TUI polls this; headless mode drains it to nothing (stdout via basicConfig).
@@ -810,7 +815,25 @@ if __name__ == "__main__":
         default="fast",
         help="Drive emulation tier (default: fast)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        metavar="LEVEL",
+        help=(
+            "Python logging level for this process (DEBUG, INFO, WARNING, ERROR, …). "
+            "Use DEBUG to see IEC wire JSON handlers (listen, open_channel, send_byte, …)."
+        ),
+    )
     args = parser.parse_args()
+
+    _lvl_name = str(args.log_level).strip().upper()
+    _log_level = getattr(logging, _lvl_name, None)
+    if not isinstance(_log_level, int):
+        print(
+            f"ERROR: invalid --log-level {args.log_level!r} (try DEBUG, INFO, WARNING, ERROR)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     if args.disk and args.new_disk:
         print("ERROR: use only one of --disk or --new-disk", file=sys.stderr)
@@ -855,4 +878,5 @@ if __name__ == "__main__":
         serial_rom_path=args.serial_rom,
         interface=args.interface,
         emulation=args.emulation,
+        log_level=_log_level,
     )
