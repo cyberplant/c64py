@@ -8,10 +8,11 @@ c64py's `--video-rendering` flag offers two tiers today:
   and handles split-screen mode/charset/background-color changes
   across the frame.
 
-A third tier — **`per-cycle`** — is implemented for **text** and **bitmap**
-(hires + multicolor) modes: the CPU cycle engine records VIC/CIA2 in a 40×200 sample
-grid, and the pygame path composites one scanline per sample. **Sprites** still use
-the per-frame latch (same as the beam renderer) until a per-cycle sprite pass exists.
+A third tier — **`per-cycle`** — is implemented for **text**, **bitmap**
+(hires + multicolor), and **sprites**: the CPU cycle engine records VIC/CIA2 in a 40×200 sample
+grid, and the pygame path composites one scanline per sample. Sprites use the **same**
+per-column register samples as the background (so mid-raster X/Y/pointer changes show up);
+sprite DMA timing and collisions are still not modeled here.
 
 The per-raster path samples VIC state only at row boundaries (every 8
 scanlines), so any effect that depends on register changes mid-row
@@ -73,20 +74,21 @@ each cycle. `--accurate` normally selects per-raster + accurate-rust; if
 you combine it with per-cycle (CLI or merged config), VIC stays on
 accurate-python so sampling works.
 
-**B3 (text + bitmap walkers):** `PygameInterface._render_frame_per_cycle` reads the
-sample grid and draws hires / multicolor / ECM text and **hires / multicolor bitmap**
-scanline-by-scanline. Sprites still use the end-of-frame latch (same limitation as the beam path).
+**B3 (text + bitmap + sprites):** `PygameInterface._render_frame_per_cycle` reads the
+sample grid and draws hires / multicolor / ECM text, **hires / multicolor bitmap**, and
+**sprites** (per 8-pixel column from the sample at that cycle). Sprite-sprite priority and
+true BA/DMA timing are still approximated compared to silicon.
 
-2. **Sprite DMA parity.** Align sprite compositing with per-cycle VIC state
-   (today sprites still latch once per frame like the beam path).
+5. **Sprite DMA / priority.** Further align sprite drawing with VIC fetch timing and
+   `$D01B` priority (today the compositor is host-side from register snapshots).
 
-3. **Gating and golden tests.** `per-cycle` is opt-in via `--video-rendering`
+6. **Gating and golden tests.** `per-cycle` is opt-in via `--video-rendering`
    / TOML. The first regression target is a frame where per-raster output
    differs from a known-good reference; `per-cycle` should converge there.
    `scripts/render_n_frames.py` supports `--video-rendering per-cycle` for
    snapshot-based frame hashes.
 
-4. **Performance.** Expect the per-cycle path to be 5–10× slower than
+7. **Performance.** Expect the per-cycle path to be 5–10× slower than
    per-raster. It is acceptable as a correctness mode, not the
    default. Consider a Rust implementation in `c64py-core` once the
    Python prototype is stable.

@@ -1050,10 +1050,10 @@ class PygameInterface:
 
         Background (text/bitmap) uses one VIC/CIA2 sample per 8-line content row.
         Sprites are composited **once** after all rows using the same frame latch
-        as :meth:`_render_frame_latched` (see :meth:`_render_sprites`). Per-row
-        sprite DMA (raster multiplex within a band) needs the future per-cycle
-        tier; sampling sprite regs only at each band start mis-draws games such
-        as Arkanoid.
+        as :meth:`_render_frame_latched` (see :meth:`_render_sprites`). Raster
+        multiplex that changes sprite registers between character columns is better
+        reproduced with **`--video-rendering per-cycle`**, which samples sprite regs
+        per column; the beam path still latches sprites once per frame.
 
         Per-line data comes from :meth:`MemoryMap.beam_capture_raster_line`
         during Python CPU steps and from the Rust fast batch when beam
@@ -1191,12 +1191,112 @@ class PygameInterface:
                 if screen_right < native_w:
                     self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
 
+    def _per_cycle_overlay_sprites_eight_pixels(
+        self,
+        mem: "MemoryMap",
+        regb: memoryview,
+        pra: int,
+        y_win: int,
+        col: int,
+        py: int,
+    ) -> None:
+        """Draw sprite pixels for one 8-pixel content strip using this column's VIC/CIA2 sample.
+
+        Uses the same screen-space mapping as :meth:`_render_sprites` (``y - 50`` / ``x - 24``)
+        so sprites line up with the latched path; register values come from the per-cycle grid
+        so mid-raster sprite register changes affect the correct column.
+        """
+        if self._rgb_frame is None:
+            return
+
+        def rb(i: int) -> int:
+            return int(regb[i]) if i < len(regb) else 0
+
+        ram = mem.ram
+        vic_bank = (3 - (int(pra) & 0x03)) * 0x4000
+        mode_info = mem._display_mode_from_vic_bytes(regb)
+        screen_base = int(mode_info["screen_base"])
+        matrix = (vic_bank + screen_base) & 0xFFFF
+
+        buf = self._rgb_frame._buf
+        w = self._rgb_frame.width
+        screen_left = int(self._screen_rect.left)
+        sl = int(self._screen_rect.left)
+        sr = int(self._screen_rect.right)
+        st = int(self._screen_rect.top)
+        sb = int(self._screen_rect.bottom)
+
+        mc0 = self._palette.get(rb(0x25) & 0x0F, (0, 0, 0))
+        mc1 = self._palette.get(rb(0x26) & 0x0F, (0, 0, 0))
+        mcr0, mcg0, mcb0 = mc0
+        mcr1, mcg1, mcb1 = mc1
+
+        x0 = col * self.CHAR_WIDTH
+
+        for sprite_num in range(8):
+            if not (rb(0x15) & (1 << sprite_num)):
+                continue
+            y_vic = rb(sprite_num * 2 + 1)
+            # Same as _render_sprites: py = screen_top + (y_vic - 50) + row  →  row = y_win - y_vic + 50
+            row = y_win - y_vic + 50
+            if row < 0 or row >= 21:
+                continue
+
+            x_vic = rb(sprite_num * 2) + (256 if (rb(0x10) & (1 << sprite_num)) else 0)
+            sprite_x = x_vic - 24
+            multicolor = (rb(0x1C) & (1 << sprite_num)) != 0
+            sp_idx = rb(0x27 + sprite_num) & 0x0F
+            sp = self._palette.get(sp_idx, (255, 255, 255))
+            spr, spg, spb = sp
+
+            ptr = ram[(matrix + 0x3F8 + sprite_num) & 0xFFFF]
+            sprite_addr = (vic_bank + ((ptr & 0xFF) << 6)) & 0xFFFF
+            bo = (sprite_addr + row * 3) & 0xFFFF
+            row_data = (ram[bo] << 16) | (ram[(bo + 1) & 0xFFFF] << 8) | ram[(bo + 2) & 0xFFFF]
+
+            if multicolor:
+                for dx in range(8):
+                    cx = x0 + dx
+                    rel_x = cx - sprite_x
+                    if rel_x < 0 or rel_x >= 24:
+                        continue
+                    bp = rel_x // 2
+                    bits = (row_data >> (22 - bp * 2)) & 0x03
+                    if bits == 0:
+                        continue
+                    if bits == 1:
+                        r, g, b = mcr0, mcg0, mcb0
+                    elif bits == 2:
+                        r, g, b = spr, spg, spb
+                    else:
+                        r, g, b = mcr1, mcg1, mcb1
+                    px = screen_left + cx
+                    if sl <= px < sr and st <= py < sb:
+                        i = (py * w + px) * 3
+                        buf[i] = r
+                        buf[i + 1] = g
+                        buf[i + 2] = b
+            else:
+                for dx in range(8):
+                    cx = x0 + dx
+                    rel_x = cx - sprite_x
+                    if rel_x < 0 or rel_x >= 24:
+                        continue
+                    if not ((row_data >> (23 - rel_x)) & 0x01):
+                        continue
+                    px = screen_left + cx
+                    if sl <= px < sr and st <= py < sb:
+                        i = (py * w + px) * 3
+                        buf[i] = spr
+                        buf[i + 1] = spg
+                        buf[i + 2] = spb
+
     def _render_frame_per_cycle(self) -> None:
         """Per-cycle video: VIC/CIA2 samples on a 40×200 grid (see ``video_beam.per_cycle_geometry``).
 
         Text modes (hires, multicolor, ECM) and **bitmap** (hires / multicolor) use the sampled
-        registers per character column and scanline. Sprites use the same end-of-frame latch
-        as :meth:`_render_frame_beam`.
+        registers per character column and scanline. **Sprites** use the same per-column samples
+        (mid-raster moves and multiplexing) instead of the end-of-frame latch.
         """
         from .video_beam import content_row_to_raster_line, per_cycle_geometry
 
@@ -1312,6 +1412,7 @@ class PygameInterface:
                         color_data,
                         color_mem,
                     )
+                    self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
                     continue
 
                 char_base = mode_info["char_base"]
@@ -1344,9 +1445,10 @@ class PygameInterface:
                         fg = (color_code & 0x07) if multicolor_text else color_code
                         self._plot_hires_text_scanline(x, py, row_bytes[scan], fg)
 
+                self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
+
         if mem.vic_render_snapshots:
             mem.snapshot_vic_render_state()
-        self._render_sprites(getattr(mem, "_vic_render_snapshot", None))
 
     def _render_frame(self) -> None:
         """Render one frame into the back buffer (per-cycle, beam, or latched)."""
@@ -1640,10 +1742,30 @@ class PygameInterface:
         else:
             color1 = (color_data >> 4) & 0x0F
             color0 = color_data & 0x0F
+            c0 = self._palette.get(color0, (0, 0, 0))
+            c1 = self._palette.get(color1, (0, 0, 0))
+            buf = self._rgb_frame._buf
+            w = self._rgb_frame.width
+            h = self._rgb_frame.height
+            if not (0 <= yy < h):
+                return
+            r0, g0, b0 = c0
+            r1, g1, b1 = c1
+            base_row = yy * w * 3
             for bit in range(8):
-                pixel_bit = (byte >> (7 - bit)) & 0x01
-                c = self._palette.get(color1 if pixel_bit else color0, (0, 0, 0))
-                self._rgb_frame.put_pixel(base_x + bit, yy, c)
+                px = base_x + bit
+                if not (0 <= px < w):
+                    continue
+                if (byte >> (7 - bit)) & 0x01:
+                    i = base_row + px * 3
+                    buf[i] = r1
+                    buf[i + 1] = g1
+                    buf[i + 2] = b1
+                else:
+                    i = base_row + px * 3
+                    buf[i] = r0
+                    buf[i + 1] = g0
+                    buf[i + 2] = b0
 
     def _render_bitmap_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render bitmap mode (standard or multicolor); wrapper over per-row helper."""

@@ -63,6 +63,13 @@ class RgbFrameBuffer:
         r, g, b = rgb
         buf = self._buf
         w = self.width
+        # Hot path: single pixel (hires sprites / bitmap scanlines).
+        if rw == 1 and rh == 1 and x0 == x and y0 == y and x1 - x0 == 1 and y1 - y0 == 1:
+            i = (y0 * w + x0) * 3
+            buf[i] = r
+            buf[i + 1] = g
+            buf[i + 2] = b
+            return
         # Hot path: double-wide pixels (multicolor bitmap / MCM text / MC sprites).
         # Avoid per-call bytes() allocation (tens of thousands/frame in swinth-like demos).
         if rw == 2 and rh == 1 and x1 - x0 == 2 and y1 - y0 == 1:

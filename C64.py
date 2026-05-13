@@ -496,8 +496,8 @@ def main():
             "charset/bank swaps mid-frame) for text/bitmap/MCM/ECM modes. "
             "`per-cycle`: one VIC/CIA2 sample per emulated cycle in the 320×200 window "
             "(requires `--vic-emulation accurate-python` or it is forced automatically; "
-            "see docs/per_cycle_vic.md). Text and bitmap modes use that grid; sprites still "
-            "latch once per frame. "
+            "see docs/per_cycle_vic.md). Text, bitmap, and sprites use that grid (sprites "
+            "per character column; not cycle-accurate DMA timing). "
             "See docs/DEBUGGING.md."
         ),
     )

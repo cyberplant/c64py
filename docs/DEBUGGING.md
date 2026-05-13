@@ -71,7 +71,7 @@ Run the same PRG or D64 with these combinations and note **which configuration f
 
 `--video-rendering per-raster` (formerly `accurate`) uses per-raster-line VIC register copies and CIA2 port A (VIC bank) samples. Each of the 25 content rows is dispatched independently to the appropriate pixel renderer (hires text, multicolor text, ECM, hires bitmap, multicolor bitmap) based on **that row's** sampled VIC config; games that flip `$D011`/`$D016`/`$D018`/`$D020`-`$D024` or CIA2-PA between bands (HUD+playfield splits, color bars, charset/bank swaps) compose correctly. The **Python** CPU path calls `MemoryMap.beam_capture_raster_line` from the raster/VIC tick hooks. When the **Rust** fast batch runs with `MemoryMap.beam_render_enabled`, the core writes **`MemoryMap.beam_vic_flat` / `beam_cia2_flat` in place** (no full-buffer copy back per batch); pygame reads those shared bytearrays.
 
-**Granularity:** one sample per raster line, latched at the start of the line. Sub-row effects (mode changes *within* an 8-scanline row, open sideborders, FLI proper, AGSP, per-scanline color stripes inside a row) are better exercised with **`--video-rendering per-cycle`** (text modes today; bitmap still uses the per-frame latch until the bitmap walker lands).
+**Granularity:** one sample per raster line, latched at the start of the line. Sub-row effects (mode changes *within* an 8-scanline row, open sideborders, FLI proper, AGSP, per-scanline color stripes inside a row) are better exercised with **`--video-rendering per-cycle`** (text, bitmap, and per-column sprites from the sample grid).
 
 **Border limits:** The presenter samples **one** border color (`$D020`) per raster line from that line’s VIC snapshot. Real hardware and VICE can change the border **several times on the same line**; matching that needs finer-than-line sampling (e.g. cycle-keyed VIC events), not just RAM write batching.
 
@@ -79,7 +79,7 @@ Run the same PRG or D64 with these combinations and note **which configuration f
 
 ## 5b. Per-cycle video rendering
 
-`--video-rendering per-cycle` enables a 40×200 sample grid (`MemoryMap.per_cycle_*`) filled from `CPU6502._vic_tick_one` (requires `accurate-python` VIC — forced automatically when needed). Pygame composes **text** (hires / multicolor / ECM) and **bitmap** (hires / multicolor) scanline-by-scanline from those samples; **sprites** still latch once per frame. See `docs/per_cycle_vic.md`.
+`--video-rendering per-cycle` enables a 40×200 sample grid (`MemoryMap.per_cycle_*`) filled from `CPU6502._vic_tick_one` (requires `accurate-python` VIC — forced automatically when needed). Pygame composes **text** (hires / multicolor / ECM), **bitmap** (hires / multicolor), and **sprites** scanline-by-scanline from those samples (sprites use the same per-column register snapshot as the background). See `docs/per_cycle_vic.md`.
 
 ## 6. TCP monitor (c64py)
 

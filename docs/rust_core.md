@@ -44,6 +44,10 @@ built (`maturin develop --manifest-path rust/c64py-core/Cargo.toml`).
    instruction. A native trace emitter in Rust would let those modes
    keep batching.
 
-4. **Per-cycle VIC renderer.** See [`per_cycle_vic.md`](per_cycle_vic.md);
-   when that lands the Python prototype will likely move into Rust
-   for performance.
+4. **Per-cycle Pygame compositor.** See [`per_cycle_vic.md`](per_cycle_vic.md).
+   Text, bitmap, and sprites are composited in Python from the 40×200 sample grid.
+   This mode forces `accurate-python` VIC, so **`run_fast_batch` is not used** and
+   installing `c64py_rust_core` does not accelerate it today. A plausible next step is
+   one **native call per frame** (or per scanline) that reads `MemoryMap.per_cycle_*`
+   flat buffers plus RAM and writes RGB888, without porting the sampler until the Rust
+   hybrid VIC matches BA stalls.
