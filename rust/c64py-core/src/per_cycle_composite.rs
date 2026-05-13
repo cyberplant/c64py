@@ -232,11 +232,25 @@ fn fg_opaque_mcm_row(row_b: u8) -> [bool; 8] {
     o
 }
 
+/// Bytes taken from the **first visible cycle** of the raster line (``regb_line``) so IRQs that
+/// rewrite sprite graphics between character cycles do not splice a different expansion /
+/// multicolor / palette into the middle of one on-screen sprite. X, enable, and mode bits still
+/// come from the per-column ``regb`` sample.
+#[inline]
+fn sprite_latched_byte(regb: &[u8; 64], regb_line: &[u8; 64], i: usize) -> u8 {
+    match i {
+        0x17 | 0x1D | 0x1C | 0x1B => regb_line[i],
+        0x25..=0x2E => regb_line[i],
+        _ => regb[i],
+    }
+}
+
 fn overlay_sprites_column(
     buf: &mut [u8],
     w: usize,
     ram: &[u8],
     regb: &[u8; 64],
+    regb_line: &[u8; 64],
     pra: u8,
     y_win: usize,
     col: usize,
@@ -246,19 +260,19 @@ fn overlay_sprites_column(
     screen_top: usize,
     screen_bottom: usize,
     pal48: &[u8],
-    sprite_bg_priority: u8,
     fg_opaque: &[bool; 8],
 ) {
     let vic_bank = (3 - (pra & 0x03)) as u32 * 0x4000;
     let m = mode_from_regb(regb);
     let matrix = (vic_bank + m.screen_base as u32) as usize & 0xFFFF;
 
-    let mc0 = pal_rgb(pal48, regb[0x25]);
-    let mc1 = pal_rgb(pal48, regb[0x26]);
+    let mc0 = pal_rgb(pal48, sprite_latched_byte(regb, regb_line, 0x25));
+    let mc1 = pal_rgb(pal48, sprite_latched_byte(regb, regb_line, 0x26));
 
     let x0 = col * 8;
-    let y_exp_mask = regb[0x17];
-    let x_exp_mask = regb[0x1D];
+    let y_exp_mask = sprite_latched_byte(regb, regb_line, 0x17);
+    let x_exp_mask = sprite_latched_byte(regb, regb_line, 0x1D);
+    let sprite_bg_priority = sprite_latched_byte(regb, regb_line, 0x1B);
     // VIC-II: lower sprite numbers are in front. Composite back-to-front (7 → 0).
     for sn in (0..8usize).rev() {
         if regb[0x15] & (1 << sn) == 0 {
@@ -287,8 +301,8 @@ fn overlay_sprites_column(
         let sprite_x = x_vic as i32 - 24;
         let x_exp = (x_exp_mask >> sn) & 1 != 0;
         let max_rel: i32 = if x_exp { 48 } else { 24 };
-        let multicolor = (regb[0x1C] & (1 << sn)) != 0;
-        let sp = pal_rgb(pal48, regb[0x27 + sn]);
+        let multicolor = (sprite_latched_byte(regb, regb_line, 0x1C) & (1 << sn)) != 0;
+        let sp = pal_rgb(pal48, sprite_latched_byte(regb, regb_line, 0x27 + sn));
 
         let ptr = ram[(matrix + 0x3F8 + sn) & 0xFFFF] as usize;
         let sprite_addr = (vic_bank as usize + ((ptr & 0xFF) << 6)) & 0xFFFF;
@@ -462,6 +476,17 @@ pub fn composite_per_cycle_frame(
             bg_scan,
         );
 
+        let regb_line_owned: [u8; 64] = if o_bg + 64 <= flat_mv.len() {
+            flat_mv[o_bg..o_bg + 64].try_into().unwrap()
+        } else {
+            *live_regb
+        };
+        let regb_line: &[u8; 64] = if regb_line_owned.iter().all(|&b| b == 0) {
+            live_regb
+        } else {
+            &regb_line_owned
+        };
+
         let text_row = y_win / 8;
         let scan = y_win % 8;
         for col in 0..(PC_CYCLES as usize) {
@@ -514,12 +539,12 @@ pub fn composite_per_cycle_frame(
                     } else {
                         fg_opaque_hires_row(byte)
                     };
-                    let spr_pri = regb.get(0x1B).copied().unwrap_or(0);
                     overlay_sprites_column(
                         rgb_out,
                         native_w,
                         ram,
                         &regb,
+                        regb_line,
                         pra,
                         y_win,
                         col,
@@ -529,7 +554,6 @@ pub fn composite_per_cycle_frame(
                         screen_top,
                         screen_bottom,
                         pal48,
-                        spr_pri,
                         &fg_op,
                     );
                 }
@@ -598,12 +622,12 @@ pub fn composite_per_cycle_frame(
                 } else {
                     fg_opaque_hires_row(row_byte_text)
                 };
-                let spr_pri = regb.get(0x1B).copied().unwrap_or(0);
                 overlay_sprites_column(
                     rgb_out,
                     native_w,
                     ram,
                     &regb,
+                    regb_line,
                     pra,
                     y_win,
                     col,
@@ -613,7 +637,6 @@ pub fn composite_per_cycle_frame(
                     screen_top,
                     screen_bottom,
                     pal48,
-                    spr_pri,
                     &fg_op,
                 );
             }

@@ -1226,6 +1226,7 @@ class PygameInterface:
         self,
         mem: "MemoryMap",
         regb: memoryview,
+        regb_line: memoryview,
         pra: int,
         y_win: int,
         col: int,
@@ -1238,14 +1239,29 @@ class PygameInterface:
         so sprites line up with the latched path; register values come from the per-cycle grid
         so mid-raster sprite register changes affect the correct column.
 
+        ``regb_line`` is the VIC snapshot for **column 0** of this raster line (cycle 14). Sprite
+        attributes that games typically hold stable for the line—$D017/$D01D expansion, $D01C
+        multicolor, $D01B priority, $D025–$D026 and $D027–$D02E colors—are read from
+        ``regb_line`` so IRQs that rewrite them between character cycles do not tear one sprite
+        into mixed graphics. Sprite X, MSBs, $D015 enable, and $D011/$D016/$D018 mode (for pointer
+        matrix) still use the per-column ``regb`` sample.
+
         Sprites are composited **7 → 0** (VIC-II: lower index in front). ``fg_opaque`` marks which
         of the eight column pixels count as opaque foreground for ``$D01B`` sprite-behind-gfx.
         """
         if self._rgb_frame is None:
             return
 
-        def rb(i: int) -> int:
+        def rb_col(i: int) -> int:
             return int(regb[i]) if i < len(regb) else 0
+
+        def rb_line(i: int) -> int:
+            return int(regb_line[i]) if i < len(regb_line) else 0
+
+        def rb_spr(i: int) -> int:
+            if i in (0x17, 0x1D, 0x1C, 0x1B) or (0x25 <= i <= 0x2E):
+                return rb_line(i)
+            return rb_col(i)
 
         ram = mem.ram
         vic_bank = (3 - (int(pra) & 0x03)) * 0x4000
@@ -1261,24 +1277,24 @@ class PygameInterface:
         st = int(self._screen_rect.top)
         sb = int(self._screen_rect.bottom)
 
-        mc0 = self._palette.get(rb(0x25) & 0x0F, (0, 0, 0))
-        mc1 = self._palette.get(rb(0x26) & 0x0F, (0, 0, 0))
+        mc0 = self._palette.get(rb_spr(0x25) & 0x0F, (0, 0, 0))
+        mc1 = self._palette.get(rb_spr(0x26) & 0x0F, (0, 0, 0))
         mcr0, mcg0, mcb0 = mc0
         mcr1, mcg1, mcb1 = mc1
 
         x0 = col * self.CHAR_WIDTH
 
-        sprite_pri = rb(0x1B)
+        sprite_pri = rb_spr(0x1B)
         fo = fg_opaque if len(fg_opaque) == 8 else ((False,) * 8)
 
-        y_exp_mask = rb(0x17)
-        x_exp_mask = rb(0x1D)
+        y_exp_mask = rb_spr(0x17)
+        x_exp_mask = rb_spr(0x1D)
 
         for sprite_num in range(7, -1, -1):
-            if not (rb(0x15) & (1 << sprite_num)):
+            if not (rb_col(0x15) & (1 << sprite_num)):
                 continue
             behind_gfx = (sprite_pri >> sprite_num) & 1
-            y_vic = rb(sprite_num * 2 + 1)
+            y_vic = rb_col(sprite_num * 2 + 1)
             # Same as _render_sprites: py = screen_top + (y_vic - 50) + row  →  row = y_win - y_vic + 50
             row_disp = y_win - y_vic + 50
             y_exp = (y_exp_mask >> sprite_num) & 1
@@ -1291,12 +1307,12 @@ class PygameInterface:
                     continue
                 row = row_disp
 
-            x_vic = rb(sprite_num * 2) + (256 if (rb(0x10) & (1 << sprite_num)) else 0)
+            x_vic = rb_col(sprite_num * 2) + (256 if (rb_col(0x10) & (1 << sprite_num)) else 0)
             sprite_x = x_vic - 24
             x_exp = (x_exp_mask >> sprite_num) & 1
             max_rel = 48 if x_exp else 24
-            multicolor = (rb(0x1C) & (1 << sprite_num)) != 0
-            sp_idx = rb(0x27 + sprite_num) & 0x0F
+            multicolor = (rb_spr(0x1C) & (1 << sprite_num)) != 0
+            sp_idx = rb_spr(0x27 + sprite_num) & 0x0F
             sp = self._palette.get(sp_idx, (255, 255, 255))
             spr, spg, spb = sp
 
@@ -1464,6 +1480,11 @@ class PygameInterface:
             py = screen_top + y_win
             self._rgb_frame.fill_rect(screen_left, py, content_px_w, 1, bg_scan)
 
+            o_line = idx_bg * 64
+            regb_line = flat_mv[o_line : o_line + 64]
+            if not any(regb_line):
+                regb_line = memoryview(mem._vic_regs)[:64]
+
             text_row = y_win // self.CHAR_HEIGHT
             scan = y_win % self.CHAR_HEIGHT
             for col in range(geom.content_cycles):
@@ -1507,7 +1528,7 @@ class PygameInterface:
                         else:
                             fg_op = self._vic_fg_opaque_hires_row(byte)
                         self._per_cycle_overlay_sprites_eight_pixels(
-                            mem, regb, pra, y_win, col, py, fg_op
+                            mem, regb, regb_line, pra, y_win, col, py, fg_op
                         )
                     continue
 
@@ -1551,7 +1572,7 @@ class PygameInterface:
                     else:
                         fg_op = self._vic_fg_opaque_hires_row(row_byte_text)
                     self._per_cycle_overlay_sprites_eight_pixels(
-                        mem, regb, pra, y_win, col, py, fg_op
+                        mem, regb, regb_line, pra, y_win, col, py, fg_op
                     )
 
         if mem.vic_render_snapshots:
