@@ -50,8 +50,11 @@ def _build_parser():
     return ap
 
 
-def _apply_video_aliases_and_accurate(ns):
-    """Mirror post-parse logic in ``C64.py`` (aliases + ``--accurate`` + per-cycle)."""
+def _apply_video_aliases_and_accurate(ns, *, rust_per_cycle_ok: bool = True):
+    """Mirror post-parse logic in ``C64.py`` (aliases + ``--accurate`` + per-cycle).
+
+    *rust_per_cycle_ok* mirrors ``_core.is_available`` and ``C64PY_RUST_PER_CYCLE``.
+    """
     aliases = {"fast": "per-frame", "accurate": "per-raster"}
     if ns.video_rendering in aliases:
         ns.video_rendering = aliases[ns.video_rendering]
@@ -60,9 +63,15 @@ def _apply_video_aliases_and_accurate(ns):
             ns.video_rendering = "per-raster"
             ns.vic_emulation = "accurate-rust"
         else:
+            if rust_per_cycle_ok:
+                ns.vic_emulation = "accurate-rust"
+            else:
+                ns.vic_emulation = "accurate-python"
+    if ns.video_rendering == "per-cycle":
+        if rust_per_cycle_ok and ns.vic_emulation != "accurate-python":
+            ns.vic_emulation = "accurate-rust"
+        elif not rust_per_cycle_ok and ns.vic_emulation != "accurate-python":
             ns.vic_emulation = "accurate-python"
-    if ns.video_rendering == "per-cycle" and ns.vic_emulation != "accurate-python":
-        ns.vic_emulation = "accurate-python"
 
 
 def test_default_video_vic():
@@ -87,18 +96,42 @@ def test_accurate_overrides_config_style_defaults():
     assert ns.video_rendering == "per-raster"
 
 
-def test_per_cycle_keeps_rendering_tier_and_forces_python_vic():
+def test_per_cycle_keeps_rendering_tier_and_rust_vic_when_extension_available():
     ns = _build_parser().parse_args(
         ["--video-rendering", "per-cycle", "--vic-emulation", "accurate-rust"]
     )
-    _apply_video_aliases_and_accurate(ns)
+    _apply_video_aliases_and_accurate(ns, rust_per_cycle_ok=True)
+    assert ns.video_rendering == "per-cycle"
+    assert ns.vic_emulation == "accurate-rust"
+
+
+def test_per_cycle_respects_explicit_accurate_python_even_with_rust():
+    ns = _build_parser().parse_args(
+        ["--video-rendering", "per-cycle", "--vic-emulation", "accurate-python"]
+    )
+    _apply_video_aliases_and_accurate(ns, rust_per_cycle_ok=True)
+    assert ns.vic_emulation == "accurate-python"
+
+
+def test_accurate_with_per_cycle_uses_rust_vic_when_extension_available():
+    ns = _build_parser().parse_args(["--accurate", "--video-rendering", "per-cycle"])
+    _apply_video_aliases_and_accurate(ns, rust_per_cycle_ok=True)
+    assert ns.video_rendering == "per-cycle"
+    assert ns.vic_emulation == "accurate-rust"
+
+
+def test_per_cycle_forces_python_vic_without_rust_extension():
+    ns = _build_parser().parse_args(
+        ["--video-rendering", "per-cycle", "--vic-emulation", "accurate-rust"]
+    )
+    _apply_video_aliases_and_accurate(ns, rust_per_cycle_ok=False)
     assert ns.video_rendering == "per-cycle"
     assert ns.vic_emulation == "accurate-python"
 
 
-def test_accurate_with_per_cycle_uses_python_vic():
+def test_accurate_with_per_cycle_uses_python_vic_without_rust_extension():
     ns = _build_parser().parse_args(["--accurate", "--video-rendering", "per-cycle"])
-    _apply_video_aliases_and_accurate(ns)
+    _apply_video_aliases_and_accurate(ns, rust_per_cycle_ok=False)
     assert ns.video_rendering == "per-cycle"
     assert ns.vic_emulation == "accurate-python"
 

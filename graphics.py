@@ -1347,6 +1347,38 @@ class PygameInterface:
         screen_h = int(self._screen_rect.height)
         screen_right = screen_left + screen_w
 
+        use_rust_draw = (
+            os.environ.get("C64PY_RUST_COMPOSITE", "1").strip().lower()
+            not in ("0", "no", "false", "off")
+        )
+        if use_rust_draw:
+            try:
+                from . import _core
+                if _core.is_available:
+                    pal48 = bytearray(48)
+                    for i in range(16):
+                        r, g, b = self._palette.get(i, (0, 0, 0))
+                        pal48[i * 3] = r
+                        pal48[i * 3 + 1] = g
+                        pal48[i * 3 + 2] = b
+                    _core.composite_per_cycle_frame(
+                        mem,
+                        bytes(pal48),
+                        self._rgb_frame._buf,
+                        video_standard=str(vs),
+                        native_width=native_w,
+                        native_height=native_h,
+                        screen_left=screen_left,
+                        screen_top=screen_top,
+                        screen_width=screen_w,
+                        screen_height=screen_h,
+                        border_px=border_px,
+                        skip_sprites=skip_sprites,
+                    )
+                    return
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                pass
+
         def _border_regb_for_rl(rl: int) -> memoryview:
             rl %= nlines
             y_win = rl - geom.content_first_raster

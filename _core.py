@@ -9,11 +9,14 @@ If the extension is missing, ``is_available`` is False and callers keep using
 the pure-Python ``CPU6502.step`` loop instead of batched Rust execution when the
 emulator would otherwise use it: ``--vic-emulation fast`` and ``accurate-rust``.
 ``accurate-python`` always steps in Python with cycle-accurate VIC in Python and
-never uses this batch path, with or without the extension.
+never uses this batch path. With ``--video-rendering per-cycle`` and a built
+``c64py_rust_core``, ``--vic-emulation accurate-rust`` can use the same batch path
+while filling per-cycle VIC/CIA2 flat buffers from the Rust hybrid VIC.
 """
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
@@ -150,6 +153,31 @@ def run_fast_batch(
             bc_ba = cf
     beam_rust = bool(beam_enabled and beam_n > 0 and bv_ba is not None and bc_ba is not None)
 
+    def _want_rust_per_cycle_capture() -> bool:
+        v = os.environ.get("C64PY_RUST_PER_CYCLE", "1").strip().lower()
+        return v not in ("0", "no", "false", "python", "off")
+
+    per_cycle_cap = (
+        bool(getattr(memory, "per_cycle_render_enabled", False))
+        and bool(hybrid_vic_pal)
+        and _want_rust_per_cycle_capture()
+    )
+    pvc_ba: Optional[bytearray] = None
+    pcc_ba: Optional[bytearray] = None
+    if per_cycle_cap:
+        memory.ensure_per_cycle_buffers()
+        pvf = getattr(memory, "per_cycle_vic_flat", None)
+        pcf = getattr(memory, "per_cycle_cia2_flat", None)
+        if (
+            pvf is not None
+            and pcf is not None
+            and len(pvf) == 512000
+            and len(pcf) == 8000
+        ):
+            pvc_ba = pvf
+            pcc_ba = pcf
+    per_cycle_rust = bool(per_cycle_cap and pvc_ba is not None and pcc_ba is not None)
+
     t = _rust.run_fast_batch_py(
         ram,
         max_instructions,
@@ -226,6 +254,9 @@ def run_fast_batch(
         beam_n if beam_rust else 0,
         bv_ba if beam_rust else None,
         bc_ba if beam_rust else None,
+        per_cycle_rust,
+        pvc_ba if per_cycle_rust else None,
+        pcc_ba if per_cycle_rust else None,
         trace_path,
     )
     (
@@ -354,3 +385,54 @@ def run_fast_batch(
     if beam_rust and beam_n > 0 and getattr(memory, "beam_vic_flat", None) is not None:
         memory.beam_snapshots_primed = True
     return ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped
+
+
+def composite_per_cycle_frame(
+    memory: "MemoryMap",
+    palette_rgb48: bytes,
+    rgb_out: bytearray,
+    *,
+    video_standard: str,
+    native_width: int,
+    native_height: int,
+    screen_left: int,
+    screen_top: int,
+    screen_width: int,
+    screen_height: int,
+    border_px: int,
+    skip_sprites: bool = False,
+) -> None:
+    """Fill *rgb_out* (packed RGB888, row-major) using the Rust per-cycle compositor."""
+    if not _rust:
+        raise RuntimeError("c64py_rust_core is not built/importable")
+    flat = getattr(memory, "per_cycle_vic_flat", None)
+    cia = getattr(memory, "per_cycle_cia2_flat", None)
+    if flat is None or cia is None or len(flat) != 512000 or len(cia) != 8000:
+        raise ValueError("per_cycle flat buffers must be allocated (512000 + 8000 bytes)")
+    ram = memory.ram
+    if not isinstance(ram, bytearray):
+        raise TypeError("memory.ram must be a bytearray")
+    if len(palette_rgb48) != 48:
+        raise ValueError("palette_rgb48 must be exactly 48 bytes")
+    vs = video_standard if video_standard in ("pal", "ntsc") else "pal"
+    cr = memory.char_rom
+    cr_py = None if not cr else bytes(cr)
+    _rust.composite_per_cycle_frame_py(
+        ram,
+        flat,
+        cia,
+        cr_py,
+        vs,
+        palette_rgb48,
+        rgb_out,
+        int(native_width),
+        int(native_height),
+        int(screen_left),
+        int(screen_top),
+        int(screen_width),
+        int(screen_height),
+        int(border_px),
+        bool(skip_sprites),
+        bytes(memory._vic_regs[:64]),
+        int(memory.cia2_pra) & 0xFF,
+    )

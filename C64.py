@@ -495,9 +495,10 @@ def main():
             "per content row — handles vertical split screens (HUD + playfield, color bars, "
             "charset/bank swaps mid-frame) for text/bitmap/MCM/ECM modes. "
             "`per-cycle`: one VIC/CIA2 sample per emulated cycle in the 320×200 window "
-            "(requires `--vic-emulation accurate-python` or it is forced automatically; "
-            "see docs/per_cycle_vic.md). Text, bitmap, and sprites use that grid (sprites "
-            "per character column; not cycle-accurate DMA timing). "
+            "(see docs/per_cycle_vic.md). With the optional `c64py_rust_core` extension, "
+            "uses `accurate-rust` VIC + Rust sampling and compositing by default "
+            "(set `C64PY_RUST_PER_CYCLE=0` or omit the extension to force `accurate-python`). "
+            "Text, bitmap, and sprites use that grid (sprites per character column). "
             "See docs/DEBUGGING.md."
         ),
     )
@@ -509,8 +510,8 @@ def main():
             "(overrides TOML defaults for those two). Drive tier stays "
             "[emulation] disk_emulation (set in c64py.toml or via the standalone "
             "c1541_emulator --emulation). If you also select `--video-rendering per-cycle` "
-            "(from CLI or TOML), VIC stays on the Python cycle path (`accurate-python`) so "
-            "per-cycle sampling can run."
+            "(from CLI or TOML), VIC uses `accurate-rust` when the Rust core is built "
+            "(otherwise `accurate-python`)."
         ),
     )
     ap.add_argument(
@@ -754,18 +755,37 @@ def main():
     if args.video_rendering in _VIDEO_RENDERING_ALIASES:
         args.video_rendering = _VIDEO_RENDERING_ALIASES[args.video_rendering]
 
-    # Master "max accuracy" flag — per-cycle video keeps Python VIC stepping (see below).
+    def _rust_ext_cli_available() -> bool:
+        try:
+            from . import _core
+            return bool(_core.is_available)
+        except ImportError:
+            return False
+
+    rust_per_cycle_ok = _rust_ext_cli_available() and os.environ.get(
+        "C64PY_RUST_PER_CYCLE", "1"
+    ).strip().lower() not in ("0", "no", "false", "python", "off")
+
+    # Master "max accuracy" flag — per-cycle video prefers Rust hybrid VIC when the extension is built.
     if args.accurate:
         if args.video_rendering != "per-cycle":
             args.video_rendering = "per-raster"
             args.vic_emulation = "accurate-rust"
         else:
-            args.vic_emulation = "accurate-python"
-            print(
-                "Note: --accurate with --video-rendering per-cycle uses accurate-python VIC "
-                "(per-cycle sampling requires the Python cycle engine).",
-                file=sys.stderr,
-            )
+            if rust_per_cycle_ok:
+                args.vic_emulation = "accurate-rust"
+                print(
+                    "Note: --accurate with --video-rendering per-cycle uses accurate-rust VIC "
+                    "with Rust per-cycle grid sampling when c64py_rust_core is built.",
+                    file=sys.stderr,
+                )
+            else:
+                args.vic_emulation = "accurate-python"
+                print(
+                    "Note: --accurate with --video-rendering per-cycle uses accurate-python VIC "
+                    "(install c64py_rust_core for faster Rust sampling).",
+                    file=sys.stderr,
+                )
 
     if args.accurate_vic:
         if args.vic_emulation != "accurate-python":
@@ -778,13 +798,23 @@ def main():
     else:
         vic_emulation = args.vic_emulation
 
-    if args.video_rendering == "per-cycle" and vic_emulation != "accurate-python":
-        print(
-            f"Note: --video-rendering per-cycle requires accurate-python VIC for sampling "
-            f"(was {vic_emulation!r}); switching to accurate-python.",
-            file=sys.stderr,
-        )
-        vic_emulation = "accurate-python"
+    if args.video_rendering == "per-cycle":
+        if rust_per_cycle_ok and vic_emulation != "accurate-python":
+            if vic_emulation == "fast":
+                print(
+                    "Note: --video-rendering per-cycle with Rust sampling upgrades "
+                    "`--vic-emulation fast` to accurate-rust.",
+                    file=sys.stderr,
+                )
+            vic_emulation = "accurate-rust"
+        elif not rust_per_cycle_ok and vic_emulation != "accurate-python":
+            print(
+                "Note: --video-rendering per-cycle needs accurate-python VIC for sampling "
+                f"when the Rust extension is missing or disabled (was {vic_emulation!r}); "
+                "switching to accurate-python.",
+                file=sys.stderr,
+            )
+            vic_emulation = "accurate-python"
 
     has_inject_src = bool(args.debug_inject_map or args.debug_inject_file)
     if args.debug_inject_at_cycle is not None and not has_inject_src:

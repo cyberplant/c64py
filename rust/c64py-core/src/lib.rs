@@ -5,8 +5,10 @@ mod c64_fast;
 mod c64_memory;
 mod c64_timing;
 mod c64_vicii;
+mod per_cycle_composite;
 mod resid_session;
 
+use crate::per_cycle_composite::composite_per_cycle_frame;
 use c64_cpu::CpuState;
 use c64_memory::{C64MemoryMap, CiaTimer};
 use c64_fast::run_fast_batch;
@@ -60,6 +62,8 @@ fn rust_core_version() -> &'static str {
     iec_enabled=false, iec_peer_clk_high=true, iec_peer_data_high=true,
     beam_render_enabled=false, beam_nlines=0u16,
     beam_vic_flat=None, beam_cia2_flat=None,
+    per_cycle_capture=false,
+    per_cycle_vic_flat=None, per_cycle_cia2_flat=None,
     trace_path=None,
 ))]
 fn run_fast_batch_py<'py>(
@@ -141,6 +145,9 @@ fn run_fast_batch_py<'py>(
     beam_nlines: u16,
     beam_vic_flat: Option<Bound<'py, PyByteArray>>,
     beam_cia2_flat: Option<Bound<'py, PyByteArray>>,
+    per_cycle_capture: bool,
+    per_cycle_vic_flat: Option<Bound<'py, PyByteArray>>,
+    per_cycle_cia2_flat: Option<Bound<'py, PyByteArray>>,
     trace_path: Option<String>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
@@ -265,6 +272,44 @@ fn run_fast_batch_py<'py>(
         }
     }
 
+    let mut per_cycle_vic_ptr_usize: usize = 0;
+    let mut per_cycle_cia2_ptr_usize: usize = 0;
+    let mut per_cycle_capture_active = false;
+    if per_cycle_capture {
+        if !hybrid_effective {
+            return Err(PyValueError::new_err(
+                "per_cycle_capture requires hybrid VIC (accurate-rust with hybrid enabled)",
+            ));
+        }
+        let Some(ref pv) = per_cycle_vic_flat else {
+            return Err(PyValueError::new_err(
+                "per_cycle_vic_flat is required when per_cycle_capture is true",
+            ));
+        };
+        let Some(ref pc) = per_cycle_cia2_flat else {
+            return Err(PyValueError::new_err(
+                "per_cycle_cia2_flat is required when per_cycle_capture is true",
+            ));
+        };
+        unsafe {
+            let vs = pv.as_bytes_mut();
+            let cs = pc.as_bytes_mut();
+            const N: usize = 8000;
+            if vs.len() != N * 64 || cs.len() != N {
+                return Err(PyValueError::new_err(format!(
+                    "per_cycle buffers must be {} and {} bytes, got {} and {}",
+                    N * 64,
+                    N,
+                    vs.len(),
+                    cs.len()
+                )));
+            }
+            per_cycle_vic_ptr_usize = vs.as_mut_ptr() as usize;
+            per_cycle_cia2_ptr_usize = cs.as_mut_ptr() as usize;
+            per_cycle_capture_active = true;
+        }
+    }
+
     // Run the heavy batch outside the GIL so Python-side audio/UI threads can run.
     // Safe: we copied the bytearray into `backing` and do not touch Python objects inside.
     let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 22]), String> =
@@ -321,6 +366,11 @@ fn run_fast_batch_py<'py>(
             mem.beam_nlines = beam_nlines;
             mem.beam_vic_ptr = beam_vic_ptr_usize as *mut u8;
             mem.beam_cia2_ptr = beam_cia2_ptr_usize as *mut u8;
+        }
+        if per_cycle_capture_active {
+            mem.per_cycle_capture_enabled = true;
+            mem.per_cycle_vic_ptr = per_cycle_vic_ptr_usize as *mut u8;
+            mem.per_cycle_cia2_ptr = per_cycle_cia2_ptr_usize as *mut u8;
         }
 
         let mut resid_box: Option<Box<ResidSession>> =
@@ -420,6 +470,9 @@ fn run_fast_batch_py<'py>(
         mem.beam_vic_ptr = std::ptr::null_mut();
         mem.beam_cia2_ptr = std::ptr::null_mut();
         mem.beam_enabled = false;
+        mem.per_cycle_vic_ptr = std::ptr::null_mut();
+        mem.per_cycle_cia2_ptr = std::ptr::null_mut();
+        mem.per_cycle_capture_enabled = false;
         Ok((out, backing, pcm_bytes, vpack))
     })());
     let (out, backing_out, pcm_bytes, vpack) = result.map_err(|e: String| PyValueError::new_err(e))?;
@@ -533,11 +586,101 @@ fn run_fast_batch_py<'py>(
     )
 }
 
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    ram, vic_flat, cia2_flat, char_rom, video_standard, palette_rgb48, rgb_out,
+    native_w, native_h, screen_left, screen_top, screen_w, screen_h, border_px,
+    skip_sprites=false, live_regb=None, live_cia2_pra=0x7F,
+))]
+fn composite_per_cycle_frame_py<'py>(
+    ram: Bound<'py, PyByteArray>,
+    vic_flat: Bound<'py, PyByteArray>,
+    cia2_flat: Bound<'py, PyByteArray>,
+    char_rom: Option<Bound<'py, PyBytes>>,
+    video_standard: String,
+    palette_rgb48: Bound<'py, PyBytes>,
+    rgb_out: Bound<'py, PyByteArray>,
+    native_w: usize,
+    native_h: usize,
+    screen_left: usize,
+    screen_top: usize,
+    screen_w: usize,
+    screen_h: usize,
+    border_px: usize,
+    skip_sprites: bool,
+    live_regb: Option<Bound<'py, PyBytes>>,
+    live_cia2_pra: u8,
+) -> PyResult<()> {
+    let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
+        1u8
+    } else {
+        0u8
+    };
+    let ram_sl = unsafe { ram.as_bytes() };
+    let ram_arr: &[u8; 65536] = ram_sl
+        .try_into()
+        .map_err(|_| PyValueError::new_err("ram must be exactly 65536 bytes"))?;
+    let vf = unsafe { vic_flat.as_bytes() };
+    let cf = unsafe { cia2_flat.as_bytes() };
+    const N: usize = 8000;
+    if vf.len() != N * 64 || cf.len() != N {
+        return Err(PyValueError::new_err(format!(
+            "vic_flat/cia2_flat must be {} / {} bytes",
+            N * 64,
+            N
+        )));
+    }
+    let pal_sl = palette_rgb48.as_bytes();
+    let pal_arr: &[u8; 48] = pal_sl
+        .try_into()
+        .map_err(|_| PyValueError::new_err("palette_rgb48 must be exactly 48 bytes"))?;
+    let exp = native_w.saturating_mul(native_h).saturating_mul(3);
+    let rgb_buf = unsafe { rgb_out.as_bytes_mut() };
+    if rgb_buf.len() < exp {
+        return Err(PyValueError::new_err(format!(
+            "rgb_out too small: need {}, got {}",
+            exp,
+            rgb_buf.len()
+        )));
+    }
+    let mut live_b = [0u8; 64];
+    if let Some(b) = live_regb {
+        let s = b.as_bytes();
+        if s.len() >= 64 {
+            live_b.copy_from_slice(&s[..64]);
+        }
+    }
+    let cr = char_rom.as_ref().map(|b| b.as_bytes());
+    composite_per_cycle_frame(
+        ram_arr,
+        vf,
+        cf,
+        cr,
+        vs,
+        pal_arr,
+        &mut rgb_buf[..exp],
+        native_w,
+        native_h,
+        screen_left,
+        screen_top,
+        screen_w,
+        screen_h,
+        border_px,
+        skip_sprites,
+        &live_b,
+        live_cia2_pra,
+    )
+    .map_err(|e| PyValueError::new_err(e))?;
+    Ok(())
+}
+
 #[pymodule]
 fn c64py_rust_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
     m.add_function(wrap_pyfunction!(rust_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(run_fast_batch_py, m)?)?;
+    m.add_function(wrap_pyfunction!(composite_per_cycle_frame_py, m)?)?;
     Ok(())
 }
 

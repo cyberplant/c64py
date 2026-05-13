@@ -347,6 +347,7 @@ fn tick_one_cycle(
     total_cyc: &mut u64,
 ) -> (bool, bool) {
     let (irq_edge, ba_blocks_cpu) = eng.step(mem);
+    mem.per_cycle_capture_at_cursor();
     if irq_edge {
         mem.trigger_vic_irq(0x01);
     }
