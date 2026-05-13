@@ -1194,9 +1194,9 @@ class PygameInterface:
     def _render_frame_per_cycle(self) -> None:
         """Per-cycle video: VIC/CIA2 samples on a 40×200 grid (see ``video_beam.per_cycle_geometry``).
 
-        Text modes (hires, multicolor, ECM) use the sampled registers per character column
-        and scanline. Bitmap modes are not composited here yet — falls back to the latched
-        path. Sprites use the same end-of-frame latch as :meth:`_render_frame_beam`.
+        Text modes (hires, multicolor, ECM) and **bitmap** (hires / multicolor) use the sampled
+        registers per character column and scanline. Sprites use the same end-of-frame latch
+        as :meth:`_render_frame_beam`.
         """
         from .video_beam import content_row_to_raster_line, per_cycle_geometry
 
@@ -1215,12 +1215,6 @@ class PygameInterface:
         vs = mem.video_standard
         geom = per_cycle_geometry(vs)
         flat_mv = memoryview(flat)
-        mode0 = mem._display_mode_from_vic_bytes(flat_mv[0:64])
-        if mode0["bitmap_mode"]:
-            if mem.vic_render_snapshots:
-                mem.snapshot_vic_render_state()
-            self._render_frame_latched()
-            return
 
         nlines = geom.raster_lines
         total_lines = nlines
@@ -1300,11 +1294,29 @@ class PygameInterface:
                     regb[0x24] & 0x0F,
                 ]
                 screen_base = (vic_bank + mode_info["screen_base"]) & 0xFFFF
-                char_base = mode_info["char_base"]
-                idx_scr = text_row * self.SCREEN_COLS + col
-                raw_code = ram[(screen_base + idx_scr) & 0xFFFF]
-                color_code = ram[COLOR_MEM + idx_scr] & 0x0F
+                bitmap_base = (vic_bank + mode_info["bitmap_base"]) & 0xFFFF
                 x = screen_left + col * self.CHAR_WIDTH
+                char_index = text_row * self.SCREEN_COLS + col
+
+                if mode_info["bitmap_mode"]:
+                    color_data = ram[(screen_base + char_index) & 0xFFFF]
+                    color_mem = ram[COLOR_MEM + char_index] & 0x0F
+                    bitmap_offset = char_index * 8
+                    byte = ram[(bitmap_base + bitmap_offset + scan) & 0xFFFF]
+                    self._plot_bitmap_scanline(
+                        x,
+                        py,
+                        byte,
+                        bool(mode_info.get("multicolor")),
+                        bg_colors[0],
+                        color_data,
+                        color_mem,
+                    )
+                    continue
+
+                char_base = mode_info["char_base"]
+                raw_code = ram[(screen_base + char_index) & 0xFFFF]
+                color_code = ram[COLOR_MEM + char_index] & 0x0F
 
                 extended_color = bool(mode_info.get("extended_color", False))
                 multicolor_text = bool(mode_info.get("multicolor")) and not extended_color
@@ -1592,34 +1604,46 @@ class PygameInterface:
             color_mem = mem[COLOR_MEM + char_index] & 0x0F
             bitmap_offset = char_index * 8
             base_x = screen_left + col * 8
-            if multicolor:
-                color1 = (color_data >> 4) & 0x0F
-                color2 = color_data & 0x0F
-                color3 = color_mem
-                for r in range(8):
-                    byte = mem[(bitmap_base + bitmap_offset + r) & 0xFFFF]
-                    yy = y + r
-                    for bit_pair in range(4):
-                        pixel_bits = (byte >> (6 - bit_pair * 2)) & 0x03
-                        if pixel_bits == 0:
-                            c = self._palette.get(bg0_color_idx, (0, 0, 0))
-                        elif pixel_bits == 1:
-                            c = self._palette.get(color1, (0, 0, 0))
-                        elif pixel_bits == 2:
-                            c = self._palette.get(color2, (0, 0, 0))
-                        else:
-                            c = self._palette.get(color3, (0, 0, 0))
-                        self._rgb_frame.fill_rect(base_x + bit_pair * 2, yy, 2, 1, c)
-            else:
-                color1 = (color_data >> 4) & 0x0F
-                color0 = color_data & 0x0F
-                for r in range(8):
-                    byte = mem[(bitmap_base + bitmap_offset + r) & 0xFFFF]
-                    yy = y + r
-                    for bit in range(8):
-                        pixel_bit = (byte >> (7 - bit)) & 0x01
-                        c = self._palette.get(color1 if pixel_bit else color0, (0, 0, 0))
-                        self._rgb_frame.put_pixel(base_x + bit, yy, c)
+            for r in range(8):
+                byte = mem[(bitmap_base + bitmap_offset + r) & 0xFFFF]
+                yy = y + r
+                self._plot_bitmap_scanline(
+                    base_x, yy, byte, multicolor, bg0_color_idx, color_data, color_mem
+                )
+
+    def _plot_bitmap_scanline(
+        self,
+        base_x: int,
+        yy: int,
+        byte: int,
+        multicolor: bool,
+        bg0_color_idx: int,
+        color_data: int,
+        color_mem: int,
+    ) -> None:
+        """Draw one 8-pixel row of a bitmap 8×8 cell (hi-res or multicolor)."""
+        if multicolor:
+            color1 = (color_data >> 4) & 0x0F
+            color2 = color_data & 0x0F
+            color3 = color_mem
+            for bit_pair in range(4):
+                pixel_bits = (byte >> (6 - bit_pair * 2)) & 0x03
+                if pixel_bits == 0:
+                    c = self._palette.get(bg0_color_idx, (0, 0, 0))
+                elif pixel_bits == 1:
+                    c = self._palette.get(color1, (0, 0, 0))
+                elif pixel_bits == 2:
+                    c = self._palette.get(color2, (0, 0, 0))
+                else:
+                    c = self._palette.get(color3, (0, 0, 0))
+                self._rgb_frame.fill_rect(base_x + bit_pair * 2, yy, 2, 1, c)
+        else:
+            color1 = (color_data >> 4) & 0x0F
+            color0 = color_data & 0x0F
+            for bit in range(8):
+                pixel_bit = (byte >> (7 - bit)) & 0x01
+                c = self._palette.get(color1 if pixel_bit else color0, (0, 0, 0))
+                self._rgb_frame.put_pixel(base_x + bit, yy, c)
 
     def _render_bitmap_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render bitmap mode (standard or multicolor); wrapper over per-row helper."""

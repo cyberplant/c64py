@@ -8,10 +8,10 @@ c64py's `--video-rendering` flag offers two tiers today:
   and handles split-screen mode/charset/background-color changes
   across the frame.
 
-A third tier — **`per-cycle`** — is implemented for **text modes** (hires,
-multicolor, ECM): the CPU cycle engine records VIC/CIA2 in a 40×200 sample
-grid, and the pygame path composites one scanline per sample. **Bitmap**
-modes still use the per-frame latch until a bitmap walker lands.
+A third tier — **`per-cycle`** — is implemented for **text** and **bitmap**
+(hires + multicolor) modes: the CPU cycle engine records VIC/CIA2 in a 40×200 sample
+grid, and the pygame path composites one scanline per sample. **Sprites** still use
+the per-frame latch (same as the beam renderer) until a per-cycle sprite pass exists.
 
 The per-raster path samples VIC state only at row boundaries (every 8
 scanlines), so any effect that depends on register changes mid-row
@@ -73,19 +73,18 @@ each cycle. `--accurate` normally selects per-raster + accurate-rust; if
 you combine it with per-cycle (CLI or merged config), VIC stays on
 accurate-python so sampling works.
 
-**B3 (text walker):** `PygameInterface._render_frame_per_cycle` reads the
-sample grid and draws hires / multicolor / ECM text scanline-by-scanline.
-Sprites still use the end-of-frame latch (same limitation as the beam path).
+**B3 (text + bitmap walkers):** `PygameInterface._render_frame_per_cycle` reads the
+sample grid and draws hires / multicolor / ECM text and **hires / multicolor bitmap**
+scanline-by-scanline. Sprites still use the end-of-frame latch (same limitation as the beam path).
 
-2. **Bitmap / sprite parity.** Extend the sampling grid to hires and
-   multicolor bitmap rows, then align sprite DMA with per-cycle state
+2. **Sprite DMA parity.** Align sprite compositing with per-cycle VIC state
    (today sprites still latch once per frame like the beam path).
 
 3. **Gating and golden tests.** `per-cycle` is opt-in via `--video-rendering`
    / TOML. The first regression target is a frame where per-raster output
    differs from a known-good reference; `per-cycle` should converge there.
-   Use `scripts/render_n_frames.py` as the harness once it supports the
-   per-cycle buffer path.
+   `scripts/render_n_frames.py` supports `--video-rendering per-cycle` for
+   snapshot-based frame hashes.
 
 4. **Performance.** Expect the per-cycle path to be 5–10× slower than
    per-raster. It is acceptable as a correctness mode, not the
