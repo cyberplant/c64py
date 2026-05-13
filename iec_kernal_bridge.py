@@ -18,15 +18,12 @@ newline-delimited JSON for offline analysis. Each line has the stable schema
 same :class:`IECBus` convention as the in-memory ring (``true`` = released/high,
 ``false`` = asserted/low).
 
-**Phase A3a** (optional, ``C64PY_IEC_WIRE_DECODE=1``): :class:`KernalIecTap` may
-host an :class:`~c64py.iec_wire_decode.IecAtnWireDecoder` that turns ATN-phase
-CLK/DATA edges into :meth:`~c64py.iec_bus.IECBus.deliver_command` (no duplicate
-ATN wiggles on the bus). OPEN filenames and non-ATN data bytes are **not**
-decoded yet (A3b/A3c).
-
-Later phases (see ``docs/plans/release_blockers_iec_percycle_vic.md``): OPEN
-filename assembly, UNLISTEN / ``send_byte`` synthesis for the data phase, PRINT#
-/ ``INPUT#``, and drive ``request_byte`` replies.
+**Phase A3a–A3c (partial)** (optional, ``C64PY_IEC_WIRE_DECODE=1``):
+:class:`KernalIecTap` may host :class:`~c64py.iec_wire_decode.IecAtnWireDecoder`
+which decodes ATN-held commands via :meth:`~c64py.iec_bus.IECBus.deliver_command`
+and C64→listener data (OPEN filename and ``PRINT#`` payload) via
+:meth:`~c64py.iec_bus.IECBus.send_byte`. ``TALK`` / ``INPUT#`` (drive as clock
+master) is not decoded yet.
 """
 
 from __future__ import annotations
@@ -97,7 +94,7 @@ class KernalIecTap:
             self.transition_count += 1
             wd = self._wire_decoder
             if wd is not None:
-                wd.feed_transition(self._prev, cur)
+                wd.feed_transition(self._prev, cur, cyc)
             self._prev = cur
 
     def _write_jsonl(self, cyc: int, atn: bool, clk: bool, data: bool) -> None:
