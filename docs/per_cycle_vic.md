@@ -8,8 +8,12 @@ c64py's `--video-rendering` flag offers two tiers today:
   and handles split-screen mode/charset/background-color changes
   across the frame.
 
-A third tier — **`per-cycle`** — is filed as future work. The
-per-raster path samples VIC state only at row boundaries (every 8
+A third tier — **`per-cycle`** — is implemented for **text modes** (hires,
+multicolor, ECM): the CPU cycle engine records VIC/CIA2 in a 40×200 sample
+grid, and the pygame path composites one scanline per sample. **Bitmap**
+modes still use the per-frame latch until a bitmap walker lands.
+
+The per-raster path samples VIC state only at row boundaries (every 8
 scanlines), so any effect that depends on register changes mid-row
 or mid-scanline is lost. Examples that need per-cycle resolution:
 
@@ -52,7 +56,7 @@ The B1 foundation is checked into `video_beam.py` and `memory.py`:
 `(raster_line, raster_cycle)` pair to a visible sample index, or `None`
 outside the 320x200 content area. `MemoryMap.ensure_per_cycle_buffers()`
 allocates matching VIC and CIA2 snapshot grids plus flat bytearrays for
-future renderer/Rust handoff; it does not render or sample yet.
+renderer/Rust handoff.
 
 **B2 sampler:** when `MemoryMap.per_cycle_render_enabled` is true,
 `MemoryMap.per_cycle_capture_vic_sample()` runs at the end of each
@@ -62,19 +66,26 @@ VIC shadow (`$D000`–`$D03F`) and CIA2 port A into the slot for the current
 Fast VIC mode does not call `_vic_tick_one`, so per-cycle buffers stay
 empty unless accurate VIC is enabled.
 
-2. **Pixel-by-pixel renderer.** Walk left-to-right within each
-   scanline emitting one pixel at a time using the cycle-correct VIC
-   state. Standard text, multicolor text, ECM, hires bitmap and
-   multicolor bitmap renderers all reduce to "given current VIC
-   state and the next 8 bits of the c-access byte, emit pixels".
-   Sprites overlay on top using the same per-cycle state.
+**B4 (CLI):** `--video-rendering per-cycle` (or `video.rendering = "per-cycle"`
+in TOML) turns on `per_cycle_render_enabled`, primes buffers at startup, and
+forces `--vic-emulation accurate-python` when needed so `_vic_tick_one` runs
+each cycle. `--accurate` normally selects per-raster + accurate-rust; if
+you combine it with per-cycle (CLI or merged config), VIC stays on
+accurate-python so sampling works.
 
-3. **Gating.** Make `per-cycle` opt-in via the existing
-   `--video-rendering` flag. The first regression target is a frame
-   where the per-raster output differs from a known-good reference;
-   `per-cycle` should converge to the reference. Use
-   `scripts/render_n_frames.py` as the harness — it already produces
-   reproducible frame hashes from a snapshot.
+**B3 (text walker):** `PygameInterface._render_frame_per_cycle` reads the
+sample grid and draws hires / multicolor / ECM text scanline-by-scanline.
+Sprites still use the end-of-frame latch (same limitation as the beam path).
+
+2. **Bitmap / sprite parity.** Extend the sampling grid to hires and
+   multicolor bitmap rows, then align sprite DMA with per-cycle state
+   (today sprites still latch once per frame like the beam path).
+
+3. **Gating and golden tests.** `per-cycle` is opt-in via `--video-rendering`
+   / TOML. The first regression target is a frame where per-raster output
+   differs from a known-good reference; `per-cycle` should converge there.
+   Use `scripts/render_n_frames.py` as the harness once it supports the
+   per-cycle buffer path.
 
 4. **Performance.** Expect the per-cycle path to be 5–10× slower than
    per-raster. It is acceptable as a correctness mode, not the

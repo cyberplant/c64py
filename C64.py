@@ -494,8 +494,9 @@ def main():
             "`per-raster` (aka `accurate`): one VIC/CIA2 sample per raster line, dispatched "
             "per content row — handles vertical split screens (HUD + playfield, color bars, "
             "charset/bank swaps mid-frame) for text/bitmap/MCM/ECM modes. "
-            "`per-cycle`: not yet implemented; currently falls back to `per-raster` "
-            "(see docs/per_cycle_vic.md). "
+            "`per-cycle`: one VIC/CIA2 sample per emulated cycle in the 320×200 window "
+            "(requires `--vic-emulation accurate-python` or it is forced automatically; "
+            "see docs/per_cycle_vic.md). Bitmap modes fall back to per-frame latch for now. "
             "See docs/DEBUGGING.md."
         ),
     )
@@ -506,9 +507,9 @@ def main():
             "Shortcut: set --video-rendering per-raster and --vic-emulation accurate-rust "
             "(overrides TOML defaults for those two). Drive tier stays "
             "[emulation] disk_emulation (set in c64py.toml or via the standalone "
-            "c1541_emulator --emulation). When per-cycle video exists, pass "
-            "--video-rendering per-cycle after --accurate to opt in (currently still maps "
-            "to per-raster with a one-line stderr note)."
+            "c1541_emulator --emulation). If you also select `--video-rendering per-cycle` "
+            "(from CLI or TOML), VIC stays on the Python cycle path (`accurate-python`) so "
+            "per-cycle sampling can run."
         ),
     )
     ap.add_argument(
@@ -752,18 +753,18 @@ def main():
     if args.video_rendering in _VIDEO_RENDERING_ALIASES:
         args.video_rendering = _VIDEO_RENDERING_ALIASES[args.video_rendering]
 
-    # Master "max accuracy" flag — must run as its own block (not tied to per-cycle).
+    # Master "max accuracy" flag — per-cycle video keeps Python VIC stepping (see below).
     if args.accurate:
-        args.video_rendering = "per-raster"
-        args.vic_emulation = "accurate-rust"
-
-    if args.video_rendering == "per-cycle":
-        print(
-            "Note: --video-rendering per-cycle is not implemented yet; using per-raster. "
-            "See docs/per_cycle_vic.md.",
-            file=sys.stderr,
-        )
-        args.video_rendering = "per-raster"
+        if args.video_rendering != "per-cycle":
+            args.video_rendering = "per-raster"
+            args.vic_emulation = "accurate-rust"
+        else:
+            args.vic_emulation = "accurate-python"
+            print(
+                "Note: --accurate with --video-rendering per-cycle uses accurate-python VIC "
+                "(per-cycle sampling requires the Python cycle engine).",
+                file=sys.stderr,
+            )
 
     if args.accurate_vic:
         if args.vic_emulation != "accurate-python":
@@ -775,6 +776,14 @@ def main():
         vic_emulation = "accurate-python"
     else:
         vic_emulation = args.vic_emulation
+
+    if args.video_rendering == "per-cycle" and vic_emulation != "accurate-python":
+        print(
+            f"Note: --video-rendering per-cycle requires accurate-python VIC for sampling "
+            f"(was {vic_emulation!r}); switching to accurate-python.",
+            file=sys.stderr,
+        )
+        vic_emulation = "accurate-python"
 
     has_inject_src = bool(args.debug_inject_map or args.debug_inject_file)
     if args.debug_inject_at_cycle is not None and not has_inject_src:
@@ -1104,10 +1113,17 @@ def main():
 
             if args.video_rendering == "per-raster":
                 emu.memory.beam_render_enabled = True
+                emu.memory.per_cycle_render_enabled = False
                 emu.memory.ensure_beam_buffers()
                 emu.memory.prime_beam_snapshots_from_current_vic()
+            elif args.video_rendering == "per-cycle":
+                emu.memory.beam_render_enabled = False
+                emu.memory.per_cycle_render_enabled = True
+                emu.memory.ensure_per_cycle_buffers()
+                emu.memory.prime_per_cycle_snapshots_from_current_vic()
             else:
                 emu.memory.beam_render_enabled = False
+                emu.memory.per_cycle_render_enabled = False
         except Exception as e:
             # Ensure UI is not left running, then show a clear error.
             try:

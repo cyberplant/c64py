@@ -75,6 +75,12 @@ def main() -> int:
     ap.add_argument("--stride", type=int, default=1, help="Save every K-th frame")
     ap.add_argument("--out-dir", required=True, help="Directory to write frame_NNN.png into")
     ap.add_argument(
+        "--video-rendering",
+        choices=("per-raster", "per-cycle"),
+        default="per-raster",
+        help="Host sampling tier for PygameInterface._render_frame (default: per-raster beam)",
+    )
+    ap.add_argument(
         "--warmup-cycles",
         type=int,
         default=PAL_CYCLES_PER_FRAME,
@@ -85,12 +91,21 @@ def main() -> int:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    emu = _C64(vic_emulation="accurate-rust")
+    emu = _C64(
+        vic_emulation="accurate-python" if args.video_rendering == "per-cycle" else "accurate-rust"
+    )
     _load_snapshot(emu, args.snapshot)
 
-    emu.memory.beam_render_enabled = True
-    emu.memory.ensure_beam_buffers()
-    emu.memory.prime_beam_snapshots_from_current_vic()
+    if args.video_rendering == "per-cycle":
+        emu.memory.beam_render_enabled = False
+        emu.memory.per_cycle_render_enabled = True
+        emu.memory.ensure_per_cycle_buffers()
+        emu.memory.prime_per_cycle_snapshots_from_current_vic()
+    else:
+        emu.memory.beam_render_enabled = True
+        emu.memory.per_cycle_render_enabled = False
+        emu.memory.ensure_beam_buffers()
+        emu.memory.prime_beam_snapshots_from_current_vic()
 
     _step_cycles(emu, args.warmup_cycles)
 
@@ -117,7 +132,7 @@ def main() -> int:
         _step_cycles(emu, PAL_CYCLES_PER_FRAME)
         if frame_idx % args.stride != 0:
             continue
-        ui._render_frame_beam()
+        ui._render_frame()
         buf = bytes(ui._rgb_frame.buf)
         digest = hashlib.sha256(buf).hexdigest()
         hashes.append((frame_idx, digest))

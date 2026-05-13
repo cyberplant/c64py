@@ -39,9 +39,9 @@ else:  # pragma: no cover - exercised on 3.9/3.10 only
 # names; the mapping to CLI flags lives in ``C64.py`` (CONFIG_TO_CLI).
 DEFAULT_CONFIG: Dict[str, Any] = {
     "video": {
-        # "per-frame" | "per-raster" | "per-cycle" (CLI: per-cycle falls back to per-raster). Aliases
-        # "fast"/"accurate" are accepted on the CLI for backwards compat
-        # but normalised before reaching this config.
+        # "per-frame" | "per-raster" | "per-cycle" (per-cycle uses the Python VIC cycle path;
+        # see docs/per_cycle_vic.md). Aliases "fast"/"accurate" are accepted on the CLI for
+        # backwards compat but normalised before reaching this config.
         "rendering": "per-frame",
         "standard": "pal",
         "scale": 2,

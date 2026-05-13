@@ -56,10 +56,13 @@ def _apply_video_aliases_and_accurate(ns):
     if ns.video_rendering in aliases:
         ns.video_rendering = aliases[ns.video_rendering]
     if ns.accurate:
-        ns.video_rendering = "per-raster"
-        ns.vic_emulation = "accurate-rust"
-    if ns.video_rendering == "per-cycle":
-        ns.video_rendering = "per-raster"
+        if ns.video_rendering != "per-cycle":
+            ns.video_rendering = "per-raster"
+            ns.vic_emulation = "accurate-rust"
+        else:
+            ns.vic_emulation = "accurate-python"
+    if ns.video_rendering == "per-cycle" and ns.vic_emulation != "accurate-python":
+        ns.vic_emulation = "accurate-python"
 
 
 def test_default_video_vic():
@@ -82,6 +85,22 @@ def test_accurate_overrides_config_style_defaults():
     _apply_video_aliases_and_accurate(ns)
     assert ns.vic_emulation == "accurate-rust"
     assert ns.video_rendering == "per-raster"
+
+
+def test_per_cycle_keeps_rendering_tier_and_forces_python_vic():
+    ns = _build_parser().parse_args(
+        ["--video-rendering", "per-cycle", "--vic-emulation", "accurate-rust"]
+    )
+    _apply_video_aliases_and_accurate(ns)
+    assert ns.video_rendering == "per-cycle"
+    assert ns.vic_emulation == "accurate-python"
+
+
+def test_accurate_with_per_cycle_uses_python_vic():
+    ns = _build_parser().parse_args(["--accurate", "--video-rendering", "per-cycle"])
+    _apply_video_aliases_and_accurate(ns)
+    assert ns.video_rendering == "per-cycle"
+    assert ns.vic_emulation == "accurate-python"
 
 
 @pytest.mark.parametrize("mode", ["resid", "python-sid", "disabled"])

@@ -36,7 +36,7 @@ If none exist, the built-in defaults (see below) are used.
 
 ```toml
 [video]
-rendering  = "per-frame"     # "per-frame" | "per-raster" | "per-cycle" (per-cycle → per-raster until implemented)
+rendering  = "per-frame"     # "per-frame" | "per-raster" | "per-cycle" (per-cycle needs accurate-python VIC; see docs/per_cycle_vic.md)
 standard   = "pal"           # "pal" | "ntsc"
 scale      = 2               # graphics window scale factor (integer)
 fps        = 30              # graphics present rate cap

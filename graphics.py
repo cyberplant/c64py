@@ -872,6 +872,55 @@ class PygameInterface:
         fg = self._palette.get(fg_idx, (255, 255, 255))
         self._rgb_frame.plot_hires_glyph(x, y, rows, fg)
 
+    def _plot_hires_text_scanline(self, x: int, y: int, row_byte: int, fg_idx: int) -> None:
+        """Draw one hires text raster (8×1); unset bits leave the existing background."""
+        fg = self._palette.get(fg_idx, (255, 255, 255))
+        fr, fg_g, fb = fg
+        buf = self._rgb_frame._buf
+        w = self._rgb_frame.width
+        h = self._rgb_frame.height
+        if not (0 <= y < h):
+            return
+        base_row = y * w * 3
+        for xx in range(8):
+            if not (row_byte & (1 << (7 - xx))):
+                continue
+            px = x + xx
+            if not (0 <= px < w):
+                continue
+            i = base_row + px * 3
+            buf[i] = fr
+            buf[i + 1] = fg_g
+            buf[i + 2] = fb
+
+    def _plot_mcm_text_scanline(
+        self,
+        x: int,
+        y: int,
+        row_byte: int,
+        char_color_idx: int,
+        bg_i: int,
+        c1_i: int,
+        c2_i: int,
+    ) -> None:
+        """One multicolor text raster line (8×1): four 2-bit wide pixels."""
+        p0 = self._palette.get(bg_i, (0, 0, 0))
+        p1 = self._palette.get(c1_i, (0, 0, 0))
+        p2 = self._palette.get(c2_i, (0, 0, 0))
+        p3 = self._palette.get(char_color_idx, (0, 0, 0))
+        for pair in range(4):
+            bits = (row_byte >> (6 - pair * 2)) & 0x03
+            if bits == 0:
+                c = p0
+            elif bits == 1:
+                c = p1
+            elif bits == 2:
+                c = p2
+            else:
+                c = p3
+            px = x + pair * 2
+            self._rgb_frame.fill_rect(px, y, 2, 1, c)
+
     def _petscii_to_screen_code(self, petscii_char: int) -> int:
         return self.emulator._petscii_to_screen_code(petscii_char)
 
@@ -1142,6 +1191,170 @@ class PygameInterface:
                 if screen_right < native_w:
                     self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
 
+    def _render_frame_per_cycle(self) -> None:
+        """Per-cycle video: VIC/CIA2 samples on a 40×200 grid (see ``video_beam.per_cycle_geometry``).
+
+        Text modes (hires, multicolor, ECM) use the sampled registers per character column
+        and scanline. Bitmap modes are not composited here yet — falls back to the latched
+        path. Sprites use the same end-of-frame latch as :meth:`_render_frame_beam`.
+        """
+        from .video_beam import content_row_to_raster_line, per_cycle_geometry
+
+        mem = self.emulator.memory
+        flat = mem.per_cycle_vic_flat
+        cia = mem.per_cycle_cia2_flat
+        if (
+            not getattr(mem, "per_cycle_render_enabled", False)
+            or flat is None
+            or cia is None
+            or not getattr(mem, "per_cycle_snapshots_primed", False)
+        ):
+            self._render_frame_latched()
+            return
+
+        vs = mem.video_standard
+        geom = per_cycle_geometry(vs)
+        flat_mv = memoryview(flat)
+        mode0 = mem._display_mode_from_vic_bytes(flat_mv[0:64])
+        if mode0["bitmap_mode"]:
+            if mem.vic_render_snapshots:
+                mem.snapshot_vic_render_state()
+            self._render_frame_latched()
+            return
+
+        nlines = geom.raster_lines
+        total_lines = nlines
+        content_first = content_row_to_raster_line(0, vs)
+        content_h = geom.content_height
+        top_lines = max(0, min(total_lines, content_first))
+        bottom_lines = max(0, total_lines - (content_first + content_h))
+        border_px = int(self.border_size)
+        native_h = int(self._rgb_frame.height)
+        native_w = int(self._rgb_frame.width)
+        screen_left = int(self._screen_rect.left)
+        screen_top = int(self._screen_rect.top)
+        screen_w = int(self._screen_rect.width)
+        screen_h = int(self._screen_rect.height)
+        screen_right = screen_left + screen_w
+
+        def _border_regb_for_rl(rl: int) -> memoryview:
+            rl %= nlines
+            y_win = rl - geom.content_first_raster
+            if 0 <= y_win < geom.content_height and len(flat_mv) >= (y_win * geom.content_cycles + 1) * 64:
+                o = (y_win * geom.content_cycles) * 64
+                return flat_mv[o : o + 64]
+            return memoryview(mem._vic_regs)[:64]
+
+        for y in range(native_h):
+            if border_px > 0 and y < border_px:
+                rl = int((y * top_lines) / border_px) if top_lines > 0 else 0
+            elif y < border_px + content_h:
+                rl = content_first + (y - border_px)
+            else:
+                yy = y - (border_px + content_h)
+                rl = (content_first + content_h) + (
+                    int((yy * bottom_lines) / border_px) if border_px > 0 else 0
+                )
+            rl %= nlines
+            regb = _border_regb_for_rl(rl)
+            border_code = regb[0x20] & 0x0F if len(regb) > 0x20 else 0x0E
+            if border_code == 0 and not any(regb):
+                border_code = 0x0E
+            c = self._palette.get(border_code, (0, 0, 0))
+            if y < screen_top or y >= screen_top + screen_h:
+                self._rgb_frame.fill_rect(0, y, native_w, 1, c)
+            else:
+                if screen_left > 0:
+                    self._rgb_frame.fill_rect(0, y, screen_left, 1, c)
+                if screen_right < native_w:
+                    self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
+
+        ram = mem.ram
+        content_px_w = geom.content_cycles * self.CHAR_WIDTH
+        for y_win in range(geom.content_height):
+            idx_bg = y_win * geom.content_cycles
+            o_bg = idx_bg * 64
+            regb_bg = flat_mv[o_bg : o_bg + 64]
+            if not any(regb_bg):
+                regb_bg = memoryview(mem._vic_regs)[:64]
+            bg_scan = self._palette.get(regb_bg[0x21] & 0x0F, (0, 0, 0))
+            py = screen_top + y_win
+            self._rgb_frame.fill_rect(screen_left, py, content_px_w, 1, bg_scan)
+
+            text_row = y_win // self.CHAR_HEIGHT
+            scan = y_win % self.CHAR_HEIGHT
+            for col in range(geom.content_cycles):
+                idx = y_win * geom.content_cycles + col
+                o = idx * 64
+                regb = flat_mv[o : o + 64]
+                pra = int(cia[idx]) & 0xFF
+                if not any(regb):
+                    regb = memoryview(mem._vic_regs)[:64]
+                    pra = mem.cia2_pra & 0xFF
+                mode_info = mem._display_mode_from_vic_bytes(regb)
+                vic_bank = (3 - (pra & 0x03)) * 0x4000
+                bg_colors = [
+                    regb[0x21] & 0x0F,
+                    regb[0x22] & 0x0F,
+                    regb[0x23] & 0x0F,
+                    regb[0x24] & 0x0F,
+                ]
+                screen_base = (vic_bank + mode_info["screen_base"]) & 0xFFFF
+                char_base = mode_info["char_base"]
+                idx_scr = text_row * self.SCREEN_COLS + col
+                raw_code = ram[(screen_base + idx_scr) & 0xFFFF]
+                color_code = ram[COLOR_MEM + idx_scr] & 0x0F
+                x = screen_left + col * self.CHAR_WIDTH
+
+                extended_color = bool(mode_info.get("extended_color", False))
+                multicolor_text = bool(mode_info.get("multicolor")) and not extended_color
+
+                if extended_color:
+                    bg_index = (raw_code >> 6) & 0x03
+                    code_ecm = raw_code & 0x3F
+                    char_bg = self._palette.get(bg_colors[bg_index], (0, 0, 0))
+                    self._rgb_frame.fill_rect(x, py, self.CHAR_WIDTH, 1, char_bg)
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code_ecm)
+                    self._plot_hires_text_scanline(x, py, row_bytes[scan], color_code)
+                else:
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, raw_code)
+                    if multicolor_text and (color_code & 0x08):
+                        self._plot_mcm_text_scanline(
+                            x,
+                            py,
+                            row_bytes[scan],
+                            color_code & 0x07,
+                            bg_colors[0],
+                            bg_colors[1],
+                            bg_colors[2],
+                        )
+                    else:
+                        fg = (color_code & 0x07) if multicolor_text else color_code
+                        self._plot_hires_text_scanline(x, py, row_bytes[scan], fg)
+
+        if mem.vic_render_snapshots:
+            mem.snapshot_vic_render_state()
+        self._render_sprites(getattr(mem, "_vic_render_snapshot", None))
+
+    def _render_frame(self) -> None:
+        """Render one frame into the back buffer (per-cycle, beam, or latched)."""
+        mem = self.emulator.memory
+        if (
+            getattr(mem, "per_cycle_render_enabled", False)
+            and mem.per_cycle_vic_flat is not None
+            and getattr(mem, "per_cycle_snapshots_primed", False)
+        ):
+            self._render_frame_per_cycle()
+            return
+        if (
+            getattr(mem, "beam_render_enabled", False)
+            and mem.beam_vic_lines
+            and getattr(mem, "beam_snapshots_primed", False)
+        ):
+            self._render_frame_beam()
+            return
+        self._render_frame_latched()
+
     def _render_frame_latched(self) -> None:
         """Render one frame using the per-frame VIC latch (non-beam path).
 
@@ -1210,19 +1423,7 @@ class PygameInterface:
 
         # Render sprites on top
         self._render_sprites(snap)
-        
-    def _render_frame(self) -> None:
-        """Render one frame into the back buffer (beam or latched)."""
-        mem = self.emulator.memory
-        if (
-            getattr(mem, "beam_render_enabled", False)
-            and mem.beam_vic_lines
-            and getattr(mem, "beam_snapshots_primed", False)
-        ):
-            self._render_frame_beam()
-            return
-        self._render_frame_latched()
-    
+
     def _render_text_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render text mode; charset definitions are read from VIC bank RAM (as the VIC would).
 

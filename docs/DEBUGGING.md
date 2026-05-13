@@ -71,11 +71,15 @@ Run the same PRG or D64 with these combinations and note **which configuration f
 
 `--video-rendering per-raster` (formerly `accurate`) uses per-raster-line VIC register copies and CIA2 port A (VIC bank) samples. Each of the 25 content rows is dispatched independently to the appropriate pixel renderer (hires text, multicolor text, ECM, hires bitmap, multicolor bitmap) based on **that row's** sampled VIC config; games that flip `$D011`/`$D016`/`$D018`/`$D020`-`$D024` or CIA2-PA between bands (HUD+playfield splits, color bars, charset/bank swaps) compose correctly. The **Python** CPU path calls `MemoryMap.beam_capture_raster_line` from the raster/VIC tick hooks. When the **Rust** fast batch runs with `MemoryMap.beam_render_enabled`, the core writes **`MemoryMap.beam_vic_flat` / `beam_cia2_flat` in place** (no full-buffer copy back per batch); pygame reads those shared bytearrays.
 
-**Granularity:** one sample per raster line, latched at the start of the line. Sub-row effects (mode changes *within* an 8-scanline row, open sideborders, FLI proper, AGSP, per-scanline color stripes inside a row) need the future per-cycle renderer — they will look like they snap to row boundaries under `per-raster`.
+**Granularity:** one sample per raster line, latched at the start of the line. Sub-row effects (mode changes *within* an 8-scanline row, open sideborders, FLI proper, AGSP, per-scanline color stripes inside a row) are better exercised with **`--video-rendering per-cycle`** (text modes today; bitmap still uses the per-frame latch until the bitmap walker lands).
 
 **Border limits:** The presenter samples **one** border color (`$D020`) per raster line from that line’s VIC snapshot. Real hardware and VICE can change the border **several times on the same line**; matching that needs finer-than-line sampling (e.g. cycle-keyed VIC events), not just RAM write batching.
 
 **Charset:** The VIC-II fetches dot patterns from **character ROM** for offsets ``$1000``–``$1FFF`` inside video **banks** ``$0000`` and ``$8000``; the CPU still sees **RAM** at those physical addresses. Pygame uses `MemoryMap.read_vic_charset_glyph_rows` / `read_vic_charset_block_2k` so the boot charset at bank 0 + ``$1000`` matches hardware. For CPU-visible char ROM at ``$D000`` (CHAREN=0), `MemoryMap.read` is still correct.
+
+## 5b. Per-cycle video rendering
+
+`--video-rendering per-cycle` enables a 40×200 sample grid (`MemoryMap.per_cycle_*`) filled from `CPU6502._vic_tick_one` (requires `accurate-python` VIC — forced automatically when needed). Pygame composes **hires / multicolor / ECM text** scanline-by-scanline from those samples; sprites and bitmap modes still use the same limitations as the beam path unless noted otherwise. See `docs/per_cycle_vic.md`.
 
 ## 6. TCP monitor (c64py)
 
