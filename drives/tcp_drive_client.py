@@ -300,8 +300,11 @@ class TcpDriveClient(IECDriveBackend):
             bus = self.iec_bus
             if (
                 bus is not None
-                and bus.listener == self.device_number
                 and bus.talker is None
+                and (
+                    bus.listener == self.device_number
+                    or bus.current_listener == self.device_number
+                )
             ):
                 self._await_listen_ready = True
 

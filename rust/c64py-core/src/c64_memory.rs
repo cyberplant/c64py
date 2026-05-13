@@ -494,10 +494,20 @@ impl<'a> C64MemoryMap<'a> {
                 if !self.iec_merge_cia2 {
                     return self.cia2_pra;
                 }
+                let c64_clk_out = (self.cia2_ddra & 0x10) != 0;
                 let c64_clk_rel = (self.cia2_pra & 0x10) != 0;
+                let clk_hi = if c64_clk_out {
+                    self.iec_peer_clk_high && c64_clk_rel
+                } else {
+                    self.iec_peer_clk_high
+                };
+                let c64_data_out = (self.cia2_ddra & 0x20) != 0;
                 let c64_data_rel = (self.cia2_pra & 0x20) != 0;
-                let clk_hi = self.iec_peer_clk_high && c64_clk_rel;
-                let data_hi = self.iec_peer_data_high && c64_data_rel;
+                let data_hi = if c64_data_out {
+                    self.iec_peer_data_high && c64_data_rel
+                } else {
+                    self.iec_peer_data_high
+                };
                 (self.cia2_pra & 0x3F) | (u8::from(clk_hi) << 6) | (u8::from(data_hi) << 7)
             }
             0x02 => self.cia2_ddra,
