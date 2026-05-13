@@ -38,15 +38,15 @@ def test_c64py_rust_hybrid_vic_zero_disables_rust_batch_for_accurate_rust(monkey
 
 
 @pytest.mark.skipif(_RUST_SKIP, reason="c64py_rust_core not built for this interpreter")
-def test_iec_wire_decode_tap_disables_rust_fast_batch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """KERNAL IEC wire decode must see every CIA2 port A write, not one per Rust batch."""
+def test_iec_wire_decode_tap_still_allows_rust_fast_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IEC wire decode relies on Rust CIA2 replay in ``_core.run_fast_batch``, not on disabling Rust."""
     monkeypatch.delenv("C64PY_USE_RUST_FAST", raising=False)
     mem = MemoryMap()
     mem.ram = bytearray(mem.ram)
     mem.iec_bus = IECBus()
     mem.iec_kernal_tap = KernalIecTap(wire_decode_bus=mem.iec_bus)
     cpu = CPU6502(mem, accurate_vic=False, rust_hybrid_vic=False)
-    assert cpu._rust_fast_batch_usable() is False
+    assert cpu._rust_fast_batch_usable() is True
 
 
 @pytest.mark.skipif(_RUST_SKIP, reason="c64py_rust_core not built for this interpreter")

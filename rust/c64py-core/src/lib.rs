@@ -64,7 +64,7 @@ fn rust_core_version() -> &'static str {
     beam_vic_flat=None, beam_cia2_flat=None,
     per_cycle_capture=false,
     per_cycle_vic_flat=None, per_cycle_cia2_flat=None,
-    trace_path=None,
+    trace_path=None, iec_cia2_write_log=false,
 ))]
 fn run_fast_batch_py<'py>(
     py: Python<'py>,
@@ -149,6 +149,7 @@ fn run_fast_batch_py<'py>(
     per_cycle_vic_flat: Option<Bound<'py, PyByteArray>>,
     per_cycle_cia2_flat: Option<Bound<'py, PyByteArray>>,
     trace_path: Option<String>,
+    iec_cia2_write_log: bool,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
         1u8
@@ -312,7 +313,8 @@ fn run_fast_batch_py<'py>(
 
     // Run the heavy batch outside the GIL so Python-side audio/UI threads can run.
     // Safe: we copied the bytearray into `backing` and do not touch Python objects inside.
-    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 22]), String> =
+    let iec_log_flag = iec_cia2_write_log;
+    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 22], Vec<u8>), String> =
         py.detach(move || (move || {
         let ram_arr: &mut [u8; 65536] = backing
             .as_mut_slice()
@@ -340,6 +342,10 @@ fn run_fast_batch_py<'py>(
         mem.iec_merge_cia2 = iec_enabled;
         mem.iec_peer_clk_high = iec_peer_clk_high;
         mem.iec_peer_data_high = iec_peer_data_high;
+        mem.cia2_iec_log_enabled = iec_log_flag && iec_enabled;
+        if mem.cia2_iec_log_enabled {
+            mem.cia2_iec_log.clear();
+        }
         mem.cia1_timer_a = CiaTimer {
             latch: ta_latch,
             counter: ta_counter,
@@ -473,9 +479,11 @@ fn run_fast_batch_py<'py>(
         mem.per_cycle_vic_ptr = std::ptr::null_mut();
         mem.per_cycle_cia2_ptr = std::ptr::null_mut();
         mem.per_cycle_capture_enabled = false;
-        Ok((out, backing, pcm_bytes, vpack))
+        let cia2_iec_log_out = mem.cia2_iec_log.clone();
+        std::mem::drop(mem);
+        Ok((out, backing, pcm_bytes, vpack, cia2_iec_log_out))
     })());
-    let (out, backing_out, pcm_bytes, vpack) = result.map_err(|e: String| PyValueError::new_err(e))?;
+    let (out, backing_out, pcm_bytes, vpack, cia2_iec_log) = result.map_err(|e: String| PyValueError::new_err(e))?;
     let dst = unsafe { ram.as_bytes_mut() };
     dst.copy_from_slice(&backing_out);
 
@@ -520,6 +528,7 @@ fn run_fast_batch_py<'py>(
     // Beam data is written in-place into Python bytearrays; keep empty trailers for tuple shape.
     let beam_vic_py = PyBytes::new(py, &[]);
     let beam_cia2_py = PyBytes::new(py, &[]);
+    let cia2_log_py = PyBytes::new(py, &cia2_iec_log);
     PyTuple::new(
         py,
         [
@@ -582,6 +591,7 @@ fn run_fast_batch_py<'py>(
             vpack[21].into_bound_py_any(py)?,
             beam_vic_py.into_any(),
             beam_cia2_py.into_any(),
+            cia2_log_py.into_any(),
         ],
     )
 }

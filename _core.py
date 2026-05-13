@@ -122,6 +122,12 @@ def run_fast_batch(
     else:
         stops = [int(x) & 0xFFFF for x in stop_pcs]
 
+    entry_cia2_pra = int(memory.cia2_pra) & 0xFF
+    iec_wire_replay = (
+        memory.iec_bus is not None
+        and getattr(getattr(memory, "iec_kernal_tap", None), "_wire_decoder", None) is not None
+    )
+
     if memory.iec_bus is not None:
         memory.apply_cia2_port_a_to_iec_bus()
         iec_enabled = True
@@ -258,6 +264,7 @@ def run_fast_batch(
         pvc_ba if per_cycle_rust else None,
         pcc_ba if per_cycle_rust else None,
         trace_path,
+        iec_wire_replay,
     )
     (
         ins,
@@ -319,6 +326,7 @@ def run_fast_batch(
         v_sprite_mcbase_hi,
         beam_vic_bytes,
         beam_cia2_bytes,
+        iec_cia2_log_bytes,
     ) = t
     memory.raster_line = rline
     memory.raster_cycles = rcycles
@@ -326,7 +334,6 @@ def run_fast_batch(
     memory.vic_interrupt_state = vist
     memory.pending_irq = pirq
     memory.cia1_icr = cia_icr
-    memory.cia2_pra = c2pra
     memory.cia2_ddra = c2ddra
     ta.latch = tala
     ta.counter = tac
@@ -380,7 +387,16 @@ def run_fast_batch(
     if pcm_bytes and hasattr(memory.sid, "extend_pcm_from_rust"):
         memory.sid.extend_pcm_from_rust(pcm_bytes)
     if memory.iec_bus is not None:
+        if iec_wire_replay and iec_cia2_log_bytes:
+            memory.cia2_pra = entry_cia2_pra
+            memory.apply_cia2_port_a_to_iec_bus()
+            for b in iec_cia2_log_bytes:
+                memory.cia2_pra = int(b) & 0xFF
+                memory.apply_cia2_port_a_to_iec_bus()
+        memory.cia2_pra = int(c2pra) & 0xFF
         memory.apply_cia2_port_a_to_iec_bus()
+    else:
+        memory.cia2_pra = int(c2pra) & 0xFF
     # Beam VIC/CIA2: Rust wrote in-place into memory.beam_vic_flat / beam_cia2_flat.
     if beam_rust and beam_n > 0 and getattr(memory, "beam_vic_flat", None) is not None:
         memory.beam_snapshots_primed = True

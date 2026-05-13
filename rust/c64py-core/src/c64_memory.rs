@@ -110,6 +110,10 @@ pub struct C64MemoryMap<'a> {
     pub per_cycle_vic_ptr: *mut u8,
     pub per_cycle_cia2_ptr: *mut u8,
     pub per_cycle_capture_enabled: bool,
+    /// When true, each CIA2 port A write that changes ATN/CLK/DATA outputs is appended
+    /// to ``cia2_iec_log`` for Python KERNAL wire-decode replay after a Rust batch.
+    pub cia2_iec_log_enabled: bool,
+    pub cia2_iec_log: Vec<u8>,
 }
 
 impl<'a> C64MemoryMap<'a> {
@@ -152,6 +156,8 @@ impl<'a> C64MemoryMap<'a> {
             per_cycle_vic_ptr: std::ptr::null_mut(),
             per_cycle_cia2_ptr: std::ptr::null_mut(),
             per_cycle_capture_enabled: false,
+            cia2_iec_log_enabled: false,
+            cia2_iec_log: Vec::new(),
         }
     }
 
@@ -501,7 +507,15 @@ impl<'a> C64MemoryMap<'a> {
 
     fn write_cia2(&mut self, reg: u8, value: u8) {
         match reg {
-            0x00 => self.cia2_pra = value,
+            0x00 => {
+                if self.cia2_iec_log_enabled {
+                    let old = self.cia2_pra;
+                    if (old ^ value) & 0x38 != 0 && self.cia2_iec_log.len() < 131072 {
+                        self.cia2_iec_log.push(value);
+                    }
+                }
+                self.cia2_pra = value;
+            }
             0x02 => self.cia2_ddra = value,
             _ => {}
         }

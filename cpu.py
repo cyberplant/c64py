@@ -1003,11 +1003,6 @@ class CPU6502:
                 return False
         if not isinstance(self.memory.ram, bytearray):
             return False
-        # Rust batches only sync CIA2 → IEC once at batch boundaries; the KERNAL
-        # wire decoder needs every Port A write to run :meth:`MemoryMap.apply_cia2_port_a_to_iec_bus`.
-        tap = getattr(self.memory, "iec_kernal_tap", None)
-        if tap is not None and getattr(tap, "_wire_decoder", None) is not None:
-            return False
         return True
 
     def _rust_delegate_stop_pcs(self) -> tuple[int, ...]:
