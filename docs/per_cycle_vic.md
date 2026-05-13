@@ -39,6 +39,21 @@ added additively without rewriting the existing renderers:
    stores a per-line snapshot, so this is roughly a 7× expansion of
    that buffer.
 
+### Geometry and buffers
+
+The B1 foundation is checked into `video_beam.py` and `memory.py`:
+
+| Standard | Frame lines | Cycles/line | Content raster window | Content cycle window | Samples/frame |
+|---|---:|---:|---:|---:|---:|
+| PAL | 312 | 63 | 51..250 | 14..53 (0-based VIC cycle) | 8000 |
+| NTSC | 263 | 65 | 51..250 | 14..53 (0-based VIC cycle) | 8000 |
+
+`video_beam.per_cycle_geometry()` returns these bounds and maps a
+`(raster_line, raster_cycle)` pair to a visible sample index, or `None`
+outside the 320x200 content area. `MemoryMap.ensure_per_cycle_buffers()`
+allocates matching VIC and CIA2 snapshot grids plus flat bytearrays for
+future renderer/Rust handoff; it does not render or sample yet.
+
 2. **Pixel-by-pixel renderer.** Walk left-to-right within each
    scanline emitting one pixel at a time using the cycle-correct VIC
    state. Standard text, multicolor text, ECM, hires bitmap and

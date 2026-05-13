@@ -15,6 +15,7 @@ from .constants import (
     VIC_D011_BMM, VIC_D011_ECM, VIC_D016_MCM
 )
 from .cpu_state import CIATimer
+from .video_beam import per_cycle_geometry
 
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
@@ -92,6 +93,13 @@ class MemoryMap:
     beam_cia2_flat: Optional[bytearray] = None
     # True after buffers are filled from current VIC shadow (avoids an all-black first frame).
     beam_snapshots_primed: bool = False
+    # Future per-cycle video tier: one VIC/CIA2 snapshot per visible character cycle.
+    per_cycle_render_enabled: bool = False
+    per_cycle_vic_samples: Optional[List[bytes]] = None
+    per_cycle_cia2_samples: Optional[List[int]] = None
+    per_cycle_vic_flat: Optional[bytearray] = None
+    per_cycle_cia2_flat: Optional[bytearray] = None
+    per_cycle_snapshots_primed: bool = False
     # Optional :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives need KERNAL line tracing.
     iec_kernal_tap: Optional[object] = field(default=None, repr=False)
     # Cached 6510 $01 effective value for MemoryMap.read() hot path (invalidated on $00/$01 writes).
@@ -742,6 +750,44 @@ class MemoryMap:
             self.beam_vic_flat = bytearray(n * 64)
             self.beam_cia2_flat = bytearray(n)
             self.beam_snapshots_primed = False
+
+    def ensure_per_cycle_buffers(self) -> None:
+        """Allocate per-cycle VIC/CIA2 snapshot arrays for the visible content window."""
+        geom = per_cycle_geometry(self.video_standard)
+        n = geom.visible_sample_count
+        need = (
+            self.per_cycle_vic_samples is None
+            or len(self.per_cycle_vic_samples) != n
+            or self.per_cycle_cia2_samples is None
+            or len(self.per_cycle_cia2_samples) != n
+            or self.per_cycle_vic_flat is None
+            or len(self.per_cycle_vic_flat) != n * 64
+            or self.per_cycle_cia2_flat is None
+            or len(self.per_cycle_cia2_flat) != n
+        )
+        if need:
+            self.per_cycle_vic_samples = [bytes(64) for _ in range(n)]
+            self.per_cycle_cia2_samples = [0] * n
+            self.per_cycle_vic_flat = bytearray(n * 64)
+            self.per_cycle_cia2_flat = bytearray(n)
+            self.per_cycle_snapshots_primed = False
+
+    def prime_per_cycle_snapshots_from_current_vic(self) -> None:
+        """Copy current VIC/CIA2 PA into every per-cycle sample slot."""
+        if not self.per_cycle_render_enabled:
+            return
+        self.ensure_per_cycle_buffers()
+        assert self.per_cycle_vic_samples is not None and self.per_cycle_cia2_samples is not None
+        assert self.per_cycle_vic_flat is not None and self.per_cycle_cia2_flat is not None
+        snap = bytes(self._vic_regs[:0x40])
+        pra = self.cia2_pra & 0xFF
+        for i in range(len(self.per_cycle_vic_samples)):
+            self.per_cycle_vic_samples[i] = snap
+            self.per_cycle_cia2_samples[i] = pra
+            o = i * 64
+            self.per_cycle_vic_flat[o : o + 64] = snap
+            self.per_cycle_cia2_flat[i] = pra
+        self.per_cycle_snapshots_primed = True
 
     def prime_beam_snapshots_from_current_vic(self) -> None:
         """Copy current VIC/CIA2 PA into every raster line (baseline before per-line capture)."""
