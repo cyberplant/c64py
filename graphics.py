@@ -1271,18 +1271,30 @@ class PygameInterface:
         sprite_pri = rb(0x1B)
         fo = fg_opaque if len(fg_opaque) == 8 else ((False,) * 8)
 
+        y_exp_mask = rb(0x17)
+        x_exp_mask = rb(0x1D)
+
         for sprite_num in range(7, -1, -1):
             if not (rb(0x15) & (1 << sprite_num)):
                 continue
             behind_gfx = (sprite_pri >> sprite_num) & 1
             y_vic = rb(sprite_num * 2 + 1)
             # Same as _render_sprites: py = screen_top + (y_vic - 50) + row  →  row = y_win - y_vic + 50
-            row = y_win - y_vic + 50
-            if row < 0 or row >= 21:
-                continue
+            row_disp = y_win - y_vic + 50
+            y_exp = (y_exp_mask >> sprite_num) & 1
+            if y_exp:
+                if row_disp < 0 or row_disp >= 42:
+                    continue
+                row = row_disp // 2
+            else:
+                if row_disp < 0 or row_disp >= 21:
+                    continue
+                row = row_disp
 
             x_vic = rb(sprite_num * 2) + (256 if (rb(0x10) & (1 << sprite_num)) else 0)
             sprite_x = x_vic - 24
+            x_exp = (x_exp_mask >> sprite_num) & 1
+            max_rel = 48 if x_exp else 24
             multicolor = (rb(0x1C) & (1 << sprite_num)) != 0
             sp_idx = rb(0x27 + sprite_num) & 0x0F
             sp = self._palette.get(sp_idx, (255, 255, 255))
@@ -1299,9 +1311,9 @@ class PygameInterface:
                         continue
                     cx = x0 + dx
                     rel_x = cx - sprite_x
-                    if rel_x < 0 or rel_x >= 24:
+                    if rel_x < 0 or rel_x >= max_rel:
                         continue
-                    bp = rel_x // 2
+                    bp = rel_x // 4 if x_exp else rel_x // 2
                     bits = (row_data >> (22 - bp * 2)) & 0x03
                     if bits == 0:
                         continue
@@ -1323,9 +1335,10 @@ class PygameInterface:
                         continue
                     cx = x0 + dx
                     rel_x = cx - sprite_x
-                    if rel_x < 0 or rel_x >= 24:
+                    if rel_x < 0 or rel_x >= max_rel:
                         continue
-                    if not ((row_data >> (23 - rel_x)) & 0x01):
+                    bi = rel_x // 2 if x_exp else rel_x
+                    if not ((row_data >> (23 - bi)) & 0x01):
                         continue
                     px = screen_left + cx
                     if sl <= px < sr and st <= py < sb:
@@ -1892,9 +1905,13 @@ class PygameInterface:
             regb, _ = snap
             sprite_mc0 = regb[0x25] & 0x0F if len(regb) > 0x25 else 0
             sprite_mc1 = regb[0x26] & 0x0F if len(regb) > 0x26 else 0
+            y_exp_mask = regb[0x17] & 0xFF if len(regb) > 0x17 else 0
+            x_exp_mask = regb[0x1D] & 0xFF if len(regb) > 0x1D else 0
         else:
             sprite_mc0 = self.emulator.memory.read(0xD025) & 0x0F
             sprite_mc1 = self.emulator.memory.read(0xD026) & 0x0F
+            y_exp_mask = self.emulator.memory.read(0xD017) & 0xFF
+            x_exp_mask = self.emulator.memory.read(0xD01D) & 0xFF
         
         # Render sprites 7→0 so lower-numbered sprites appear in front (VIC-II order).
         for sprite_num in range(7, -1, -1):
@@ -1906,7 +1923,7 @@ class PygameInterface:
             # Get sprite bitmap data (63 bytes per sprite) in VIC bank RAM
             sprite_addr = sprite_data['sprite_ram_base']
 
-            # Sprites are 24x21 pixels
+            # Sprites are 24x21 pixels of data; X/Y expansion stretches to 48x42 on screen.
             # Offset sprite coordinates to screen space
             # VIC-II sprite coordinates are relative to the display area, not the border
             # Subtract 24 pixels for X to align with display area (standard C64 offset)
@@ -1914,47 +1931,57 @@ class PygameInterface:
             sprite_x = sprite_data['x'] - 24
             sprite_y = sprite_data['y'] - 50
             sprite_color = self._palette.get(sprite_data['color'], (255, 255, 255))
+            y_exp = (y_exp_mask >> sprite_num) & 1
+            x_exp = (x_exp_mask >> sprite_num) & 1
             
             # Render sprite pixels
             if sprite_data['multicolor']:
-                # Multicolor sprite: 12x21 (double-wide pixels)
+                # Multicolor sprite: 12x21 data pairs; each pair is 2 or 4 screen pixels wide.
                 for row in range(21):
                     # Each row is 3 bytes
                     byte_offset = (sprite_addr + row * 3) & 0xFFFF
                     row_data = (mem[byte_offset] << 16) | (mem[(byte_offset + 1) & 0xFFFF] << 8) | mem[(byte_offset + 2) & 0xFFFF]
-                    
-                    for bit_pair in range(12):
-                        pixel_bits = (row_data >> (22 - bit_pair * 2)) & 0x03
-                        
-                        if pixel_bits == 0:
-                            continue  # Transparent
-                        elif pixel_bits == 1:
-                            color = self._palette.get(sprite_mc0, (0, 0, 0))
-                        elif pixel_bits == 2:
-                            color = sprite_color
-                        else:  # pixel_bits == 3
-                            color = self._palette.get(sprite_mc1, (0, 0, 0))
-                        
-                        # Draw double-wide pixel
-                        px = screen_left + sprite_x + bit_pair * 2
-                        py = screen_top + sprite_y + row
-                        # Check if pixel is within screen rect bounds
-                        if (self._screen_rect.left <= px < self._screen_rect.right and 
-                            self._screen_rect.top <= py < self._screen_rect.bottom):
-                            self._rgb_frame.fill_rect(px, py, 2, 1, color)
+                    y_steps = (0, 1) if y_exp else (0,)
+                    for ydup in y_steps:
+                        py = screen_top + sprite_y + row * (2 if y_exp else 1) + ydup
+                        for bit_pair in range(12):
+                            pixel_bits = (row_data >> (22 - bit_pair * 2)) & 0x03
+                            
+                            if pixel_bits == 0:
+                                continue  # Transparent
+                            elif pixel_bits == 1:
+                                color = self._palette.get(sprite_mc0, (0, 0, 0))
+                            elif pixel_bits == 2:
+                                color = sprite_color
+                            else:  # pixel_bits == 3
+                                color = self._palette.get(sprite_mc1, (0, 0, 0))
+                            
+                            px = screen_left + sprite_x + bit_pair * (4 if x_exp else 2)
+                            w = 4 if x_exp else 2
+                            if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                self._screen_rect.top <= py < self._screen_rect.bottom):
+                                self._rgb_frame.fill_rect(px, py, w, 1, color)
             else:
-                # Hi-res sprite: 24x21
+                # Hi-res sprite: 24x21 data bits
                 for row in range(21):
                     byte_offset = (sprite_addr + row * 3) & 0xFFFF
                     row_data = (mem[byte_offset] << 16) | (mem[(byte_offset + 1) & 0xFFFF] << 8) | mem[(byte_offset + 2) & 0xFFFF]
-                    
-                    for bit in range(24):
-                        pixel_bit = (row_data >> (23 - bit)) & 0x01
-                        
-                        if pixel_bit:
-                            px = screen_left + sprite_x + bit
-                            py = screen_top + sprite_y + row
-                            # Check if pixel is within screen rect bounds
-                            if (self._screen_rect.left <= px < self._screen_rect.right and 
-                                self._screen_rect.top <= py < self._screen_rect.bottom):
-                                self._rgb_frame.put_pixel(px, py, sprite_color)
+                    y_steps = (0, 1) if y_exp else (0,)
+                    for ydup in y_steps:
+                        py = screen_top + sprite_y + row * (2 if y_exp else 1) + ydup
+                        for bit in range(24):
+                            pixel_bit = (row_data >> (23 - bit)) & 0x01
+                            
+                            if pixel_bit:
+                                px0 = screen_left + sprite_x + bit * (2 if x_exp else 1)
+                                if x_exp:
+                                    for xd in range(2):
+                                        px = px0 + xd
+                                        if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                            self._screen_rect.top <= py < self._screen_rect.bottom):
+                                            self._rgb_frame.put_pixel(px, py, sprite_color)
+                                else:
+                                    px = px0
+                                    if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                        self._screen_rect.top <= py < self._screen_rect.bottom):
+                                        self._rgb_frame.put_pixel(px, py, sprite_color)

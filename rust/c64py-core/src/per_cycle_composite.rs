@@ -257,6 +257,8 @@ fn overlay_sprites_column(
     let mc1 = pal_rgb(pal48, regb[0x26]);
 
     let x0 = col * 8;
+    let y_exp_mask = regb[0x17];
+    let x_exp_mask = regb[0x1D];
     // VIC-II: lower sprite numbers are in front. Composite back-to-front (7 → 0).
     for sn in (0..8usize).rev() {
         if regb[0x15] & (1 << sn) == 0 {
@@ -264,17 +266,27 @@ fn overlay_sprites_column(
         }
         let behind_gfx = (sprite_bg_priority >> sn) & 1 != 0;
         let y_vic = regb[sn * 2 + 1];
-        let row = y_win as i32 - y_vic as i32 + 50;
-        if row < 0 || row >= 21 {
-            continue;
-        }
-        let row = row as usize;
+        let row_disp = y_win as i32 - y_vic as i32 + 50;
+        let y_exp = (y_exp_mask >> sn) & 1 != 0;
+        let row = if y_exp {
+            if row_disp < 0 || row_disp >= 42 {
+                continue;
+            }
+            (row_disp / 2) as usize
+        } else {
+            if row_disp < 0 || row_disp >= 21 {
+                continue;
+            }
+            row_disp as usize
+        };
         let mut xv = regb[sn * 2] as u16;
         if (regb[0x10] & (1 << sn)) != 0 {
             xv |= 256;
         }
         let x_vic = xv;
         let sprite_x = x_vic as i32 - 24;
+        let x_exp = (x_exp_mask >> sn) & 1 != 0;
+        let max_rel: i32 = if x_exp { 48 } else { 24 };
         let multicolor = (regb[0x1C] & (1 << sn)) != 0;
         let sp = pal_rgb(pal48, regb[0x27 + sn]);
 
@@ -291,11 +303,11 @@ fn overlay_sprites_column(
                 }
                 let cx = x0 + dx;
                 let rel_x = cx as i32 - sprite_x;
-                if !(0..24).contains(&rel_x) {
+                if rel_x < 0 || rel_x >= max_rel {
                     continue;
                 }
-                let bp = rel_x / 2;
-                let bits = (row_data >> (22 - bp * 2)) & 0x03;
+                let bp = if x_exp { rel_x / 4 } else { rel_x / 2 };
+                let bits = (row_data >> ((22 - bp * 2) as u32)) & 0x03;
                 if bits == 0 {
                     continue;
                 }
@@ -322,10 +334,11 @@ fn overlay_sprites_column(
                 }
                 let cx = x0 + dx;
                 let rel_x = cx as i32 - sprite_x;
-                if !(0..24).contains(&rel_x) {
+                if rel_x < 0 || rel_x >= max_rel {
                     continue;
                 }
-                if (row_data >> (23 - rel_x)) & 1 == 0 {
+                let bi = if x_exp { rel_x / 2 } else { rel_x };
+                if (row_data >> ((23 - bi) as u32)) & 1 == 0 {
                     continue;
                 }
                 let px = screen_left + cx;
