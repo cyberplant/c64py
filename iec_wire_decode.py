@@ -79,7 +79,10 @@ class IecAtnWireDecoder:
         if self._pending_byte is None:
             return
         if (
-            self._bus.listener is not None
+            (
+                self._bus.listener is not None
+                or self._bus.current_listener is not None
+            )
             and self._bus.secondary_phase in ("open", "data")
         ):
             self._bus.send_byte(self._pending_byte & 0xFF, eoi=True)
@@ -89,7 +92,7 @@ class IecAtnWireDecoder:
     def _data_phase_active(self) -> bool:
         b = self._bus
         return (
-            b.listener is not None
+            (b.listener is not None or b.current_listener is not None)
             and b.talker is None
             and b.secondary_phase in ("open", "data")
         )

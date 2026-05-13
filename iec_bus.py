@@ -249,9 +249,14 @@ class IECBus:
         - Otherwise fall back to the legacy ``receive_byte(byte)`` hook.
         """
         self.eoi = bool(eoi)
-        if self.listener is None:
+        dev = (
+            self.current_listener
+            if self.current_listener is not None
+            else self.listener
+        )
+        if dev is None:
             return False
-        device = self._find_device(self.listener)
+        device = self._find_device(dev)
         if device is None:
             return False
         if hasattr(device, "iec_receive_byte"):

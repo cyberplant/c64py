@@ -326,8 +326,11 @@ class TcpDriveClient(IECDriveBackend):
             bus is not None
             and bus.atn
             and bus.secondary_phase == "data"
-            and bus.listener == self.device_number
             and bus.talker is None
+            and (
+                bus.listener == self.device_number
+                or bus.current_listener == self.device_number
+            )
         ):
             bus.set_data(self._iec_peer_tag, False)
             self._listen_data_low = True

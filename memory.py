@@ -227,6 +227,16 @@ class MemoryMap:
 
         # I/O area (can be ROM or RAM depending on memory config)
         if ROM_CHAR_START <= addr < ROM_CHAR_END:
+            if (
+                self.iec_bus is not None
+                and CIA2_BASE <= addr < CIA2_BASE + 0x10
+            ):
+                # CIA2 ($DD00) lives in the $D000-$DFFF decode window. When CHAREN=0 the
+                # CPU normally sees character ROM / RAM here, but KERNAL's IEC routines
+                # still hit $DD00 for the serial bus. If we left those reads on the RAM
+                # backing, bit-bang polling would see stale data and the wire decoder
+                # would never run. Always decode CIA2 when an IEC bus is attached.
+                return self._read_io(addr)
             if charen:
                 # I/O registers (VIC, SID, CIA, etc.)
                 return self._read_io(addr)
@@ -326,7 +336,12 @@ class MemoryMap:
             self.ram[addr] = value
         elif ROM_CHAR_START <= addr < ROM_CHAR_END:
             # I/O area
-            if charen:  # I/O enabled
+            if (
+                self.iec_bus is not None
+                and CIA2_BASE <= addr < CIA2_BASE + 0x10
+            ):
+                self._write_io(addr, value)
+            elif charen:  # I/O enabled
                 self._write_io(addr, value)
             else:
                 self.ram[addr] = value
