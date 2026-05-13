@@ -11,11 +11,13 @@ change after CIA2 port A is applied **or** when peripherals toggle CLK/DATA
 
 **ATN released** (``atn`` True) while the C64 is sending to a listener
 (``listener`` set, ``talker`` is None, ``secondary_phase`` is ``open`` or
-``data``): the same bit framing invokes :meth:`~c64py.iec_bus.IECBus.send_byte``
-(A3b filename after OPEN; A3c partial for ``PRINT#`` / channel data). Completed
-bytes are held briefly so the **last** byte before the next ATN-held command
-(typically UNLISTEN) is sent with ``eoi=True``; earlier bytes use
-``eoi=False``.
+``data``): each falling CLK edge while ATN stays released invokes
+:meth:`~c64py.iec_bus.IECBus.send_byte` (A3b filename after OPEN; A3c partial for
+``PRINT#`` / channel data). A CLK fall on the **same** CIA2 update that releases
+ATN (leaving the ATN-held secondary command) is counted too, so the first payload
+bit is not lost. Completed bytes are held briefly so the **last** byte before the
+next ATN-held command (typically UNLISTEN) is sent with ``eoi=True``; earlier bytes
+use ``eoi=False``.
 
 **TALK / INPUT# (experimental):** when ``talk_pull_receive`` is true (env
 ``C64PY_IEC_WIRE_DECODE_TALK`` via :class:`~c64py.iec_kernal_bridge.KernalIecTap`),
@@ -138,21 +140,28 @@ class IecAtnWireDecoder:
     def feed_transition(self, prev: Triple, cur: Triple, _cyc: int = 0) -> None:
         """Handle one resolved-bus transition (previous → new triple)."""
         patn, pclk, pdata = prev
-        catn, cclk, _cdata = cur
+        catn, cclk, cdata = cur
 
         if patn and not catn:
             self._flush_last_pending()
             self._reset_shift()
         elif not patn and catn:
+            # ATN released (end of ATN-held command bytes). Do not return yet:
+            # KERNAL often releases ATN and clocks the first data-phase bit in one
+            # CIA2 port A write; that combined transition must still sample DATA.
             self._reset_shift()
-            return
 
         if not patn and not catn and pclk and not cclk:
             self._sample_atn_command_bit(pdata)
             return
 
-        if patn and catn and pclk and not cclk:
+        # Data / TALK sampling: ATN must be released in *cur* (open-collector idle).
+        if catn and pclk and not cclk:
             if self._data_phase_active():
-                self._sample_data_phase_bit(pdata)
+                # When ATN is released in the same transition as this CLK fall, ``prev``
+                # still reflects the last ATN-held command bit on DATA; the payload bit is
+                # already visible in ``cur``.
+                dsamp = cdata if not patn else pdata
+                self._sample_data_phase_bit(dsamp)
             elif self._talk_receive_active():
                 self._sample_talk_data_bit(pdata)

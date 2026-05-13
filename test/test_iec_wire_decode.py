@@ -94,6 +94,29 @@ def _synthetic_listen_data_byte_unlisten(data_byte: int = 0x41) -> list[tuple[bo
     return seq
 
 
+def _synthetic_listen_data_coalesced_atn_release_first_clk(data_byte: int = 0x55) -> list[tuple[bool, bool, bool]]:
+    """Like ``_synthetic_listen_data_byte_unlisten`` but first payload CLK fall is
+    coalesced with ATN release (one resolved-bus step), matching real KERNAL timing.
+    """
+    seq: list[tuple[bool, bool, bool]] = [(True, True, True), (False, True, True)]
+    for cmd in (0x28, 0x61):
+        _append_wired_byte(seq, False, cmd)
+    bit0 = data_byte & 1
+    first_dh = bit0 == 0
+    seq.append((True, False, first_dh))
+    prev_atn = True
+    for bit_i in range(1, 8):
+        bit = (data_byte >> bit_i) & 1
+        data_high = bit == 0
+        seq.append((prev_atn, True, data_high))
+        seq.append((prev_atn, False, data_high))
+        seq.append((prev_atn, True, data_high))
+    seq.append((False, True, True))
+    _append_wired_byte(seq, False, 0x3F)
+    seq.append((True, True, True))
+    return seq
+
+
 def _synthetic_talk_data_one_byte(payload: int) -> list[tuple[bool, bool, bool]]:
     """TALK 8 + DATA secondary ch0, ATN up, one payload byte."""
     seq: list[tuple[bool, bool, bool]] = [(True, True, True), (False, True, True)]
@@ -165,6 +188,19 @@ def test_wire_decoder_data_phase_one_byte():
     bus.attach_device(_IecRxRecorder())
     dec = IecAtnWireDecoder(bus)
     path = _synthetic_listen_data_byte_unlisten(0x55)
+    _feed_state_path(dec, path)
+    assert dec.commands_delivered == [0x28, 0x61, 0x3F]
+    assert dec.bytes_sent == [(0x55, True)]
+    dev = bus.devices[0]
+    assert isinstance(dev, _IecRxRecorder)
+    assert dev.rx == [(0x55, True)]
+
+
+def test_wire_decoder_data_phase_coalesced_atn_release_and_first_clock_edge():
+    bus = IECBus()
+    bus.attach_device(_IecRxRecorder())
+    dec = IecAtnWireDecoder(bus)
+    path = _synthetic_listen_data_coalesced_atn_release_first_clk(0x55)
     _feed_state_path(dec, path)
     assert dec.commands_delivered == [0x28, 0x61, 0x3F]
     assert dec.bytes_sent == [(0x55, True)]
