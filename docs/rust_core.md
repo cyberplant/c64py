@@ -21,18 +21,21 @@ built (`maturin develop --manifest-path rust/c64py-core/Cargo.toml`).
   (KERNAL LOAD/SAVE hooks), and `$FF5B`/`$FFCF` when there is no
   KERNAL ROM.
 - Optional reSID lockstep clocking from inside the Rust batch via the
-  shared `resid_c.dylib`.
+  shared `resid_c.dylib` (including hybrid-IRQ phases so SID time matches
+  the emulated cycle counter).
+- **Per-cycle pygame tier:** with the extension built, hybrid VIC fills
+  `per_cycle_vic_flat` / `per_cycle_cia2_flat` during `run_fast_batch`, and
+  `_core.composite_per_cycle_frame` draws text, bitmap, and sprites in one
+  pass (sprite expansion, line-latched attribute regs, ``$D01B`` vs opaque fg;
+  env toggles `C64PY_RUST_PER_CYCLE`, `C64PY_RUST_COMPOSITE`).
 - Differential test coverage: `test/test_rust_core_parity.py`,
   `test/test_kernal_hook_rts.py`, plus Rust `cargo test` in
   `rust/c64py-core/`.
 
 ## Remaining work
 
-1. **BA / CPU-stall arbitration** in the Rust hybrid VIC path.
-   The Python per-cycle accurate-VIC engine stalls the CPU when the
-   VIC pulls BA low for c-access / sprite DMA fetches; the Rust
-   hybrid path currently does not. This is the main known-gap vs
-   `--vic-emulation accurate-python`.
+1. **Rust hybrid vs ``accurate-python``** — parity for newly reported VIC/CPU
+   timing cases; see `test/test_rust_core_parity.py`.
 
 2. **Coarse "run N cycles with breakpoints"**. Today each batch is
    bounded by `C64PY_RUST_BATCH` (default 64) plus stop PCs; a
@@ -43,9 +46,3 @@ built (`maturin develop --manifest-path rust/c64py-core/Cargo.toml`).
 3. **Trace / UDP-debug paths** still force Python `step()` per
    instruction. A native trace emitter in Rust would let those modes
    keep batching.
-
-4. **Per-cycle rendering with Rust.** When `c64py_rust_core` is built, `--video-rendering per-cycle`
-   defaults to **`--vic-emulation accurate-rust`**: `run_fast_batch` runs the hybrid VIC and fills
-   `per_cycle_vic_flat` / `per_cycle_cia2_flat` each visible-cycle (disable with `C64PY_RUST_PER_CYCLE=0`).
-   Pygame can composite that grid in one FFI call via `_core.composite_per_cycle_frame` (on by default;
-   set `C64PY_RUST_COMPOSITE=0` to use the Python compositor). See [`per_cycle_vic.md`](per_cycle_vic.md).

@@ -67,23 +67,27 @@ VIC shadow (`$D000`–`$D03F`) and CIA2 port A into the slot for the current
 Fast VIC mode does not call `_vic_tick_one`, so per-cycle buffers stay
 empty unless accurate VIC is enabled.
 
-**B4 (CLI):** `--video-rendering per-cycle` (or `video.rendering = "per-cycle"`
-in TOML) turns on `per_cycle_render_enabled`, primes buffers at startup, and
-forces `--vic-emulation accurate-python` when needed so `_vic_tick_one` runs
-each cycle. `--accurate` normally selects per-raster + accurate-rust; if
-you combine it with per-cycle (CLI or merged config), VIC stays on
-accurate-python so sampling works.
+**B4 (CLI):** `--video-rendering per-cycle` turns on `per_cycle_render_enabled`, primes buffers
+at startup, and (when `c64py_rust_core` is built) prefers **`--vic-emulation accurate-rust`**
+with hybrid VIC so `run_fast_batch` fills the flat buffers each visible cycle; use
+`C64PY_RUST_PER_CYCLE=0` to keep sampling in Python. Without the Rust extension, per-cycle
+still requires **`accurate-python`** VIC so `_vic_tick_one` runs each cycle.
 
-**B3 (text + bitmap + sprites):** `PygameInterface._render_frame_per_cycle` reads the
-sample grid and draws hires / multicolor / ECM text, **hires / multicolor bitmap**, and
-**sprites** (per 8-pixel column from the sample at that cycle). Sprite-sprite order matches
-silicon (**sprite 0 in front of sprite 7**; compositor draws 7 → 0). ``$D01B``
-sprite/background priority is approximated for opaque foreground pixels in hires and
-multicolor text/bitmap rows (hires bitmap: per-bit ``1`` pixels block behind-sprites). True
+**B3 (text + bitmap + sprites):** `PygameInterface._render_frame_per_cycle` (or
+`_core.composite_per_cycle_frame` when enabled) reads the sample grid and draws hires /
+multicolor / ECM text, **hires / multicolor bitmap**, and **sprites**. Per-column samples
+drive sprite **X**, **enable**, and video-matrix context; **$D017 / $D01D / $D01C / $D01B** and
+sprite colours **$D025–$D02E** are taken from the **first visible cycle** of each raster line
+(column 0) so one sprite is not torn across mixed expansion/palette bytes when the KERNAL
+changes those registers between character cycles. **Sprite X/Y expansion** is honoured
+(48×42 screen extent from 24×21 data). Sprite-sprite order matches silicon (**sprite 0 in
+front of sprite 7**; compositor draws 7 → 0). ``$D01B`` sprite/background priority is
+approximated for opaque foreground pixels in hires and multicolor text/bitmap rows. True
 BA/DMA timing is still approximated compared to silicon.
 
-5. **Sprite DMA / finer priority.** Further align sprite drawing with VIC fetch timing and
-   border/latch edge cases beyond the current ``$D01B`` foreground mask.
+5. **Sprite DMA / finer priority.** Further align sprite drawing with VIC internal fetch
+   buffers, multiplex edge cases, and border/latch timing beyond the current foreground mask
+   and line-latched attribute registers.
 
 6. **Gating and golden tests.** `per-cycle` is opt-in via `--video-rendering`
    / TOML. The first regression target is a frame where per-raster output
@@ -91,18 +95,10 @@ BA/DMA timing is still approximated compared to silicon.
    `scripts/render_n_frames.py` supports `--video-rendering per-cycle` for
    snapshot-based frame hashes.
 
-7. **Performance.** The dominant cost is **`--vic-emulation accurate-python`**
-   (full Python VIC cycle step per CPU cycle). Host compositing is secondary but
-   was improved by: (a) writing only the **flat** `per_cycle_vic_flat` /
-   `per_cycle_cia2_flat` in the sampler — no per-slot `bytes(64)` allocations
-   (~8000/frame); (b) **bulk priming** of those flats at startup; (c) an LRU
-   **glyph row cache** in the pygame path for repeated screen codes; (d) optional
-   `C64PY_PER_CYCLE_NO_SPRITES=1` to skip the per-column sprite overlay when you
-   only care about background splits. Expect per-cycle to remain much slower than
-   per-raster for interactive use; use per-raster for daily play. A future win is
-   one **native compositor** pass per frame over the flat buffers (see
-   `docs/rust_core.md`); that does not remove the Python VIC stepping cost unless
-   sampling moves to Rust too.
+7. **Performance.** With the Rust extension, hybrid VIC + **native compositor** (`_core.composite_per_cycle_frame`,
+   on by default; `C64PY_RUST_COMPOSITE=0` for Python drawing) makes per-cycle usable for
+   interactive play. Optional `C64PY_PER_CYCLE_NO_SPRITES=1` skips sprite overlay. Remaining
+   cost is dominated by anything still on the Python path (e.g. IEC stepping, debugging).
 
 ## When to implement
 
