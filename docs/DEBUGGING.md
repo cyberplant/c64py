@@ -79,7 +79,7 @@ Run the same PRG or D64 with these combinations and note **which configuration f
 
 ## 5b. Per-cycle video rendering
 
-`--video-rendering per-cycle` enables a 40×200 sample grid (`MemoryMap.per_cycle_*`) filled from `CPU6502._vic_tick_one` (requires `accurate-python` VIC — forced automatically when needed). Pygame composes **text** (hires / multicolor / ECM), **bitmap** (hires / multicolor), and **sprites** scanline-by-scanline from those samples (sprites use the same per-column register snapshot as the background). See `docs/per_cycle_vic.md`.
+`--video-rendering per-cycle` enables a 40×200 sample grid (`MemoryMap.per_cycle_*`) filled from `CPU6502._vic_tick_one` (requires `accurate-python` VIC — forced automatically when needed). Pygame composes **text** (hires / multicolor / ECM), **bitmap** (hires / multicolor), and **sprites** scanline-by-scanline from those samples (sprites use the same per-column register snapshot as the background). **Performance:** accurate-python stepping dominates wall time; set `C64PY_PER_CYCLE_NO_SPRITES=1` to skip sprite overlay if you only need background splits. See `docs/per_cycle_vic.md`.
 
 ## 6. TCP monitor (c64py)
 

@@ -56,8 +56,8 @@ The B1 foundation is checked into `video_beam.py` and `memory.py`:
 `video_beam.per_cycle_geometry()` returns these bounds and maps a
 `(raster_line, raster_cycle)` pair to a visible sample index, or `None`
 outside the 320x200 content area. `MemoryMap.ensure_per_cycle_buffers()`
-allocates matching VIC and CIA2 snapshot grids plus flat bytearrays for
-renderer/Rust handoff.
+allocates matching VIC and CIA2 **flat** bytearrays (`per_cycle_vic_flat`,
+`per_cycle_cia2_flat`) for the renderer (and a future native compositor).
 
 **B2 sampler:** when `MemoryMap.per_cycle_render_enabled` is true,
 `MemoryMap.per_cycle_capture_vic_sample()` runs at the end of each
@@ -88,10 +88,18 @@ true BA/DMA timing are still approximated compared to silicon.
    `scripts/render_n_frames.py` supports `--video-rendering per-cycle` for
    snapshot-based frame hashes.
 
-7. **Performance.** Expect the per-cycle path to be 5–10× slower than
-   per-raster. It is acceptable as a correctness mode, not the
-   default. Consider a Rust implementation in `c64py-core` once the
-   Python prototype is stable.
+7. **Performance.** The dominant cost is **`--vic-emulation accurate-python`**
+   (full Python VIC cycle step per CPU cycle). Host compositing is secondary but
+   was improved by: (a) writing only the **flat** `per_cycle_vic_flat` /
+   `per_cycle_cia2_flat` in the sampler — no per-slot `bytes(64)` allocations
+   (~8000/frame); (b) **bulk priming** of those flats at startup; (c) an LRU
+   **glyph row cache** in the pygame path for repeated screen codes; (d) optional
+   `C64PY_PER_CYCLE_NO_SPRITES=1` to skip the per-column sprite overlay when you
+   only care about background splits. Expect per-cycle to remain much slower than
+   per-raster for interactive use; use per-raster for daily play. A future win is
+   one **native compositor** pass per frame over the flat buffers (see
+   `docs/rust_core.md`); that does not remove the Python VIC stepping cost unless
+   sampling moves to Rust too.
 
 ## When to implement
 

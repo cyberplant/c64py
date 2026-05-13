@@ -4,6 +4,8 @@ Pygame graphics interface for the C64 emulator.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import os
 import re
 import sys
@@ -121,6 +123,10 @@ class PygameInterface:
         # Standard hires text when RAM charset matches char ROM: pygame blit (built once per ROM+offset).
         self._rom_glyph_key: Optional[Tuple[int, int]] = None  # (id(char_rom), rom_offset)
         self._rom_glyph_surfaces: Optional[list] = None
+        # Charset row cache (vic bank, char base, screen code) → 8 glyph bytes; bounded LRU.
+        # Speeds per-cycle compositing (8000 cells/frame) when the same codes repeat (e.g. BASIC boot).
+        self._glyph_rows_cache: OrderedDict[tuple[int, int, int], bytes] = OrderedDict()
+        self._glyph_rows_cache_max: int = 8192
 
         self._palette = {
             0: (0, 0, 0),
@@ -863,9 +869,18 @@ class PygameInterface:
 
     def _fetch_glyph_rows(self, vic_bank_base: int, char_base: int, screen_code: int) -> bytes:
         """Read 8 bytes of charset definition as the VIC-II fetches (incl. ROM mirror at bank+$1000)."""
-        return self.emulator.memory.read_vic_charset_glyph_rows(
-            vic_bank_base, char_base, screen_code & 0xFF
-        )
+        code = screen_code & 0xFF
+        key = (vic_bank_base, char_base, code)
+        cache = self._glyph_rows_cache
+        hit = cache.get(key)
+        if hit is not None:
+            cache.move_to_end(key)
+            return hit
+        row = self.emulator.memory.read_vic_charset_glyph_rows(vic_bank_base, char_base, code)
+        cache[key] = row
+        if len(cache) > self._glyph_rows_cache_max:
+            cache.popitem(last=False)
+        return row
 
     def _plot_hires_text_cell(self, x: int, y: int, rows: bytes, fg_idx: int) -> None:
         """Draw an 8×8 hires glyph; unset bits leave the existing background."""
@@ -1315,6 +1330,7 @@ class PygameInterface:
         vs = mem.video_standard
         geom = per_cycle_geometry(vs)
         flat_mv = memoryview(flat)
+        skip_sprites = _env_truthy("C64PY_PER_CYCLE_NO_SPRITES")
 
         nlines = geom.raster_lines
         total_lines = nlines
@@ -1412,7 +1428,8 @@ class PygameInterface:
                         color_data,
                         color_mem,
                     )
-                    self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
+                    if not skip_sprites:
+                        self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
                     continue
 
                 char_base = mode_info["char_base"]
@@ -1445,7 +1462,8 @@ class PygameInterface:
                         fg = (color_code & 0x07) if multicolor_text else color_code
                         self._plot_hires_text_scanline(x, py, row_bytes[scan], fg)
 
-                self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
+                if not skip_sprites:
+                    self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
 
         if mem.vic_render_snapshots:
             mem.snapshot_vic_render_state()

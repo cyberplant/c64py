@@ -35,12 +35,15 @@ def test_per_cycle_capture_writes_visible_slots() -> None:
         mem.raster_cycles = cy
         mem.per_cycle_capture_vic_sample()
 
-    assert mem.per_cycle_vic_samples is not None
+    flat = mem.per_cycle_vic_flat
+    cia = mem.per_cycle_cia2_flat
+    assert flat is not None and cia is not None
     for cy in range(geom.content_cycles):
-        snap = mem.per_cycle_vic_samples[cy]
+        o = cy * 64
+        snap = flat[o : o + 64]
         assert snap[0x11] == 0x1B
         assert snap[0x18] == 0x32
-        assert mem.per_cycle_cia2_samples[cy] == 0xAA
+        assert cia[cy] == 0xAA
 
 
 def test_per_cycle_capture_mid_line_d011_diff() -> None:
@@ -65,7 +68,10 @@ def test_per_cycle_capture_mid_line_d011_diff() -> None:
     i0 = geom.sample_index(line, 14)
     i1 = geom.sample_index(line, 15)
     assert i0 is not None and i1 is not None
-    assert mem.per_cycle_vic_samples is not None
-    assert mem.per_cycle_vic_samples[i0][0x11] == 0x1B
-    assert mem.per_cycle_vic_samples[i1][0x11] == 0x5B
-    assert mem.per_cycle_vic_samples[i0] != mem.per_cycle_vic_samples[i1]
+    flat = mem.per_cycle_vic_flat
+    assert flat is not None
+    s0 = flat[i0 * 64 : (i0 + 1) * 64]
+    s1 = flat[i1 * 64 : (i1 + 1) * 64]
+    assert s0[0x11] == 0x1B
+    assert s1[0x11] == 0x5B
+    assert s0 != s1
