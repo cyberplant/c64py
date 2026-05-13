@@ -34,6 +34,25 @@ Omit both to run **without** an inserted image (TCP `attach_disk` / fast RPC onl
 
 The ``test/fixtures/disk_host_*.bas`` listings intentionally include **``OPEN`` / ``PRINT#``** (and **``SAVE``**) so they remain **regression targets** once the KERNAL→logical bridge lands; see ``test/fixtures/README_disk_bas.md``.
 
+### KERNAL IEC tap JSONL
+
+For bridge debugging, set ``C64PY_IEC_TAP_JSONL=/path/to/tap.jsonl`` while running a C64 instance with a TCP drive attached. ``iec_kernal_bridge.KernalIecTap`` appends one newline-delimited JSON object for each CIA2-derived resolved bus transition:
+
+```json
+{"cyc":120,"atn":true,"clk":false,"data":false}
+```
+
+Schema:
+
+| Key | Type | Meaning |
+|---|---|---|
+| ``cyc`` | integer | ``MemoryMap.debug_last_cycles`` at the CIA2 apply point. |
+| ``atn`` | boolean | Resolved ATN line after the write. |
+| ``clk`` | boolean | Resolved CLK line after the write. |
+| ``data`` | boolean | Resolved DATA line after the write. |
+
+Line booleans follow the ``IECBus`` convention: ``true`` means released/high, ``false`` means asserted/low. The tap records transitions only after C64 CIA2 port A writes; it does not yet capture device-side line changes or synthesize logical JSON commands.
+
 ## `--interface`
 
 | Value | Behavior |
