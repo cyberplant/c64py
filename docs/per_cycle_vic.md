@@ -54,6 +54,14 @@ outside the 320x200 content area. `MemoryMap.ensure_per_cycle_buffers()`
 allocates matching VIC and CIA2 snapshot grids plus flat bytearrays for
 future renderer/Rust handoff; it does not render or sample yet.
 
+**B2 sampler:** when `MemoryMap.per_cycle_render_enabled` is true,
+`MemoryMap.per_cycle_capture_vic_sample()` runs at the end of each
+`CPU6502._vic_tick_one()` (accurate VIC path only). It copies the current
+VIC shadow (`$D000`–`$D03F`) and CIA2 port A into the slot for the current
+`(raster_line, raster_cycle)` when that pair lies in the visible window.
+Fast VIC mode does not call `_vic_tick_one`, so per-cycle buffers stay
+empty unless accurate VIC is enabled.
+
 2. **Pixel-by-pixel renderer.** Walk left-to-right within each
    scanline emitting one pixel at a time using the cycle-correct VIC
    state. Standard text, multicolor text, ECM, hires bitmap and

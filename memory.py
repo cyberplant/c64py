@@ -824,6 +824,30 @@ class MemoryMap:
         self.beam_cia2_flat[line] = pr
         self.beam_snapshots_primed = True
 
+    def per_cycle_capture_vic_sample(self) -> None:
+        """Record VIC + CIA2 PA at the current raster line/cycle when inside the visible window.
+
+        Intended to run once per emulated VIC cycle from :meth:`cpu.CPU6502._vic_tick_one`
+        after ``raster_line`` / ``raster_cycles`` are updated. When ``per_cycle_render_enabled``
+        is false, this is a no-op. Fast VIC (coarse raster) mode never calls this.
+        """
+        if not self.per_cycle_render_enabled:
+            return
+        geom = per_cycle_geometry(self.video_standard)
+        idx = geom.sample_index(self.raster_line, self.raster_cycles)
+        if idx is None:
+            return
+        self.ensure_per_cycle_buffers()
+        assert self.per_cycle_vic_flat is not None and self.per_cycle_cia2_flat is not None
+        assert self.per_cycle_vic_samples is not None
+        vic_slice = self._vic_regs[:0x40]
+        pr = self.cia2_pra & 0xFF
+        o = idx * 64
+        self.per_cycle_vic_flat[o : o + 64] = vic_slice
+        self.per_cycle_cia2_flat[idx] = pr
+        self.per_cycle_vic_samples[idx] = bytes(vic_slice)
+        self.per_cycle_cia2_samples[idx] = pr
+
     def _read_cia2(self, reg: int) -> int:
         """Read CIA2 register.
         
