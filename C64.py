@@ -756,11 +756,16 @@ def main():
         args.video_rendering = _VIDEO_RENDERING_ALIASES[args.video_rendering]
 
     def _rust_ext_cli_available() -> bool:
+        # Match _check_rust_core_available / _warn_if_rust_fast_core_unavailable: when C64.py is
+        # run as a script (``python C64.py``), ``from . import _core`` fails; use ``c64py``.
         try:
             from . import _core
-            return bool(_core.is_available)
         except ImportError:
-            return False
+            try:
+                from c64py import _core
+            except ImportError:
+                return False
+        return bool(_core.is_available)
 
     rust_per_cycle_ok = _rust_ext_cli_available() and os.environ.get(
         "C64PY_RUST_PER_CYCLE", "1"
