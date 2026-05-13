@@ -210,6 +210,28 @@ fn plot_bitmap_scanline(
     }
 }
 
+/// Pixels that count as opaque "foreground" for VIC-II sprite/background priority ($D01B).
+#[inline]
+fn fg_opaque_hires_row(row_b: u8) -> [bool; 8] {
+    let mut o = [false; 8];
+    for dx in 0..8 {
+        o[dx] = (row_b >> (7 - dx)) & 1 != 0;
+    }
+    o
+}
+
+#[inline]
+fn fg_opaque_mcm_row(row_b: u8) -> [bool; 8] {
+    let mut o = [false; 8];
+    for pair in 0..4 {
+        let bits = (row_b >> (6 - pair * 2)) & 0x03;
+        let op = bits != 0;
+        o[pair * 2] = op;
+        o[pair * 2 + 1] = op;
+    }
+    o
+}
+
 fn overlay_sprites_column(
     buf: &mut [u8],
     w: usize,
@@ -224,6 +246,8 @@ fn overlay_sprites_column(
     screen_top: usize,
     screen_bottom: usize,
     pal48: &[u8],
+    sprite_bg_priority: u8,
+    fg_opaque: &[bool; 8],
 ) {
     let vic_bank = (3 - (pra & 0x03)) as u32 * 0x4000;
     let m = mode_from_regb(regb);
@@ -233,10 +257,12 @@ fn overlay_sprites_column(
     let mc1 = pal_rgb(pal48, regb[0x26]);
 
     let x0 = col * 8;
-    for sn in 0..8usize {
+    // VIC-II: lower sprite numbers are in front. Composite back-to-front (7 → 0).
+    for sn in (0..8usize).rev() {
         if regb[0x15] & (1 << sn) == 0 {
             continue;
         }
+        let behind_gfx = (sprite_bg_priority >> sn) & 1 != 0;
         let y_vic = regb[sn * 2 + 1];
         let row = y_win as i32 - y_vic as i32 + 50;
         if row < 0 || row >= 21 {
@@ -259,6 +285,10 @@ fn overlay_sprites_column(
 
         if multicolor {
             for dx in 0..8usize {
+                let dx_idx = dx;
+                if behind_gfx && fg_opaque[dx_idx] {
+                    continue;
+                }
                 let cx = x0 + dx;
                 let rel_x = cx as i32 - sprite_x;
                 if !(0..24).contains(&rel_x) {
@@ -286,6 +316,10 @@ fn overlay_sprites_column(
             }
         } else {
             for dx in 0..8usize {
+                let dx_idx = dx;
+                if behind_gfx && fg_opaque[dx_idx] {
+                    continue;
+                }
                 let cx = x0 + dx;
                 let rel_x = cx as i32 - sprite_x;
                 if !(0..24).contains(&rel_x) {
@@ -462,6 +496,12 @@ pub fn composite_per_cycle_frame(
                     pal48,
                 );
                 if !skip_sprites {
+                    let fg_op = if m.mcm {
+                        fg_opaque_mcm_row(byte)
+                    } else {
+                        fg_opaque_hires_row(byte)
+                    };
+                    let spr_pri = regb.get(0x1B).copied().unwrap_or(0);
                     overlay_sprites_column(
                         rgb_out,
                         native_w,
@@ -476,6 +516,8 @@ pub fn composite_per_cycle_frame(
                         screen_top,
                         screen_bottom,
                         pal48,
+                        spr_pri,
+                        &fg_op,
                     );
                 }
                 continue;
@@ -485,22 +527,25 @@ pub fn composite_per_cycle_frame(
             let raw_code = ram[(screen_base + char_index) & 0xFFFF];
             let color_code = ram[(COLOR_MEM + char_index) & 0xFFFF] & 0x0F;
 
+            let row_byte_text: u8;
             if m.ecm {
                 let bg_index = (raw_code >> 6) & 0x03;
                 let code_ecm = raw_code & 0x3F;
                 let char_bg = pal_rgb(pal48, bg_colors[bg_index as usize]);
                 fill_rect_rgb(rgb_out, native_w, x, py, 8, 1, char_bg);
                 let rows = read_glyph_rows(ram, char_rom, vic_bank, char_base, code_ecm);
+                row_byte_text = rows[scan];
                 plot_hires_scanline(
                     rgb_out,
                     native_w,
                     x,
                     py,
-                    rows[scan],
+                    row_byte_text,
                     pal_rgb(pal48, color_code),
                 );
             } else {
                 let rows = read_glyph_rows(ram, char_rom, vic_bank, char_base, raw_code);
+                row_byte_text = rows[scan];
                 let multicolor_text = m.mcm && !m.ecm;
                 if multicolor_text && (color_code & 0x08) != 0 {
                     plot_mcm_text_scanline(
@@ -508,7 +553,7 @@ pub fn composite_per_cycle_frame(
                         native_w,
                         x,
                         py,
-                        rows[scan],
+                        row_byte_text,
                         pal48,
                         color_code & 0x07,
                         bg_colors[0],
@@ -526,12 +571,21 @@ pub fn composite_per_cycle_frame(
                         native_w,
                         x,
                         py,
-                        rows[scan],
+                        row_byte_text,
                         pal_rgb(pal48, fg),
                     );
                 }
             }
             if !skip_sprites {
+                let multicolor_text = m.mcm && !m.ecm;
+                let fg_op = if m.ecm {
+                    fg_opaque_hires_row(row_byte_text)
+                } else if multicolor_text && (color_code & 0x08) != 0 {
+                    fg_opaque_mcm_row(row_byte_text)
+                } else {
+                    fg_opaque_hires_row(row_byte_text)
+                };
+                let spr_pri = regb.get(0x1B).copied().unwrap_or(0);
                 overlay_sprites_column(
                     rgb_out,
                     native_w,
@@ -546,6 +600,8 @@ pub fn composite_per_cycle_frame(
                     screen_top,
                     screen_bottom,
                     pal48,
+                    spr_pri,
+                    &fg_op,
                 );
             }
         }
@@ -564,5 +620,18 @@ mod tests {
         assert_eq!(per_cycle_flat_index(0, 250, 53), Some(7999));
         assert!(per_cycle_flat_index(0, 50, 14).is_none());
         assert!(per_cycle_flat_index(0, 51, 13).is_none());
+    }
+
+    #[test]
+    fn fg_opaque_hires_alternating() {
+        let o = fg_opaque_hires_row(0xAA);
+        assert_eq!(o, [true, false, true, false, true, false, true, false]);
+    }
+
+    #[test]
+    fn fg_opaque_mcm_pair() {
+        let o = fg_opaque_mcm_row(0xC0);
+        assert!(o[0] && o[1]);
+        assert!(!o[2] && !o[3]);
     }
 }

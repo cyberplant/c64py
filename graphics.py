@@ -1206,6 +1206,22 @@ class PygameInterface:
                 if screen_right < native_w:
                     self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
 
+    @staticmethod
+    def _vic_fg_opaque_hires_row(row_byte: int) -> Tuple[bool, ...]:
+        """Foreground bits for VIC-II sprite/background priority ($D01B), hires glyph row."""
+        return tuple(bool((row_byte >> (7 - dx)) & 1) for dx in range(8))
+
+    @staticmethod
+    def _vic_fg_opaque_mcm_row(row_byte: int) -> Tuple[bool, ...]:
+        """Opaque (non-transparent 00) pairs for multicolor text/bitmap rows."""
+        o = [False] * 8
+        for pair in range(4):
+            bits = (row_byte >> (6 - pair * 2)) & 0x03
+            op = bits != 0
+            o[pair * 2] = op
+            o[pair * 2 + 1] = op
+        return tuple(o)
+
     def _per_cycle_overlay_sprites_eight_pixels(
         self,
         mem: "MemoryMap",
@@ -1214,12 +1230,16 @@ class PygameInterface:
         y_win: int,
         col: int,
         py: int,
+        fg_opaque: Tuple[bool, ...],
     ) -> None:
         """Draw sprite pixels for one 8-pixel content strip using this column's VIC/CIA2 sample.
 
         Uses the same screen-space mapping as :meth:`_render_sprites` (``y - 50`` / ``x - 24``)
         so sprites line up with the latched path; register values come from the per-cycle grid
         so mid-raster sprite register changes affect the correct column.
+
+        Sprites are composited **7 → 0** (VIC-II: lower index in front). ``fg_opaque`` marks which
+        of the eight column pixels count as opaque foreground for ``$D01B`` sprite-behind-gfx.
         """
         if self._rgb_frame is None:
             return
@@ -1248,9 +1268,13 @@ class PygameInterface:
 
         x0 = col * self.CHAR_WIDTH
 
-        for sprite_num in range(8):
+        sprite_pri = rb(0x1B)
+        fo = fg_opaque if len(fg_opaque) == 8 else ((False,) * 8)
+
+        for sprite_num in range(7, -1, -1):
             if not (rb(0x15) & (1 << sprite_num)):
                 continue
+            behind_gfx = (sprite_pri >> sprite_num) & 1
             y_vic = rb(sprite_num * 2 + 1)
             # Same as _render_sprites: py = screen_top + (y_vic - 50) + row  →  row = y_win - y_vic + 50
             row = y_win - y_vic + 50
@@ -1271,6 +1295,8 @@ class PygameInterface:
 
             if multicolor:
                 for dx in range(8):
+                    if behind_gfx and fo[dx]:
+                        continue
                     cx = x0 + dx
                     rel_x = cx - sprite_x
                     if rel_x < 0 or rel_x >= 24:
@@ -1293,6 +1319,8 @@ class PygameInterface:
                         buf[i + 2] = b
             else:
                 for dx in range(8):
+                    if behind_gfx and fo[dx]:
+                        continue
                     cx = x0 + dx
                     rel_x = cx - sprite_x
                     if rel_x < 0 or rel_x >= 24:
@@ -1461,7 +1489,13 @@ class PygameInterface:
                         color_mem,
                     )
                     if not skip_sprites:
-                        self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
+                        if mode_info.get("multicolor"):
+                            fg_op = self._vic_fg_opaque_mcm_row(byte)
+                        else:
+                            fg_op = self._vic_fg_opaque_hires_row(byte)
+                        self._per_cycle_overlay_sprites_eight_pixels(
+                            mem, regb, pra, y_win, col, py, fg_op
+                        )
                     continue
 
                 char_base = mode_info["char_base"]
@@ -1477,14 +1511,16 @@ class PygameInterface:
                     char_bg = self._palette.get(bg_colors[bg_index], (0, 0, 0))
                     self._rgb_frame.fill_rect(x, py, self.CHAR_WIDTH, 1, char_bg)
                     row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code_ecm)
-                    self._plot_hires_text_scanline(x, py, row_bytes[scan], color_code)
+                    row_byte_text = row_bytes[scan]
+                    self._plot_hires_text_scanline(x, py, row_byte_text, color_code)
                 else:
                     row_bytes = self._fetch_glyph_rows(vic_bank, char_base, raw_code)
+                    row_byte_text = row_bytes[scan]
                     if multicolor_text and (color_code & 0x08):
                         self._plot_mcm_text_scanline(
                             x,
                             py,
-                            row_bytes[scan],
+                            row_byte_text,
                             color_code & 0x07,
                             bg_colors[0],
                             bg_colors[1],
@@ -1492,10 +1528,18 @@ class PygameInterface:
                         )
                     else:
                         fg = (color_code & 0x07) if multicolor_text else color_code
-                        self._plot_hires_text_scanline(x, py, row_bytes[scan], fg)
+                        self._plot_hires_text_scanline(x, py, row_byte_text, fg)
 
                 if not skip_sprites:
-                    self._per_cycle_overlay_sprites_eight_pixels(mem, regb, pra, y_win, col, py)
+                    if extended_color:
+                        fg_op = self._vic_fg_opaque_hires_row(row_byte_text)
+                    elif multicolor_text and (color_code & 0x08):
+                        fg_op = self._vic_fg_opaque_mcm_row(row_byte_text)
+                    else:
+                        fg_op = self._vic_fg_opaque_hires_row(row_byte_text)
+                    self._per_cycle_overlay_sprites_eight_pixels(
+                        mem, regb, pra, y_win, col, py, fg_op
+                    )
 
         if mem.vic_render_snapshots:
             mem.snapshot_vic_render_state()
@@ -1852,8 +1896,8 @@ class PygameInterface:
             sprite_mc0 = self.emulator.memory.read(0xD025) & 0x0F
             sprite_mc1 = self.emulator.memory.read(0xD026) & 0x0F
         
-        # Render sprites 0-7 (back to front)
-        for sprite_num in range(8):
+        # Render sprites 7→0 so lower-numbered sprites appear in front (VIC-II order).
+        for sprite_num in range(7, -1, -1):
             sprite_data = self.emulator.memory.get_sprite_data(sprite_num, for_render=True)
             
             if not sprite_data['enabled']:

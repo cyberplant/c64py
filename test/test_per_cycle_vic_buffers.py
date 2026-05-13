@@ -72,3 +72,21 @@ def test_prime_per_cycle_snapshots_is_gated() -> None:
 
     assert mem.per_cycle_vic_flat is None
     assert mem.per_cycle_snapshots_primed is False
+
+
+def test_vic_fg_opaque_helpers_match_compositor_rules() -> None:
+    from c64py.graphics import PygameInterface
+
+    assert PygameInterface._vic_fg_opaque_hires_row(0xAA) == (
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+    )
+    t = PygameInterface._vic_fg_opaque_mcm_row(0xC0)
+    assert t[0] and t[1]
+    assert not t[2] and not t[3]

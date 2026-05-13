@@ -76,11 +76,14 @@ accurate-python so sampling works.
 
 **B3 (text + bitmap + sprites):** `PygameInterface._render_frame_per_cycle` reads the
 sample grid and draws hires / multicolor / ECM text, **hires / multicolor bitmap**, and
-**sprites** (per 8-pixel column from the sample at that cycle). Sprite-sprite priority and
-true BA/DMA timing are still approximated compared to silicon.
+**sprites** (per 8-pixel column from the sample at that cycle). Sprite-sprite order matches
+silicon (**sprite 0 in front of sprite 7**; compositor draws 7 → 0). ``$D01B``
+sprite/background priority is approximated for opaque foreground pixels in hires and
+multicolor text/bitmap rows (hires bitmap: per-bit ``1`` pixels block behind-sprites). True
+BA/DMA timing is still approximated compared to silicon.
 
-5. **Sprite DMA / priority.** Further align sprite drawing with VIC fetch timing and
-   `$D01B` priority (today the compositor is host-side from register snapshots).
+5. **Sprite DMA / finer priority.** Further align sprite drawing with VIC fetch timing and
+   border/latch edge cases beyond the current ``$D01B`` foreground mask.
 
 6. **Gating and golden tests.** `per-cycle` is opt-in via `--video-rendering`
    / TOML. The first regression target is a frame where per-raster output
