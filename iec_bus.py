@@ -258,29 +258,14 @@ class IECBus:
         # Legacy device: returns just an int.
         return device.send_byte()
         
-    def send_command(self, command: int) -> bool:
-        """Send a command byte with ATN asserted.
+    def deliver_command(self, command: int) -> bool:
+        """Apply a logical IEC command byte **without** toggling ATN on the bus.
 
-        Primary commands:
-            0x20 + dev (0..30)  LISTEN device
-            0x3F                UNLISTEN
-            0x40 + dev (0..30)  TALK device
-            0x5F                UNTALK
-
-        Secondary commands (interpreted relative to the current LISTEN/TALK):
-            0x60 + ch  open data on channel ch (assumes file already open)
-            0x70 + ch  reserved (treated like 0x60+ch for safety)
-            0xE0 + ch  close channel ch
-            0xF0 + ch  open new file on channel ch — filename bytes follow
-                       (until UNLISTEN) and are streamed to the listener via
-                       send_byte/iec_receive_byte.
-
-        Returns:
-            True if the command was recognised and dispatched.
+        Used when a KERNAL wire decoder has already asserted ATN on the CIA2
+        lines and only the listener/talker/secondary state machine must run.
+        :meth:`send_command` wraps this with ``set_atn(False)`` / ``set_atn(True)``
+        for programmatic / test callers.
         """
-        # Assert ATN
-        self.set_atn(False)
-
         handled = True
 
         if 0x20 <= command <= 0x3E:
@@ -382,9 +367,31 @@ class IECBus:
         else:
             handled = False
 
-        # Release ATN
-        self.set_atn(True)
+        return handled
 
+    def send_command(self, command: int) -> bool:
+        """Send a command byte with ATN asserted.
+
+        Primary commands:
+            0x20 + dev (0..30)  LISTEN device
+            0x3F                UNLISTEN
+            0x40 + dev (0..30)  TALK device
+            0x5F                UNTALK
+
+        Secondary commands (interpreted relative to the current LISTEN/TALK):
+            0x60 + ch  open data on channel ch (assumes file already open)
+            0x70 + ch  reserved (treated like 0x60+ch for safety)
+            0xE0 + ch  close channel ch
+            0xF0 + ch  open new file on channel ch — filename bytes follow
+                       (until UNLISTEN) and are streamed to the listener via
+                       send_byte/iec_receive_byte.
+
+        Returns:
+            True if the command was recognised and dispatched.
+        """
+        self.set_atn(False)
+        handled = self.deliver_command(command)
+        self.set_atn(True)
         return handled
 
     def unlisten(self) -> bool:

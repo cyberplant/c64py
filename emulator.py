@@ -952,7 +952,15 @@ class C64:
             if m.iec_kernal_tap is None:
                 from .iec_kernal_bridge import KernalIecTap
 
-                m.iec_kernal_tap = KernalIecTap()
+                wire = os.environ.get("C64PY_IEC_WIRE_DECODE", "").strip().lower() in (
+                    "1",
+                    "yes",
+                    "true",
+                    "on",
+                )
+                m.iec_kernal_tap = KernalIecTap(
+                    wire_decode_bus=m.iec_bus if wire else None,
+                )
         else:
             m.iec_kernal_tap = None
 
