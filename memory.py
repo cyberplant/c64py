@@ -726,11 +726,16 @@ class MemoryMap:
         """
         if self.iec_bus is None:
             return
-        v = self.cia2_pra & 0xFF
-        # Invert: bit set on CIA2 means "pull low" → bus state False.
-        self.iec_bus.set_atn((v & 0x08) == 0)
-        self.iec_bus.set_clk("c64", (v & 0x10) == 0)
-        self.iec_bus.set_data("c64", (v & 0x20) == 0)
+        bus = self.iec_bus
+        bus.iec_line_events_suppressed = True
+        try:
+            v = self.cia2_pra & 0xFF
+            # Invert: bit set on CIA2 means "pull low" → bus state False.
+            self.iec_bus.set_atn((v & 0x08) == 0)
+            self.iec_bus.set_clk("c64", (v & 0x10) == 0)
+            self.iec_bus.set_data("c64", (v & 0x20) == 0)
+        finally:
+            bus.iec_line_events_suppressed = False
         tap = self.iec_kernal_tap
         if tap is not None:
             tap.after_cia2_applied(self)

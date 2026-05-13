@@ -64,3 +64,38 @@ def test_kernal_iec_tap_writes_jsonl_from_env(monkeypatch, tmp_path):
         {"cyc": 170, "atn": True, "clk": True, "data": True},
     ]
     tap.close()
+
+
+def test_kernal_tap_records_drive_clk_when_line_receiver_attached():
+    mem = MemoryMap()
+    bus = IECBus()
+    mem.iec_bus = bus
+    tap = KernalIecTap()
+    mem.iec_kernal_tap = tap
+    tap.attach_line_receiver(bus)
+
+    class _D8:
+        device_number = 8
+        iec_bus = None
+
+        def on_atn_changed(self, _s: bool) -> None:
+            pass
+
+        def notify_bus_change(self) -> None:
+            pass
+
+    bus.attach_device(_D8())
+    mem.cia2_pra = 0xC7
+    mem.apply_cia2_port_a_to_iec_bus()
+    mem.apply_cia2_port_a_to_iec_bus()
+    assert tap.transition_count == 0
+
+    bus.set_clk("drive8", False)
+    assert tap.transition_count == 1
+    ev = tap.recent_events()[-1]
+    assert ev[1] is True and ev[2] is False  # ATN released, CLK asserted (low)
+
+    mem.debug_last_cycles = 5000
+    bus.set_clk("drive8", True)
+    assert tap.transition_count == 2
+    assert tap.recent_events()[-1][0] == 5000

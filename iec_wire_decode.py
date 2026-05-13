@@ -2,7 +2,8 @@
 
 Observes resolved ``(ATN, CLK, DATA)`` triples (same convention as
 :class:`~c64py.iec_bus.IECBus`: ``True`` = line released / high) on each bus
-change after CIA2 port A is applied.
+change after CIA2 port A is applied **or** when peripherals toggle CLK/DATA
+(see :attr:`~c64py.iec_bus.IECBus.iec_line_receiver`).
 
 **ATN asserted** (``atn`` False): each falling edge on CLK samples DATA into an
 8-bit shift register (LSB first; DATA high = serial ``0``). Eight bits invoke
@@ -10,20 +11,28 @@ change after CIA2 port A is applied.
 
 **ATN released** (``atn`` True) while the C64 is sending to a listener
 (``listener`` set, ``talker`` is None, ``secondary_phase`` is ``open`` or
-``data``): the same bit framing invokes :meth:`~c64py.iec_bus.IECBus.send_byte`
+``data``): the same bit framing invokes :meth:`~c64py.iec_bus.IECBus.send_byte``
 (A3b filename after OPEN; A3c partial for ``PRINT#`` / channel data). Completed
 bytes are held briefly so the **last** byte before the next ATN-held command
 (typically UNLISTEN) is sent with ``eoi=True``; earlier bytes use
 ``eoi=False``.
 
-**Not implemented:** EOI inferred solely from inter-byte timing, ``TALK`` /
-``INPUT#`` (drive as clock master), and full hardware listener ``CLK`` holds.
-Enable with ``C64PY_IEC_WIRE_DECODE=1`` via :class:`~c64py.iec_kernal_bridge.KernalIecTap`.
+**TALK / INPUT# (experimental):** when ``talk_pull_receive`` is true (env
+``C64PY_IEC_WIRE_DECODE_TALK`` via :class:`~c64py.iec_kernal_bridge.KernalIecTap`),
+during ``TALK`` data phase the same CLK sampling calls
+:meth:`~c64py.iec_bus.IECBus.receive_byte` after each assembled byte. This can
+prefetch TCP drive replies and is **off by default**.
+
+**Not implemented:** EOI inferred solely from inter-byte timing, full hardware
+listener ``CLK`` holds.
+
+Enable wire decode with ``C64PY_IEC_WIRE_DECODE=1`` via
+:class:`~c64py.iec_kernal_bridge.KernalIecTap`.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .iec_bus import IECBus
@@ -32,24 +41,28 @@ Triple = Tuple[bool, bool, bool]  # (atn released?, clk high?, data high?)
 
 
 class IecAtnWireDecoder:
-    """Decode ATN command bytes and C64→listener data bytes from CLK/DATA edges."""
+    """Decode ATN command bytes and C64↔listener data bytes from CLK/DATA edges."""
 
     __slots__ = (
         "_bus",
         "_bit_idx",
         "_pending_byte",
         "_shift",
+        "_talk_pull_receive",
         "bytes_sent",
         "commands_delivered",
+        "talk_logical_reads",
     )
 
-    def __init__(self, bus: "IECBus") -> None:
+    def __init__(self, bus: "IECBus", *, talk_pull_receive: bool = False) -> None:
         self._bus = bus
         self._bit_idx = 0
         self._shift = 0
         self._pending_byte: Optional[int] = None
+        self._talk_pull_receive = bool(talk_pull_receive)
         self.commands_delivered: List[int] = []
         self.bytes_sent: List[Tuple[int, bool]] = []
+        self.talk_logical_reads: List[Any] = []
 
     def reset(self) -> None:
         self._bit_idx = 0
@@ -79,6 +92,15 @@ class IecAtnWireDecoder:
             and b.secondary_phase in ("open", "data")
         )
 
+    def _talk_receive_active(self) -> bool:
+        b = self._bus
+        return (
+            self._talk_pull_receive
+            and b.talker is not None
+            and b.listener is None
+            and b.secondary_phase == "data"
+        )
+
     def _sample_atn_command_bit(self, pdata: bool) -> None:
         wire_bit = 0 if pdata else 1
         self._shift |= wire_bit << self._bit_idx
@@ -103,6 +125,16 @@ class IecAtnWireDecoder:
             self.bytes_sent.append((self._pending_byte & 0xFF, False))
         self._pending_byte = completed
 
+    def _sample_talk_data_bit(self, pdata: bool) -> None:
+        wire_bit = 0 if pdata else 1
+        self._shift |= wire_bit << self._bit_idx
+        self._bit_idx += 1
+        if self._bit_idx != 8:
+            return
+        self._reset_shift()
+        result = self._bus.receive_byte()
+        self.talk_logical_reads.append(result)
+
     def feed_transition(self, prev: Triple, cur: Triple, _cyc: int = 0) -> None:
         """Handle one resolved-bus transition (previous → new triple)."""
         patn, pclk, pdata = prev
@@ -119,5 +151,8 @@ class IecAtnWireDecoder:
             self._sample_atn_command_bit(pdata)
             return
 
-        if patn and catn and pclk and not cclk and self._data_phase_active():
-            self._sample_data_phase_bit(pdata)
+        if patn and catn and pclk and not cclk:
+            if self._data_phase_active():
+                self._sample_data_phase_bit(pdata)
+            elif self._talk_receive_active():
+                self._sample_talk_data_bit(pdata)

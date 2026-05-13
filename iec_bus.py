@@ -55,10 +55,12 @@ Logical (byte-level) protocol — modelled by ``send_command``/``send_byte``/
 
 from __future__ import annotations
 
-from typing import Optional, List, TYPE_CHECKING
+from typing import Optional, List, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .drives.c1541_emulator import Drive1541
+
+Triple = Tuple[bool, bool, bool]
 
 
 class IECBus:
@@ -70,6 +72,11 @@ class IECBus:
         self.atn = True  # Attention line (C64 controls)
         self.clk = True  # Clock line (bidirectional)
         self.data = True  # Data line (bidirectional)
+        # When True, :meth:`set_atn` / :meth:`set_clk` / :meth:`set_data` skip
+        # :attr:`iec_line_receiver` (used to batch CIA2 port A into one tap event).
+        self.iec_line_events_suppressed: bool = False
+        # Optional tap / decoder implementing ``on_iec_lines(before, after, cyc=0)``.
+        self.iec_line_receiver: Optional[object] = None
         
         # Track who's pulling each line low
         self.clk_pullers = set()  # Set of device IDs pulling CLK low
@@ -93,6 +100,17 @@ class IECBus:
         self.eoi = False
         # Latches an EOI-on-receive so callers can poll after receive_byte().
         self.eoi_pending = False
+
+    def line_triple(self) -> Triple:
+        """Resolved ``(ATN, CLK, DATA)`` with ``True`` = released / high."""
+        return (bool(self.atn), bool(self.clk), bool(self.data))
+
+    def _emit_iec_line_change_if_needed(self, before: Triple, after: Triple, cyc: int = 0) -> None:
+        if before == after or self.iec_line_events_suppressed:
+            return
+        recv = self.iec_line_receiver
+        if recv is not None and hasattr(recv, "on_iec_lines"):
+            recv.on_iec_lines(before, after, cyc)
         
     def attach_device(self, device: Drive1541) -> None:
         """Attach a device to the bus.
@@ -119,6 +137,7 @@ class IECBus:
         Args:
             state: True = released (high), False = asserted (low)
         """
+        before = self.line_triple()
         if self.atn != state:
             self.atn = state
             # Notify all devices of ATN change
@@ -126,6 +145,8 @@ class IECBus:
                 device.on_atn_changed(state)
                 if hasattr(device, "notify_bus_change"):
                     device.notify_bus_change()
+        after = self.line_triple()
+        self._emit_iec_line_change_if_needed(before, after, 0)
                 
     def set_clk(self, device_id: str, state: bool) -> None:
         """Set CLK line state from a specific device.
@@ -134,6 +155,7 @@ class IECBus:
             device_id: ID of device setting the line
             state: True = released (high), False = asserted (low)
         """
+        before = self.line_triple()
         prev = self.clk
         if state:
             # Release - remove from pullers
@@ -148,6 +170,8 @@ class IECBus:
             for device in self.devices:
                 if hasattr(device, "notify_bus_change"):
                     device.notify_bus_change()
+        after = self.line_triple()
+        self._emit_iec_line_change_if_needed(before, after, 0)
         
     def set_data(self, device_id: str, state: bool) -> None:
         """Set DATA line state from a specific device.
@@ -156,6 +180,7 @@ class IECBus:
             device_id: ID of device setting the line
             state: True = released (high), False = asserted (low)
         """
+        before = self.line_triple()
         prev = self.data
         if state:
             # Release - remove from pullers
@@ -170,6 +195,8 @@ class IECBus:
             for device in self.devices:
                 if hasattr(device, "notify_bus_change"):
                     device.notify_bus_change()
+        after = self.line_triple()
+        self._emit_iec_line_change_if_needed(before, after, 0)
         
     def get_clk(self) -> bool:
         """Get current CLK line state.

@@ -945,6 +945,9 @@ class C64:
         """Install :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives are attached."""
         m = self.memory
         if not getattr(self, "use_iec_bus", False) or self.iec_bus is None:
+            tap = m.iec_kernal_tap
+            if tap is not None:
+                tap.detach_line_receiver()
             m.iec_kernal_tap = None
             return
         has_tcp = any(isinstance(d, TcpDriveClient) for d in self.iec_drives.values())
@@ -958,10 +961,15 @@ class C64:
                     "true",
                     "on",
                 )
-                m.iec_kernal_tap = KernalIecTap(
+                tap = KernalIecTap(
                     wire_decode_bus=m.iec_bus if wire else None,
                 )
+                m.iec_kernal_tap = tap
+                tap.attach_line_receiver(m.iec_bus)
         else:
+            tap = m.iec_kernal_tap
+            if tap is not None:
+                tap.detach_line_receiver()
             m.iec_kernal_tap = None
 
     def attach_tcp_drive(self, device: int, addr: str) -> bool:

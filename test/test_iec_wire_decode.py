@@ -94,6 +94,17 @@ def _synthetic_listen_data_byte_unlisten(data_byte: int = 0x41) -> list[tuple[bo
     return seq
 
 
+def _synthetic_talk_data_one_byte(payload: int) -> list[tuple[bool, bool, bool]]:
+    """TALK 8 + DATA secondary ch0, ATN up, one payload byte."""
+    seq: list[tuple[bool, bool, bool]] = [(True, True, True), (False, True, True)]
+    for cmd in (0x48, 0x60):
+        _append_wired_byte(seq, False, cmd)
+    seq.append((True, True, True))
+    _append_wired_byte(seq, True, payload)
+    seq.append((True, True, True))
+    return seq
+
+
 def _feed_state_path(decoder: IecAtnWireDecoder, states: list[tuple[bool, bool, bool]]) -> None:
     prev = states[0]
     for s in states[1:]:
@@ -160,6 +171,60 @@ def test_wire_decoder_data_phase_one_byte():
     dev = bus.devices[0]
     assert isinstance(dev, _IecRxRecorder)
     assert dev.rx == [(0x55, True)]
+
+
+class _TalkerDev:
+    device_number = 8
+    iec_bus = None
+
+    def on_atn_changed(self, _s: bool) -> None:
+        pass
+
+    def on_listen(self) -> None:
+        pass
+
+    def on_unlisten(self) -> None:
+        pass
+
+    def on_talk(self) -> None:
+        pass
+
+    def on_untalk(self) -> None:
+        pass
+
+    def on_secondary_address(self, _channel: int) -> None:
+        pass
+
+    def iec_open_channel(self, _channel: int) -> None:
+        pass
+
+    def iec_close_channel(self, _channel: int) -> None:
+        pass
+
+    def iec_secondary(self, _channel: int, _kind: str) -> None:
+        pass
+
+    def iec_unlisten(self) -> None:
+        pass
+
+    def iec_untalk(self) -> None:
+        pass
+
+    def iec_receive_byte(self, _byte: int, _eoi: bool = False) -> None:
+        pass
+
+    def iec_send_byte(self):
+        return (0x99, False)
+
+
+def test_talk_wire_decoder_receive_pull_when_enabled():
+    bus = IECBus()
+    bus.attach_device(_TalkerDev())
+    dec = IecAtnWireDecoder(bus, talk_pull_receive=True)
+    path = _synthetic_talk_data_one_byte(0x99)
+    _feed_state_path(dec, path)
+    assert dec.commands_delivered == [0x48, 0x60]
+    assert dec.talk_logical_reads == [(0x99, False)]
 
 
 def _bus_triple_to_cia2_pra(atn_released: bool, clk_released: bool, data_released: bool) -> int:
