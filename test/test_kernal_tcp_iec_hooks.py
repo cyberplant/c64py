@@ -1,4 +1,4 @@
-"""KERNAL TCP IEC fast hooks (OPEN / CHROUT / CIOUT / CLRCHN)."""
+"""KERNAL TCP IEC fast hooks (OPEN / CHKIN / CHKOUT / CLRCHN / BASIN / CHROUT / CIOUT)."""
 
 from c64py.cpu import CPU6502
 from c64py.emulator import C64
@@ -19,6 +19,63 @@ def test_rust_delegate_includes_tcp_iec_vectors_when_memory_flag_set() -> None:
     assert 0xFFC0 in stops
     assert 0xFFC3 in stops
     assert 0xFFCF in stops
+
+
+def test_clrchn_vector_is_ffcc_not_ffc6() -> None:
+    """CLRCHN is $FFCC (JMP $0322); $FFC6 is CHKIN — hooks must match."""
+    from c64py.kernal_tcp_iec_hooks import handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+
+        def connect(self) -> bool:
+            return True
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    emu.memory.write(0x9A, 8)
+    emu.memory.write(0x99, 8)
+    emu.cpu.state.pc = 0xFFCC
+    assert handle_kernal_tcp_iec(emu) is True
+    assert emu.memory.read(0x9A) == 3
+    assert emu.memory.read(0x99) == 0
+
+
+def test_chkin_vector_ffc6_sets_dfltn() -> None:
+    from c64py.kernal_tcp_iec_hooks import FAT, LAT, SAT, handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+
+        def connect(self) -> bool:
+            return True
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    idx = 0
+    emu.memory.write(LAT + idx, 1)
+    emu.memory.write(FAT + idx, 8)
+    emu.memory.write(SAT + idx, 15)
+    emu.cpu.state.pc = 0xFFC6
+    emu.cpu.state.a = 1
+    assert handle_kernal_tcp_iec(emu) is True
+    assert emu.memory.read(0x99) == 8
 
 
 def test_open_hook_uses_setlfs_zp_fa_sa_order() -> None:

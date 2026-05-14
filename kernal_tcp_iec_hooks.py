@@ -70,12 +70,13 @@ def handle_kernal_tcp_iec(emu: "C64") -> bool:
         return _hook_open(emu, bus)
     if pc == 0xFFC3:
         return _hook_close(emu, bus)
+    # Official KERNAL vectors (901227-03): CHKIN $FFC6, CHKOUT $FFC9, CLRCHN $FFCC.
     if pc == 0xFFC6:
-        return _hook_clrchn(emu, bus)
+        return _hook_chkin(emu, bus)
     if pc == 0xFFC9:
         return _hook_chkout(emu, bus)
     if pc == 0xFFCC:
-        return _hook_chkin(emu, bus)
+        return _hook_clrchn(emu, bus)
     if pc == 0xFFCF:
         return _hook_basin(emu, bus)
     # BSOUT ($F9ED): BASIC PRINT#; CIOUT ($FDF9); CHROUT ($FFD2).
