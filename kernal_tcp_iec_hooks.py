@@ -1,6 +1,6 @@
 """KERNAL jump-table fast path for logical IEC over :class:`~c64py.drives.tcp_drive_client.TcpDriveClient`.
 
-These hooks run only when :attr:`c64py.emulator.C64Emulator.kernal_load_shortcut_enabled` is on
+These hooks run only when :attr:`c64py.emulator.C64.kernal_load_shortcut_enabled` is on
 and the target device is 8–11 with a TCP drive client attached. They mirror the KERNAL
 calling convention at the official vectors and return via synthetic ``RTS`` without
 executing KERNAL ROM, so the bit-level CIA2 wire decoder remains available when this
