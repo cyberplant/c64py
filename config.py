@@ -610,6 +610,7 @@ _EDITOR_DOTTED_DISPLAY_PREFIXES: tuple[str, ...] = (
     "input.gamepad.",
     "video.",
     "audio.",
+    "c1541.",
     "debug.",
 )
 
@@ -837,6 +838,11 @@ def _editor_build_rows() -> List[Any]:
         ("fld", "debug.udp_debug", "bool", None),
         ("fld", "debug.udp_port", "int", None),
         ("fld", "debug.screen_update_interval", "float", None),
+    ]
+    rows.append(("hdr", "--- C1541 (TCP DRIVE) ---"))
+    rows += [
+        ("fld", "c1541.file_logging_enabled", "bool", None),
+        ("fld", "c1541.file_logging_filename", "str", None),
     ]
     rows.append(("hdr", "--- JOYSTICK PORT 1 — KEYBOARD ---"))
     for d in ("up", "down", "left", "right"):
@@ -1090,6 +1096,54 @@ def _capture_numeric_value(
         pygame.key.set_repeat(400, 85)
 
 
+def _capture_text_value(
+    pygame: Any,
+    screen: Any,
+    font: Any,
+    prompt: str,
+    current: str,
+    *,
+    max_len: int = 240,
+) -> Optional[str]:
+    """Small text prompt for path-like strings; Enter accepts, Esc cancels."""
+
+    buf = str(current) if current is not None else ""
+    pygame.key.set_repeat(200, 45)
+    try:
+        while True:
+            screen.fill(_EDITOR_BG)
+            y = 24
+            for line in (
+                prompt,
+                "Type path, Enter = OK   Esc = cancel   Backspace",
+                "(use {date} and {device} placeholders if desired)",
+                "",
+                f"> {buf}_",
+            ):
+                screen.blit(font.render(line[:118], _EDITOR_FG, _EDITOR_BG), (24, y))
+                y += font.line_skip + 2
+            pygame.display.flip()
+            pygame.event.pump()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if event.type != pygame.KEYDOWN:
+                    continue
+                if event.key == pygame.K_ESCAPE:
+                    return None
+                if event.key == pygame.K_RETURN:
+                    return buf[:max_len]
+                if event.key == pygame.K_BACKSPACE:
+                    buf = buf[:-1]
+                    continue
+                ch = event.unicode
+                if ch and ch.isprintable() and len(buf) < max_len:
+                    buf += ch
+            pygame.time.wait(10)
+    finally:
+        pygame.key.set_repeat(400, 85)
+
+
 def _capture_keyboard_binding(pygame: Any, screen: Any, font: _EditorFont) -> Optional[str]:
     msg = "Press a key to bind (Esc cancel)"
     deadline = pygame.time.get_ticks() + 15_000
@@ -1142,7 +1196,7 @@ def _run_pygame_config_editor(path: Path) -> int:
     editor_help_lines: tuple[str, ...] = (
         "UP/DOWN / WHEEL: move   CLICK: row   DOUBLE-CLICK: edit",
         "DEL / X: clear binding   LEFT/RIGHT: nudge value",
-        "ENTER: edit   F10: factory reset   S: save   Q / ESC: quit",
+        "ENTER: edit (incl. text paths)   F10: factory reset   S: save   Q / ESC: quit",
     )
     editor_help_n = len(editor_help_lines)
 
@@ -1244,6 +1298,17 @@ def _run_pygame_config_editor(path: Path) -> int:
                 _config_set(cfg, dotted, token)
                 dirty = True
             _, joystick_banner = _editor_refresh_joysticks(pygame)
+        elif typ == "str" and key == pygame.K_RETURN:
+            newv = _capture_text_value(
+                pygame,
+                screen,
+                font,
+                f"New value for {dotted}",
+                str(cur) if cur is not None else "",
+            )
+            if newv is not None:
+                _config_set(cfg, dotted, newv)
+                dirty = True
 
     dbl_click_ms = 450
     dbl_click_tick = 0

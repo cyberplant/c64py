@@ -67,6 +67,16 @@ def test_defaults_when_no_file_present(isolated_env):
     assert cfg["input"]["gamepad"]["port2"]["mapping"]["fire"] == "button0"
 
 
+def test_config_editor_rows_include_c1541_tcp_drive_fields(isolated_env):
+    from c64py.config import _editor_build_rows
+
+    rows = _editor_build_rows()
+    kinds = {r[1] for r in rows if r[0] == "fld"}
+    assert "c1541.file_logging_enabled" in kinds
+    assert "c1541.file_logging_filename" in kinds
+    assert any(r == ("hdr", "--- C1541 (TCP DRIVE) ---") for r in rows)
+
+
 def test_search_order_cwd_wins(isolated_env):
     isolated_env["cwd_file"].write_text('[video]\nscale = 5\n')
     isolated_env["home_file"].write_text('[video]\nscale = 7\n')

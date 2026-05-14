@@ -252,6 +252,8 @@ Editor controls:
 - `Enter`: on **keyboard** joystick rows, capture a host key; on **gamepad** mapping
   rows, capture a button/axis/hat token (opens the capture screen; pygame opens all
   SDL devices first). Bluetooth: focus the window, wake the pad; polling runs ~30s.
+  On **`[c1541]`** string fields (e.g. `file_logging_filename`), `Enter` opens a short
+  text prompt for the path template (`{date}` / `{device}` placeholders allowed).
 - `S`: save
 - `Q` or `Esc`: quit; if there are unsaved changes, choose **Save and quit** (default),
   **Discard and quit**, or **Cancel**
