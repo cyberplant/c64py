@@ -21,6 +21,37 @@ def test_rust_delegate_includes_tcp_iec_vectors_when_memory_flag_set() -> None:
     assert 0xFFCF in stops
 
 
+def test_chkout_resolves_lfn_from_x_when_a_is_scratch() -> None:
+    """BASIC may leave garbage in A and hold the logical file number in X at $FFC9."""
+    from c64py.kernal_tcp_iec_hooks import FAT, LAT, SAT, handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+
+        def connect(self) -> bool:
+            return True
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    idx = 0
+    emu.memory.write(LAT + idx, 1)
+    emu.memory.write(FAT + idx, 8)
+    emu.memory.write(SAT + idx, 15)
+    emu.cpu.state.pc = 0xFFC9
+    emu.cpu.state.a = 0x22
+    emu.cpu.state.x = 1
+    assert handle_kernal_tcp_iec(emu) is True
+    assert emu.memory.read(0x9A) == 8
+
+
 def test_clrchn_vector_is_ffcc_not_ffc6() -> None:
     """CLRCHN is $FFCC (JMP $0322); $FFC6 is CHKIN — hooks must match."""
     from c64py.kernal_tcp_iec_hooks import handle_kernal_tcp_iec

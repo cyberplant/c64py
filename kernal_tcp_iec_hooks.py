@@ -28,10 +28,46 @@ DFLTO = 0x9A
 
 
 def _slot_for_lfn(mem, lfn: int) -> int:
+    # Logical file 0 is not a valid KERNAL table entry; $00 in LAT means "free slot".
+    if (lfn & 0xFF) == 0:
+        return -1
     for i in range(10):
         if mem.read(LAT + i) == lfn:
             return i
     return -1
+
+
+def _resolve_lfn_slot_for_chkout_chkin(emu: "C64") -> tuple[int, int]:
+    """Return (lfn, table_index) for CHKIN/CHKOUT.
+
+    KERNAL passes the logical file number in A, but BASIC sometimes leaves A
+    as scratch (e.g. string work) and holds the LFN in X when hitting $FFC9 /
+    the indirect CHKOUT vector — match the KERNAL table without mis-binding a
+    plausible A that simply has no open file (screen CHKOUT).
+    """
+    mem = emu.memory
+    a = emu.cpu.state.a & 0xFF
+    x = emu.cpu.state.x & 0xFF
+    y = emu.cpu.state.y & 0xFF
+
+    ia = _slot_for_lfn(mem, a)
+    if ia >= 0:
+        return a, ia
+
+    if 1 <= a <= 15:
+        return -1, -1
+
+    for lfn in (x, y):
+        if 1 <= lfn <= 15:
+            j = _slot_for_lfn(mem, lfn)
+            if j >= 0:
+                return lfn, j
+
+    for lfn in (a, x, y):
+        j = _slot_for_lfn(mem, lfn)
+        if j >= 0:
+            return lfn, j
+    return -1, -1
 
 
 def _first_free_slot(mem) -> int:
@@ -225,8 +261,7 @@ def _hook_clrchn(emu: "C64", bus) -> bool:
 
 
 def _hook_chkout(emu: "C64", bus) -> bool:
-    lfn = emu.cpu.state.a & 0xFF
-    idx = _slot_for_lfn(emu.memory, lfn)
+    lfn, idx = _resolve_lfn_slot_for_chkout_chkin(emu)
     if idx < 0:
         return False
     raw_d = emu.memory.read(FAT + idx) & 0xFF
@@ -250,8 +285,7 @@ def _hook_chkout(emu: "C64", bus) -> bool:
 
 
 def _hook_chkin(emu: "C64", bus) -> bool:
-    lfn = emu.cpu.state.a & 0xFF
-    idx = _slot_for_lfn(emu.memory, lfn)
+    lfn, idx = _resolve_lfn_slot_for_chkout_chkin(emu)
     if idx < 0:
         return False
     raw_d = emu.memory.read(FAT + idx) & 0xFF
