@@ -548,6 +548,18 @@ def main():
     )
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
+    ap.add_argument(
+        "--host-command-ctrl",
+        metavar="TX=ADDR,RX=ADDR",
+        default=None,
+        help=(
+            "Enable the host memory command channel: the guest pokes a request "
+            "into the TX mailbox and reads the reply from RX. Each mailbox is "
+            "256 bytes (1 size byte + up to 255 payload bytes). Off by default; "
+            "see docs/host_memory_command_channel.md. Example: "
+            "--host-command-ctrl TX=0xC000,RX=0xC100"
+        ),
+    )
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
     ap.add_argument("--dump-memory", help="Dump memory to file after execution")
     ap.add_argument(
@@ -1233,6 +1245,28 @@ def main():
             emu.monitor_server = C64MonitorTcpServer(emu, int(args.monitor_port))
             emu.monitor_server.start()
             print(f"Monitor TCP on 127.0.0.1:{int(args.monitor_port)} (see docs/DEBUGGING.md)")
+
+        if args.host_command_ctrl:
+            try:
+                from .host_command_channel import (
+                    HostCommandChannel,
+                    parse_host_command_ctrl,
+                )
+            except ImportError:
+                from c64py.host_command_channel import (  # type: ignore[no-redef]
+                    HostCommandChannel,
+                    parse_host_command_ctrl,
+                )
+            try:
+                tx_base, rx_base = parse_host_command_ctrl(args.host_command_ctrl)
+            except ValueError as e:
+                print(f"ERROR: --host-command-ctrl: {e}", file=sys.stderr)
+                sys.exit(2)
+            emu._host_cmd_channel = HostCommandChannel(emu, tx_base, rx_base)
+            print(
+                f"Host command channel: TX=${tx_base:04X} RX=${rx_base:04X} "
+                f"(see docs/host_memory_command_channel.md)"
+            )
 
         # Start server if requested (runs in parallel with UI)
         server = None

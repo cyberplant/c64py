@@ -169,6 +169,9 @@ class C64:
         self.monitor_breakpoints: set[int] = set()
         self._monitor_cmd_queue: Optional[queue.Queue] = None
         self._monitor_reply_queue: Optional[queue.Queue] = None
+        # Optional :class:`~c64py.host_command_channel.HostCommandChannel`,
+        # polled between CPU quanta when ``--host-command-ctrl`` is set.
+        self._host_cmd_channel = None  # type: ignore[var-annotated]
         self._monitor_pending_step_ack = False
 
         # IEC serial bus for 1541 drive emulation (optional, created when needed)
@@ -1493,6 +1496,8 @@ class C64:
                 cycles, time.perf_counter() - inject_wall_t0
             )
             self._service_snapshot_requests()
+            if self._host_cmd_channel is not None:
+                self._host_cmd_channel.poll()
             self.throttle_emulation_if_needed(cycles)
 
             # Check if we've reached max cycles
