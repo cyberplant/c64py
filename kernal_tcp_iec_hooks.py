@@ -9,7 +9,7 @@ path is disabled.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from c64py.emulator import C64
@@ -85,11 +85,45 @@ def _tcp_client(emu: "C64", device: int):
     return emu.get_drive(device)
 
 
+def _resolve_setlfs_fa_sa(emu: "C64") -> tuple[int, int]:
+    """Return (FA, SA) for OPEN from SETLFS zero page.
+
+    SETLFS stores X→$B9 (device) and Y→$BA (secondary). Some callers (and an
+    earlier bug) used the LOAD vector layout with device in $BA instead; if
+    $B9 does not map to a TCP disk but $BA does, treat ($BA,$B9) as (FA, SA).
+    """
+    b9 = emu.memory.read(0xB9) & 0xFF
+    ba = emu.memory.read(0xBA) & 0xFF
+    if _tcp_client(emu, b9) is not None:
+        return b9, ba
+    if (
+        8 <= ba <= 11
+        and _tcp_client(emu, ba) is not None
+        and (b9 > 11 or b9 == 15)
+    ):
+        return ba, b9
+    return b9, ba
+
+
+def _heal_fat_sat_for_tcp(emu: "C64", device: int, secondary: int) -> tuple[int, int]:
+    """If the logical file table has FA/SA swapped (e.g. FAT=15, SAT=8), fix for TCP."""
+    d = device & 0xFF
+    s = secondary & 0xFF
+    if _tcp_client(emu, d) is not None:
+        return d, s
+    if (
+        8 <= s <= 11
+        and _tcp_client(emu, s) is not None
+        and (d > 11 or d == 15)
+    ):
+        return s, d
+    return d, s
+
+
 def _hook_open(emu: "C64", bus) -> bool:
-    # SETLFS ($FFBA): A→$B8 (LA), X→$B9 (FA device), Y→$BA (SA secondary).
+    # SETLFS ($FFBA): A→$B8 (LA), X→$B9 (FA), Y→$BA (SA); see _resolve_setlfs_fa_sa.
     lfn = emu.memory.read(0xB8)
-    device = emu.memory.read(0xB9)
-    secondary = emu.memory.read(0xBA)
+    device, secondary = _resolve_setlfs_fa_sa(emu)
     client = _tcp_client(emu, device)
     if client is None:
         return False
@@ -140,8 +174,12 @@ def _hook_close(emu: "C64", bus) -> bool:
         emu._kernal_hook_rts_return()
         return True
 
-    device = emu.memory.read(FAT + idx)
-    secondary = emu.memory.read(SAT + idx)
+    raw_d = emu.memory.read(FAT + idx) & 0xFF
+    raw_s = emu.memory.read(SAT + idx) & 0xFF
+    device, secondary = _heal_fat_sat_for_tcp(emu, raw_d, raw_s)
+    if device != raw_d or secondary != raw_s:
+        emu.memory.write(FAT + idx, device & 0xFF)
+        emu.memory.write(SAT + idx, secondary & 0xFF)
     client = _tcp_client(emu, device)
     if client is None:
         return False
@@ -185,8 +223,12 @@ def _hook_chkout(emu: "C64", bus) -> bool:
     idx = _slot_for_lfn(emu.memory, lfn)
     if idx < 0:
         return False
-    device = emu.memory.read(FAT + idx)
-    secondary = emu.memory.read(SAT + idx)
+    raw_d = emu.memory.read(FAT + idx) & 0xFF
+    raw_s = emu.memory.read(SAT + idx) & 0xFF
+    device, secondary = _heal_fat_sat_for_tcp(emu, raw_d, raw_s)
+    if device != raw_d or secondary != raw_s:
+        emu.memory.write(FAT + idx, device & 0xFF)
+        emu.memory.write(SAT + idx, secondary & 0xFF)
     if _tcp_client(emu, device) is None:
         return False
 
@@ -206,8 +248,12 @@ def _hook_chkin(emu: "C64", bus) -> bool:
     idx = _slot_for_lfn(emu.memory, lfn)
     if idx < 0:
         return False
-    device = emu.memory.read(FAT + idx)
-    secondary = emu.memory.read(SAT + idx)
+    raw_d = emu.memory.read(FAT + idx) & 0xFF
+    raw_s = emu.memory.read(SAT + idx) & 0xFF
+    device, secondary = _heal_fat_sat_for_tcp(emu, raw_d, raw_s)
+    if device != raw_d or secondary != raw_s:
+        emu.memory.write(FAT + idx, device & 0xFF)
+        emu.memory.write(SAT + idx, secondary & 0xFF)
     if _tcp_client(emu, device) is None:
         return False
 

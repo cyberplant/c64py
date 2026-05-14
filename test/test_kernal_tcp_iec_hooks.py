@@ -50,6 +50,80 @@ def test_open_hook_uses_setlfs_zp_fa_sa_order() -> None:
     assert emu.memory.read(SAT + idx) == 15
 
 
+def test_open_hook_heals_load_style_fa_in_ba() -> None:
+    """If $B9/$BA look like SA=15 and FA=8 (LOAD layout), still open on device 8."""
+    from c64py.kernal_tcp_iec_hooks import FAT, LAT, SAT, handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+
+        def connect(self) -> bool:
+            return True
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    emu.cpu.state.pc = 0xFFC0
+    emu.memory.write(0xB8, 1)
+    emu.memory.write(0xB9, 15)
+    emu.memory.write(0xBA, 8)
+    emu.memory.write(0xB7, 0)
+    assert handle_kernal_tcp_iec(emu) is True
+    idx = next(i for i in range(10) if emu.memory.read(LAT + i) == 1)
+    assert emu.memory.read(FAT + idx) == 8
+    assert emu.memory.read(SAT + idx) == 15
+
+
+def test_chkout_heals_swapped_fat_sat_from_bad_open() -> None:
+    """CHKOUT repairs FAT=15 SAT=8 so PRINT# can use the TCP CIOUT hook."""
+    from c64py.kernal_tcp_iec_hooks import FAT, LAT, SAT, handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+            self.received: list[int] = []
+
+        def connect(self) -> bool:
+            return True
+
+        def iec_receive_byte(self, byte: int, eoi: bool = False) -> None:
+            self.received.append(int(byte) & 0xFF)
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    idx = 0
+    emu.memory.write(LAT + idx, 1)
+    emu.memory.write(FAT + idx, 15)
+    emu.memory.write(SAT + idx, 8)
+    bus.send_command(0x20 | 8)
+    bus.send_command(0xF0 | 15)
+    bus.unlisten()
+    emu.cpu.state.pc = 0xFFC9
+    emu.cpu.state.a = 1
+    assert handle_kernal_tcp_iec(emu) is True
+    assert emu.memory.read(FAT + idx) == 8
+    assert emu.memory.read(SAT + idx) == 15
+    assert emu.memory.read(0x9A) == 8
+    emu.cpu.state.pc = 0xFFD2
+    emu.cpu.state.a = ord("Z")
+    assert handle_kernal_tcp_iec(emu) is True
+    assert spy.received and spy.received[-1] == ord("Z")
+
+
 def test_ciout_hook_skips_when_dflto_is_screen() -> None:
     from c64py.kernal_tcp_iec_hooks import handle_kernal_tcp_iec
 
