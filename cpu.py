@@ -394,6 +394,22 @@ class CPU6502:
         high = self._mr((addr + 1) & 0xFFFF)
         return low | (high << 8)
 
+    def trigger_nmi_coarse(self) -> None:
+        """Service NMI via vector ``$FFFA`` (C64 RESTORE key). Coarse 6502 entry.
+
+        Matches the simplified IRQ entry path used in fast VIC mode: three-byte
+        return address push, clear B on pushed P, SEI, then jump to ``($FFFA)``.
+        """
+        pc = self.state.pc
+        self.memory.write(0x100 + self.state.sp, (pc >> 8) & 0xFF)
+        self.state.sp = (self.state.sp - 1) & 0xFF
+        self.memory.write(0x100 + self.state.sp, pc & 0xFF)
+        self.state.sp = (self.state.sp - 1) & 0xFF
+        self.memory.write(0x100 + self.state.sp, (self.state.p | 0x20) & ~0x10)
+        self.state.sp = (self.state.sp - 1) & 0xFF
+        self._set_flag(0x04, True)
+        self.state.pc = self._read_word(0xFFFA) & 0xFFFF
+
     def _get_flag(self, flag: int) -> bool:
         """Get processor flag"""
         return (self.state.p & flag) != 0

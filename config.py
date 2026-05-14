@@ -70,8 +70,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # historical CLI default.
         "udp_port": 64738,
     },
-    # Joystick mapping (item E): host keys → joystick port bits. Defaults
-    # match docs/input_config_plan.md §3 — port 2 with arrows + RCtrl/Space.
+    # Joystick mapping (item E): host keys → joystick port bits. Port 2 uses
+    # Space for fire because RCtrl is mapped to the C= matrix key.
     "input": {
         "joystick": {
             "port1": {},
@@ -80,7 +80,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "down": "Down",
                 "left": "Left",
                 "right": "Right",
-                "fire": ["RCtrl", "Space"],
+                "fire": ["Space"],
             },
         },
         "gamepad": {

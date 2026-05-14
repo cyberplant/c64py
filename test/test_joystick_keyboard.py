@@ -114,8 +114,7 @@ class TestHostToJoystick(unittest.TestCase):
         self.assertEqual(m[pygame.K_DOWN], [(2, JOY_BIT_DOWN)])
         self.assertEqual(m[pygame.K_LEFT], [(2, JOY_BIT_LEFT)])
         self.assertEqual(m[pygame.K_RIGHT], [(2, JOY_BIT_RIGHT)])
-        # Fire is multi-key (RCtrl + Space).
-        self.assertEqual(m[pygame.K_RCTRL], [(2, JOY_BIT_FIRE)])
+        # Default fire is Space (RCtrl maps to C= on the keyboard matrix).
         self.assertEqual(m[pygame.K_SPACE], [(2, JOY_BIT_FIRE)])
 
     def test_none_config_uses_defaults(self) -> None:
@@ -178,13 +177,45 @@ class TestHostToJoystick(unittest.TestCase):
             [(1, JOY_BIT_FIRE), (2, JOY_BIT_FIRE)],
         )
 
-    def test_quote_key_same_matrix_as_at(self) -> None:
+    def test_host_punctuation_matches_c64_layout(self) -> None:
         import pygame
         from c64py.host_keymap import ShiftReq, build_host_to_matrix
 
         m = build_host_to_matrix()
-        self.assertEqual(m[pygame.K_QUOTE][:2], m[pygame.K_AT][:2])
-        self.assertEqual(m[pygame.K_QUOTE][2], ShiftReq.NONE)
+        semi = (6, 2, ShiftReq.NONE)
+        self.assertEqual(m[pygame.K_QUOTE], semi)
+        self.assertEqual(m[pygame.K_SEMICOLON], semi)
+        at = (5, 6, ShiftReq.NONE)
+        self.assertEqual(m[pygame.K_LEFTBRACKET], at)
+        self.assertEqual(m[pygame.K_AT], at)
+        star = (6, 1, ShiftReq.NONE)
+        self.assertEqual(m[pygame.K_RIGHTBRACKET], star)
+        self.assertEqual(m[pygame.K_ASTERISK], star)
+        self.assertEqual(m[pygame.K_MINUS], (5, 0, ShiftReq.NONE))
+        self.assertEqual(m[pygame.K_PLUS], (5, 0, ShiftReq.NONE))
+        self.assertEqual(m[pygame.K_EQUALS], (5, 3, ShiftReq.NONE))
+        self.assertNotIn(pygame.K_BACKSLASH, m)
+        self.assertEqual(m[pygame.K_TAB], (7, 2, ShiftReq.NONE))
+        self.assertEqual(m[pygame.K_ESCAPE], (7, 7, ShiftReq.NONE))
+        ckey = (7, 5, ShiftReq.NONE)
+        self.assertEqual(m[pygame.K_LCTRL], ckey)
+        self.assertEqual(m[pygame.K_RCTRL], ckey)
+
+    def test_trigger_nmi_coarse_uses_fffa_vector(self) -> None:
+        from c64py.cpu import CPU6502
+        from c64py.memory import MemoryMap
+
+        mem = MemoryMap()
+        cpu = CPU6502(mem)
+        mem.write(0xFFFA, 0x34)
+        mem.write(0xFFFB, 0x12)
+        cpu.state.pc = 0x0800
+        cpu.state.sp = 0xFE
+        cpu.state.p = 0x30
+        cpu.trigger_nmi_coarse()
+        self.assertEqual(cpu.state.pc, 0x1234)
+        self.assertEqual(cpu.state.sp, 0xFB)
+        self.assertTrue(cpu.state.p & 0x04)
 
 
 if __name__ == "__main__":

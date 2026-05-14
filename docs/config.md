@@ -70,13 +70,13 @@ screen_update_interval = 0.1 # seconds between text/status refreshes
 [input.joystick.port2]
 # Host-key bindings for emulated joystick port 2 (the C64 default for most
 # games). A direction can be a single key or a list.
-# Names are case-insensitive; "Up"/"K_UP", "RCtrl"/"K_RCTRL", "Space",
-# "LShift", individual letters/digits, etc. all resolve to pygame.K_*.
+# Names are case-insensitive; "Up"/"K_UP", "Space", "LShift",
+# individual letters/digits, etc. all resolve to pygame.K_*.
 up    = "Up"
 down  = "Down"
 left  = "Left"
 right = "Right"
-fire  = ["RCtrl", "Space"]
+fire  = ["Space"]
 
 [input.joystick.port1]
 # Empty by default. Example WASD remap:
@@ -175,7 +175,7 @@ same way; games disambiguate via the CIA1 DDR. BASIC ignores joystick
 lines, so binding `Space` as fire does not break typing in graphics mode.
 
 If no `[input.joystick]` table is present, the built-in defaults
-(arrows + RCtrl/Space → port 2; port 1 empty) apply. To disable a
+(arrows + Space for port 2 fire; port 1 empty) apply. To disable a
 direction entirely, set it to an empty string or a name pygame can't
 resolve (e.g. `up = ""`).
 

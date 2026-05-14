@@ -61,7 +61,7 @@ def test_defaults_when_no_file_present(isolated_env):
     assert cfg["debug"]["screen_update_interval"] == 0.1
     assert cfg["input"]["joystick"]["port1"] == {}
     assert cfg["input"]["joystick"]["port2"]["up"] == "Up"
-    assert cfg["input"]["joystick"]["port2"]["fire"] == ["RCtrl", "Space"]
+    assert cfg["input"]["joystick"]["port2"]["fire"] == ["Space"]
     assert cfg["input"]["gamepad"]["port1"]["enabled"] is False
     assert cfg["input"]["gamepad"]["port2"]["enabled"] is False
     assert cfg["input"]["gamepad"]["port2"]["mapping"]["fire"] == "button0"

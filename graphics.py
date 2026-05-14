@@ -341,6 +341,11 @@ class PygameInterface:
         if not self.emulator or not self.emulator.running:
             return
 
+        # C64 RESTORE is not on the CIA keyboard matrix; host ``\`` (``BACKSLASH``).
+        if event.key == pygame.K_BACKSLASH:
+            self.emulator.cpu.trigger_nmi_coarse()
+            return
+
         mem = self.emulator.memory
 
         # 2a. Joystick mapping (item C/E). A host key may be bound to BOTH a
