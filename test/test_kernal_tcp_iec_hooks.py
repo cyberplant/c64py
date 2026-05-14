@@ -1,4 +1,4 @@
-"""KERNAL TCP IEC fast hooks (OPEN / CHROUT gate / CLRCHN)."""
+"""KERNAL TCP IEC fast hooks (OPEN / CHROUT / CIOUT / CLRCHN)."""
 
 from c64py.cpu import CPU6502
 from c64py.emulator import C64
@@ -14,6 +14,7 @@ def test_rust_delegate_includes_tcp_iec_vectors_when_memory_flag_set() -> None:
     assert 0xFFC0 not in cpu._rust_delegate_stop_pcs()
     m.kernal_tcp_iec_vectors = True
     stops = cpu._rust_delegate_stop_pcs()
+    assert 0xFDF9 in stops
     assert 0xFFC0 in stops
     assert 0xFFC3 in stops
     assert 0xFFCF in stops
@@ -124,6 +125,39 @@ def test_chkout_heals_swapped_fat_sat_from_bad_open() -> None:
     assert spy.received and spy.received[-1] == ord("Z")
 
 
+def test_ciout_hook_sends_byte_from_fdf9_ciout_vector() -> None:
+    """KERNAL CIOUT ($FDF9) is what PRINT# usually calls per character, not CHROUT."""
+    from c64py.kernal_tcp_iec_hooks import handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+            self.received: list[int] = []
+
+        def connect(self) -> bool:
+            return True
+
+        def iec_receive_byte(self, byte: int, eoi: bool = False) -> None:
+            self.received.append(int(byte) & 0xFF)
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    emu.memory.write(0x9A, 8)
+    emu.cpu.state.pc = 0xFDF9
+    emu.cpu.state.a = 0x55
+    bus.send_command(0x20 | 8)
+    bus.send_command(0x60 | 15)
+    assert handle_kernal_tcp_iec(emu) is True
+    assert spy.received and spy.received[-1] == 0x55
+
+
 def test_ciout_hook_skips_when_dflto_is_screen() -> None:
     from c64py.kernal_tcp_iec_hooks import handle_kernal_tcp_iec
 
@@ -132,8 +166,10 @@ def test_ciout_hook_skips_when_dflto_is_screen() -> None:
     emu.kernal_load_shortcut_enabled = True
     emu.iec_bus = IECBus()
     emu.memory.write(0x9A, 3)
-    emu.cpu.state.pc = 0xFFD2
     emu.cpu.state.a = ord("X")
+    emu.cpu.state.pc = 0xFDF9
+    assert handle_kernal_tcp_iec(emu) is False
+    emu.cpu.state.pc = 0xFFD2
     assert handle_kernal_tcp_iec(emu) is False
 
 

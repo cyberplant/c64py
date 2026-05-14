@@ -1031,7 +1031,17 @@ class CPU6502:
             if self.kernal_disk_hook_vectors or iec_stub:
                 pcs.extend((0xFFD5, 0xFFD8))
             if tcp_iec:
-                pcs.extend((0xFFC0, 0xFFC3, 0xFFC6, 0xFFC9, 0xFFCC, 0xFFCF))
+                pcs.extend(
+                    (
+                        0xFDF9,
+                        0xFFC0,
+                        0xFFC3,
+                        0xFFC6,
+                        0xFFC9,
+                        0xFFCC,
+                        0xFFCF,
+                    )
+                )
             if self.memory.kernal_rom is None:
                 pcs.extend((0xFF5B, 0xFFCF))
             self._rust_delegate_stop_pcs_cached = tuple(sorted(set(pcs)))
