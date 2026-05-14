@@ -152,6 +152,8 @@ def build_host_to_matrix() -> Dict[int, Tuple[int, int, ShiftReq]]:
         K.K_SEMICOLON: (6, 2, ShiftReq.NONE),
         K.K_COLON: (5, 5, ShiftReq.NONE),
         K.K_AT: (5, 6, ShiftReq.NONE),
+        # US/ANSI host: `'` is often free; C64 `@` lives at matrix (5,6).
+        K.K_QUOTE: (5, 6, ShiftReq.NONE),
         K.K_EQUALS: (6, 5, ShiftReq.NONE),
         K.K_BACKQUOTE: (7, 1, ShiftReq.NONE),       # ← (left-arrow) on C64
         K.K_CARET: (6, 6, ShiftReq.NONE),           # ↑ (up-arrow) on C64

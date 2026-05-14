@@ -10,7 +10,15 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from c64py.drives.tcp_drive_client import TcpDriveClient  # noqa: E402
-from c64py.emulator import C64  # noqa: E402
+from c64py.emulator import C64, _map_dos1541_to_kernal_basic_err  # noqa: E402
+
+
+def test_dos1541_to_basic_err_mapping() -> None:
+    assert _map_dos1541_to_kernal_basic_err(62) == 4
+    assert _map_dos1541_to_kernal_basic_err(63) == 2
+    assert _map_dos1541_to_kernal_basic_err(64) == 22
+    assert _map_dos1541_to_kernal_basic_err(34) == 11
+    assert _map_dos1541_to_kernal_basic_err(72) == 5
 
 
 class _CaptureSaveClient(TcpDriveClient):
@@ -26,6 +34,17 @@ class _CaptureSaveClient(TcpDriveClient):
     def fast_save(self, filename: str, data: bytes) -> tuple:  # type: ignore[override]
         self.last_save = (filename, bytes(data))
         return (True, None)
+
+
+class _FileExistsSaveClient(TcpDriveClient):
+    def __init__(self) -> None:
+        super().__init__(8, "localhost", 1)
+
+    def connect(self) -> bool:  # type: ignore[override]
+        return True
+
+    def fast_save(self, filename: str, data: bytes) -> tuple:  # type: ignore[override]
+        return (False, (63, "FILE EXISTS"))
 
 
 def test_kernal_load_no_disk_pops_return_address() -> None:
@@ -95,3 +114,29 @@ def test_kernal_save_no_disk_pops_return_address() -> None:
     assert emu.cpu.state.pc == 0x5679
     assert emu.cpu.state.sp == 0xFF
     assert emu.cpu.state.p & 0x01
+
+
+def test_kernal_save_file_exists_sets_file_open_basic_code() -> None:
+    """DOS 63 must not map to BASIC 4 (FILE NOT FOUND); stock BASIC has no FILE EXISTS."""
+    emu = C64(interface_factory=lambda _e: None)
+    emu._initialize_c64()
+    emu.kernal_load_shortcut_enabled = True
+    emu.iec_drives[8] = _FileExistsSaveClient()
+    emu.memory.write(0xB7, 1)
+    emu.memory.write(0xBB, 0x00)
+    emu.memory.write(0xBC, 0x10)
+    emu.memory.write(0x1000, ord("X"))
+    emu.memory.write(0xBA, 8)
+    emu.memory.write(0x2B, 0x01)
+    emu.memory.write(0x2C, 0x08)
+    emu.memory.write(0x0801, 0x00)
+    emu.cpu.state.pc = 0xFFD8
+    emu.cpu.state.a = 0x2B
+    emu.cpu.state.x = 0x03
+    emu.cpu.state.y = 0x08
+    emu.cpu.state.sp = 0xFD
+    emu.memory.write(0x01FE, 0x10)
+    emu.memory.write(0x01FF, 0x20)
+    assert emu._handle_kernal_save() is True
+    assert emu.cpu.state.p & 0x01
+    assert emu.cpu.state.a == 2  # FILE OPEN — see _map_dos1541_to_kernal_basic_err

@@ -53,6 +53,25 @@ from .iec_bus import IECBus
 from .drives.tcp_drive_client import TcpDriveClient
 from .drives.iec_backend import IECDriveBackend
 
+
+def _map_dos1541_to_kernal_basic_err(dos_code: int) -> int:
+    """Map 1541 ``DiskDrive.last_error`` codes to BASIC/KERNAL I/O error numbers.
+
+    BASIC V2 has no dedicated message for DOS ``63`` (``FILE EXISTS``); mapping
+    it to ``4`` (``FILE NOT FOUND``) misleads users. We use ``2`` (``FILE OPEN``)
+    as the closest stock wording. ``64`` maps to ``22`` (``TYPE MISMATCH``).
+    """
+    if dos_code == 62:
+        return 4  # FILE NOT FOUND
+    if dos_code == 63:
+        return 2  # FILE OPEN — closest stock BASIC string to "cannot create"
+    if dos_code == 64:
+        return 22  # TYPE MISMATCH (FILE TYPE MISMATCH on disk)
+    if dos_code == 34:
+        return 11  # SYNTAX ERROR
+    return 5  # DEVICE NOT PRESENT / generic I/O failure bucket
+
+
 class C64:
     """Main C64 emulator"""
 
@@ -1145,12 +1164,7 @@ class C64:
                 self.interface.add_debug_log(
                     f"❌ LOAD '{filename}' failed: {drive_code},{drive_msg}"
                 )
-            # Map 1541 DOS error codes to BASIC/KERNAL error codes:
-            #   BASIC 4 = FILE NOT FOUND
-            #   BASIC 5 = DEVICE NOT PRESENT
-            # (BASIC 8 = MISSING FILE NAME — do NOT use for disk errors)
-            kernal_err = 4 if drive_code in (62, 63, 64) else 5
-            self.cpu.state.a = kernal_err
+            self.cpu.state.a = _map_dos1541_to_kernal_basic_err(drive_code)
             self.memory.write(0x90, 0x00)  # clear ST — error is in A/carry
             self.cpu.state.p |= 0x01       # carry set = error
             self._kernal_hook_rts_return()
@@ -1300,11 +1314,7 @@ class C64:
                 self.interface.add_debug_log(
                     f"❌ SAVE '{filename}' failed: {drive_code},{drive_msg}"
                 )
-            # Map 1541 DOS error codes to BASIC/KERNAL error codes:
-            #   BASIC 4 = FILE NOT FOUND   (62 FILE NOT FOUND)
-            #   BASIC 5 = DEVICE NOT PRESENT (74 DRIVE NOT READY, 72 DISK FULL, etc.)
-            kernal_err = 4 if drive_code in (62, 63) else 5
-            self.cpu.state.a = kernal_err
+            self.cpu.state.a = _map_dos1541_to_kernal_basic_err(drive_code)
             self.memory.write(0x90, 0x00)  # clear ST — error is in A/carry
             self.cpu.state.p |= 0x01       # carry set = error
 

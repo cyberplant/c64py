@@ -178,6 +178,14 @@ class TestHostToJoystick(unittest.TestCase):
             [(1, JOY_BIT_FIRE), (2, JOY_BIT_FIRE)],
         )
 
+    def test_quote_key_same_matrix_as_at(self) -> None:
+        import pygame
+        from c64py.host_keymap import ShiftReq, build_host_to_matrix
+
+        m = build_host_to_matrix()
+        self.assertEqual(m[pygame.K_QUOTE][:2], m[pygame.K_AT][:2])
+        self.assertEqual(m[pygame.K_QUOTE][2], ShiftReq.NONE)
+
 
 if __name__ == "__main__":
     unittest.main()
