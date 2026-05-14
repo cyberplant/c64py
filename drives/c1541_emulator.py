@@ -38,7 +38,11 @@ if TYPE_CHECKING:
     from ..iec_bus import IECBus
     from ..d64 import D64Image
 
-from ..d64 import dos_filetype_byte_closed, parse_commodore_filename_mode
+from ..d64 import (
+    dos_filetype_byte_closed,
+    normalize_commodore_disk_catalog_name,
+    parse_commodore_filename_mode,
+)
 
 
 @dataclass
@@ -55,6 +59,7 @@ class ChannelState:
     write_mode: bool = False
     write_buf: Optional[bytearray] = None
     open_stem: str = ""
+    open_raw_filename: str = ""
     dos_ft_nibble: int = 2
 
 
@@ -411,14 +416,11 @@ class Drive1541(IECDriveBackend):
     def iec_close_channel(self, channel: int) -> None:
         state = self.channels.get(channel)
         if state is not None and state.write_mode and state.write_buf is not None:
-            disk = self._disk_helper.disk
-            name = state.open_stem.strip().strip('"').upper()[:16]
-            if disk is not None and self._disk_helper.has_disk() and name:
+            raw = state.open_raw_filename.strip()
+            if raw and self._disk_helper.has_disk():
                 payload = bytes(state.write_buf)
                 if payload:
-                    ft = dos_filetype_byte_closed(state.dos_ft_nibble)
-                    if not disk.write_file(name, payload, filetype=ft):
-                        self._disk_helper.last_error = (63, "FILE EXISTS", 0, 0)
+                    self._disk_helper.save_file(raw, payload)
         self.channels.pop(channel, None)
         if self._opening_channel == channel:
             self._opening_channel = None
@@ -444,7 +446,8 @@ class Drive1541(IECDriveBackend):
             stem, want = parse_commodore_filename_mode(raw_name)
             state.write_mode = True
             state.dos_ft_nibble = int(want) if want is not None else 2
-            state.open_stem = stem.strip().strip('"').upper()[:16]
+            state.open_raw_filename = raw_name
+            state.open_stem, _ = normalize_commodore_disk_catalog_name(stem)
             state.write_buf = bytearray()
             state.found = True
             state.byte_iter = iter(())

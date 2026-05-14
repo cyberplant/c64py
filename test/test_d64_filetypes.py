@@ -6,6 +6,7 @@ from c64py.d64 import (
     create_blank_d64,
     dos_filetype_byte_closed,
     load_d64,
+    normalize_commodore_disk_catalog_name,
     parse_commodore_filename_mode,
 )
 from c64py.drives.drive import DiskDrive
@@ -15,6 +16,45 @@ def test_parse_commodore_filename_mode_strip_open():
     assert parse_commodore_filename_mode("DATA,S,W") == ("DATA", 1)
     assert parse_commodore_filename_mode("FOO,P,R") == ("FOO", 2)
     assert parse_commodore_filename_mode("BAR") == ("BAR", None)
+
+
+def test_normalize_commodore_disk_catalog_name_at_and_at_s():
+    assert normalize_commodore_disk_catalog_name("@FOO") == ("FOO", True)
+    assert normalize_commodore_disk_catalog_name("@S:BAR") == ("BAR", True)
+    assert normalize_commodore_disk_catalog_name("@s:BAZ") == ("BAZ", True)
+    assert normalize_commodore_disk_catalog_name("S:QUX") == ("S:QUX", False)
+    assert normalize_commodore_disk_catalog_name("NOAT") == ("NOAT", False)
+
+
+def test_save_at_prefix_replaces_and_strips_s_colon(tmp_path):
+    img = create_blank_d64("AT", "01")
+    p = tmp_path / "at.d64"
+    img.save_to_file(str(p))
+    drv = DiskDrive(8)
+    drv.attach_disk(load_d64(str(p)), str(p))
+    p1 = b"OLD"
+    assert drv.save_file("@S:SCORES,S", p1)
+    names = {e.filename.rstrip().upper() for e in drv.disk.read_directory()}
+    assert "SCORES" in names
+
+    p2 = b"NEW"
+    assert drv.save_file("@S:SCORES,S", p2)
+    got = drv.load_file("SCORES,S")
+    assert got is not None
+    assert got[2:] == b"NEW"
+
+
+def test_load_accepts_at_s_when_catalog_is_plain(tmp_path):
+    img = create_blank_d64("L", "01")
+    p = tmp_path / "l.d64"
+    img.save_to_file(str(p))
+    drv = DiskDrive(8)
+    drv.attach_disk(load_d64(str(p)), str(p))
+    body = b"xyz"
+    assert drv.save_file("@S:CFG,S", body)
+    got = drv.load_file("@S:CFG,S")
+    assert got is not None
+    assert got[2:] == body
 
 
 def test_dos_filetype_byte_closed():

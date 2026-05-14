@@ -14,6 +14,40 @@ D64_SIZE_WITH_ERRORS = 175531  # D64 with error bytes appended
 TOTAL_DISK_BLOCKS = 664  # Total blocks on a standard 1541 disk
 
 
+def normalize_commodore_disk_catalog_name(stem: str) -> Tuple[str, bool]:
+    """Map a logical filename *stem* to the 16-character directory catalog key.
+
+    Commodore DOS and many games use a leading ``@`` on SAVE/OPEN to mean
+    *replace if present*: scratch an existing file with the same catalog name
+    before writing. The ``@`` is not stored in the directory.
+
+    When ``@`` was present, a following ``S:`` prefix is also stripped from the
+    catalog key only (``@S:HIGHSCORE`` → catalog ``HIGHSCORE``). This matches
+    common ``@S:…`` score/config saves where ``S:`` is a convention, not part of
+    the name programs use when they later OPEN the file without the prefix.
+
+    A bare ``S:NAME`` (no leading ``@``) keeps the ``S:`` in the catalog key so
+    we do not strip drive-style prefixes from ordinary filenames.
+
+    Args:
+        stem: Filename stem after ``parse_commodore_filename_mode`` (no
+            trailing ``,P`` / ``,S`` / ``,W`` type suffix).
+
+    Returns:
+        ``(catalog_name, replace_existing)`` where *catalog_name* is ASCII
+        upper case truncated to 16 characters (1541 directory field width).
+    """
+    s = stem.strip().strip('"').strip()
+    replace = False
+    if s.startswith("@"):
+        replace = True
+        s = s[1:].lstrip()
+        if len(s) >= 2 and s[0].upper() == "S" and s[1] == ":":
+            s = s[2:].lstrip()
+    cat = s.upper()[:16]
+    return cat, replace
+
+
 def parse_commodore_filename_mode(filename: str) -> Tuple[str, Optional[int]]:
     """Split ``"NAME,S"`` / ``NAME,P`` style strings into stem and DOS file type.
 

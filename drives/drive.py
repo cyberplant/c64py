@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 from ..d64 import (
     TOTAL_DISK_BLOCKS,
     dos_filetype_byte_closed,
+    normalize_commodore_disk_catalog_name,
     parse_commodore_filename_mode,
 )
 
@@ -119,11 +120,11 @@ class DiskDrive:
         # Find file in directory
         entries = self.disk.read_directory()
 
-        # Clean up filename for comparison (remove quotes, spaces)
-        clean_filename = stem.strip().upper().strip('"')
+        cat_name, _replace = normalize_commodore_disk_catalog_name(stem)
+        clean_filename = cat_name
 
         for entry in entries:
-            if entry.filename.upper() != clean_filename:
+            if entry.filename.upper().rstrip() != clean_filename:
                 continue
             if want_type is not None and entry.filetype != want_type:
                 self.last_error = (64, "FILE TYPE MISMATCH", 0, 0)
@@ -169,8 +170,11 @@ class DiskDrive:
             74  DRIVE NOT READY
 
         Args:
-            filename: File to save (quotes/whitespace stripped, uppercased,
-                truncated to 16 chars).
+            filename: File to save (quotes/whitespace stripped). A leading ``@``
+                requests replace-on-write (scratch same catalog name first). After
+                ``@``, optional ``S:`` is stripped for the 16-character catalog key
+                only (see ``normalize_commodore_disk_catalog_name``). Trailing
+                ``,P``/``,S``/… select the DOS file type.
             file_data: File data including the 2-byte load address at the
                 front for PRG files.
 
@@ -182,7 +186,7 @@ class DiskDrive:
             return False
 
         clean_stem, want_nibble = parse_commodore_filename_mode(filename)
-        clean_filename = clean_stem.strip().strip('"').upper()[:16]
+        clean_filename, replace = normalize_commodore_disk_catalog_name(clean_stem)
         if not clean_filename:
             self.last_error = (34, "SYNTAX ERROR", 0, 0)
             return False
@@ -209,8 +213,11 @@ class DiskDrive:
         except Exception:
             existing = set()
         if clean_filename in existing:
-            self.last_error = (63, "FILE EXISTS", 0, 0)
-            return False
+            if replace:
+                self._scratch_file(clean_filename)
+            else:
+                self.last_error = (63, "FILE EXISTS", 0, 0)
+                return False
 
         try:
             ok = self.disk.write_file(clean_filename, file_data, filetype=ft_byte)
