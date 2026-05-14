@@ -62,7 +62,14 @@ Reply:
 
 ## Polling cadence
 
-The host polls TX once per CPU quantum, immediately after `_service_snapshot_requests()` in the main run loop. Latency is roughly one Rust fast-batch (default 64 instructions). There is no rate limiting beyond that — a guest that pokes the size byte every iteration will drive the dispatcher every quantum.
+The host polls TX once per CPU quantum at the end of
+`C64.run_cpu_instruction_quantum` (including the Pygame and Textual CPU
+threads, which call that method directly rather than `C64.run`). In the
+`C64.run` loop, `_service_snapshot_requests()` runs on the same cadence but
+**after** each quantum returns; host-command polling is tied to the quantum
+itself. Latency is roughly one Rust fast-batch (default 64 instructions).
+There is no rate limiting beyond that — a guest that pokes the size byte every
+iteration will drive the dispatcher every quantum.
 
 When the host produces a reply but RX size byte is still non-zero (the guest hasn't acked the previous reply yet), the new reply is **dropped** and a counter is bumped (`HostCommandChannel.replies_dropped`). The host never blocks waiting for the guest.
 
@@ -112,7 +119,7 @@ When the host produces a reply but RX size byte is still non-zero (the guest has
 ## Implementation pointers
 
 - Module: `host_command_channel.py` — `HostCommandChannel` (poll/handle/encode) and `parse_host_command_ctrl` (CLI parser).
-- Polling site: `emulator.py`, inside `C64.run()`, next to `_service_snapshot_requests()`.
+- Polling site: `emulator.py` — end of `C64.run_cpu_instruction_quantum` via `_poll_host_cmd_channel` (covers `C64.run`, `graphics.py`, `ui.py`, and scripts).
 - Construction site: `C64.py`, near the monitor / TCP server bring-up.
 - Dispatcher: `command_dispatch.py` — shared with `EmulatorServer` so both transports speak the same grammar.
 - Tests: `test/test_host_command_channel.py` (no ROMs required).

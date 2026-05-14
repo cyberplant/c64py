@@ -15,6 +15,9 @@ or JSON depending on the first byte), and writes the reply on RX:
 payload first, then RX[0] = N. The guest must clear RX[0] back to 0 to
 acknowledge before the host will send the next reply.
 
+Polling happens at the end of each :meth:`emulator.C64.run_cpu_instruction_quantum`
+call (including Pygame and Textual CPU loops), not only in :meth:`emulator.C64.run`.
+
 This module is **off by default**; it is enabled only when
 ``--host-command-ctrl TX=...,RX=...`` is passed on the CLI. It is **not**
 a security boundary: the dispatcher reuses the full TCP server grammar

@@ -272,24 +272,17 @@ class TestHostCommandChannelConstruction:
 
 # --------------------------------------------------- emulator.run wiring smoke
 
-def test_emulator_run_loop_polls_channel(monkeypatch):
-    """Verify that emulator.run() actually calls _host_cmd_channel.poll().
+def test_run_cpu_instruction_quantum_polls_channel(monkeypatch):
+    """Host command channel must be polled from run_cpu_instruction_quantum.
 
-    We don't bring up ROMs; we just patch the run loop's preconditions so
-    one iteration executes, then assert poll() was invoked.
+    Graphics and Textual UIs drive the CPU via that method instead of C64.run(),
+    so poll cannot live only in the run() loop.
     """
-    from c64py.emulator import C64
+    from c64py import emulator as emu_mod
 
-    emu = C64.__new__(C64)  # bypass full __init__ (no ROMs/UI required)
-    # Minimal attribute surface for the relevant branch in run() — but we
-    # don't actually need to run the full loop. Just check the wiring:
-    # _host_cmd_channel exists and is None by default after __init__.
-    # A real C64() instance would have it as None.
-    assert hasattr(C64, "__init__")
-    # The wiring is exercised by line `if self._host_cmd_channel is not None:`
-    # in emulator.run(); its presence is verified by the source check below.
-    import c64py.emulator as emu_mod
     src = open(emu_mod.__file__).read()
+    assert "def run_cpu_instruction_quantum" in src
+    assert "def _poll_host_cmd_channel" in src
     assert "self._host_cmd_channel.poll()" in src, (
-        "emulator.run() must invoke HostCommandChannel.poll() once per quantum"
+        "run_cpu_instruction_quantum must end with HostCommandChannel.poll()"
     )

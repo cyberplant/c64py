@@ -170,7 +170,8 @@ class C64:
         self._monitor_cmd_queue: Optional[queue.Queue] = None
         self._monitor_reply_queue: Optional[queue.Queue] = None
         # Optional :class:`~c64py.host_command_channel.HostCommandChannel`,
-        # polled between CPU quanta when ``--host-command-ctrl`` is set.
+        # polled at the end of each :meth:`run_cpu_instruction_quantum` (including
+        # graphics/Textual CPU threads — not only :meth:`run`).
         self._host_cmd_channel = None  # type: ignore[var-annotated]
         self._monitor_pending_step_ack = False
 
@@ -1336,24 +1337,36 @@ class C64:
         for d in self.iec_drives.values():
             d.step(n)
 
+    def _poll_host_cmd_channel(self) -> None:
+        """If ``--host-command-ctrl`` is active, service the TX mailbox once."""
+        if self._host_cmd_channel is not None:
+            self._host_cmd_channel.poll()
+
     def run_cpu_instruction_quantum(
         self, cycles_before: int, max_cycles: Optional[int] = None
     ) -> int:
-        """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
+        """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`.
+
+        Always ends with :meth:`_poll_host_cmd_channel` so Pygame/Textual loops
+        (which call this directly instead of :meth:`run`) still see guest mailboxes.
+        """
         self.memory.kernal_tcp_iec_vectors = bool(
             self.kernal_load_shortcut_enabled and self.use_iec_bus
         )
-        if self._handle_kernal_load():
-            return 0
-        if self._handle_kernal_save():
-            return 0
-        from .kernal_tcp_iec_hooks import handle_kernal_tcp_iec
+        try:
+            if self._handle_kernal_load():
+                return 0
+            if self._handle_kernal_save():
+                return 0
+            from .kernal_tcp_iec_hooks import handle_kernal_tcp_iec
 
-        if handle_kernal_tcp_iec(self):
-            return 0
-        return self.cpu.cpu_step_quantum(
-            self.udp_debug, self.vice_trace, cycles_before, max_cycles
-        )
+            if handle_kernal_tcp_iec(self):
+                return 0
+            return self.cpu.cpu_step_quantum(
+                self.udp_debug, self.vice_trace, cycles_before, max_cycles
+            )
+        finally:
+            self._poll_host_cmd_channel()
 
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
@@ -1496,8 +1509,6 @@ class C64:
                 cycles, time.perf_counter() - inject_wall_t0
             )
             self._service_snapshot_requests()
-            if self._host_cmd_channel is not None:
-                self._host_cmd_channel.poll()
             self.throttle_emulation_if_needed(cycles)
 
             # Check if we've reached max cycles
