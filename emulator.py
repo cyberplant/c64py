@@ -1225,17 +1225,14 @@ class C64:
         """Handle KERNAL SAVE operation for virtual disk drives.
         
         This intercepts SAVE calls when PC is at $FFD8 and device is 8-11.
-        Skipped when :attr:`use_iec_bus` is True.
         Returns True if SAVE was handled, False otherwise.
         
-        KERNAL SAVE calling convention:
-        - A: Zero page pointer to start address (low byte)
-        - X: Start address low byte  
-        - Y: Start address high byte
-        - $B7: Filename length
-        - $BB-$BC: Filename pointer
-        - $BA: Device number
-        - $AE-$AF: End address + 1
+        KERNAL SAVE calling convention (matches ``$F5DD`` / sk6502):
+        - **A**: Zero-page index such that ``(A)`` / ``(A+1)`` hold the **start**
+          address low/high (BASIC typically passes ``$2B`` so ``$2B/$2C`` = start).
+        - **X**, **Y**: **End** address low/high (exclusive end of the byte range;
+          same convention as ``range(start, end)``).
+        - ``$B7``: Filename length; ``$BB``-``$BC``: Filename pointer; ``$BA``: device.
         """
         if not self.kernal_load_shortcut_enabled:
             return False
@@ -1261,13 +1258,27 @@ class C64:
             self._kernal_hook_rts_return()
             return True
 
-        start_addr = self.cpu.state.x | (self.cpu.state.y << 8)
-        end_addr = self.memory.read(0xAE) | (self.memory.read(0xAF) << 8)
+        zp_idx = self.cpu.state.a & 0xFF
+        start_addr = self.memory.read(zp_idx & 0xFFFF) | (
+            self.memory.read((zp_idx + 1) & 0xFFFF) << 8
+        )
+        end_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+
+        if end_addr < start_addr:
+            if self.interface:
+                self.interface.add_debug_log(
+                    f"❌ KERNAL SAVE: invalid range ${start_addr:04X}-${end_addr:04X}"
+                )
+            self.cpu.state.a = 5
+            self.memory.write(0x90, 0x00)
+            self.cpu.state.p |= 0x01
+            self._kernal_hook_rts_return()
+            return True
 
         if self.interface:
             self.interface.add_debug_log(
                 f"🔧 KERNAL SAVE: device={device}, file='{filename}', "
-                f"${start_addr:04X}-${end_addr:04X}"
+                f"${start_addr:04X}-${end_addr:04X} ({end_addr - start_addr} bytes)"
             )
 
         file_data = bytearray([start_addr & 0xFF, (start_addr >> 8) & 0xFF])
