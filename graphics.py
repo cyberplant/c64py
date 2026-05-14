@@ -341,8 +341,9 @@ class PygameInterface:
         if not self.emulator or not self.emulator.running:
             return
 
-        # C64 RESTORE is not on the CIA keyboard matrix; host ``\`` (``BACKSLASH``).
-        if event.key == pygame.K_BACKSLASH:
+        # C64 RESTORE (NMI via $FFFA): host Scroll Lock / Pause — no matrix cell.
+        _restore = (pygame.K_SCROLLOCK, pygame.K_PAUSE)
+        if event.key in _restore:
             self.emulator.cpu.trigger_nmi_coarse()
             return
 

@@ -7,8 +7,9 @@ press on the matrix (e.g. ``F2`` = SHIFT + F1).
 
 Default punctuation follows a US ANSI host keyboard aligned to a C64 photo
 (e.g. host ``'`` → C64 ``;``, ``[`` → ``@``, ``]`` → ``*``, ``-``/``+``,
-``=``, and host ``\\`` triggers RESTORE via NMI in ``graphics.py`` — not in
-this table).
+host ``=`` → C64 ``-``, host ``\\`` → C64 ``=``). C64 RESTORE (NMI via
+``$FFFA``) is bound in ``graphics.py`` to Scroll Lock and Pause — not in this
+table.
 
 Pygame is imported lazily so importing ``c64py`` headlessly never forces a
 pygame init. Call :func:`build_host_to_matrix` once at startup; the returned
@@ -164,7 +165,7 @@ def build_host_to_matrix() -> Dict[int, Tuple[int, int, ShiftReq]]:
         K.K_AT: (5, 6, ShiftReq.NONE),
         K.K_EQUALS: (5, 3, ShiftReq.NONE),        # host = → C64 -
         K.K_KP_EQUALS: (5, 3, ShiftReq.NONE),
-        # Host \ → C64 RESTORE (NMI), not in matrix — handled in ``graphics.py``.
+        K.K_BACKSLASH: (6, 5, ShiftReq.NONE),    # host \ → C64 = (PETSCII BASIC)
         K.K_BACKQUOTE: (7, 1, ShiftReq.NONE),       # ← (left-arrow) on C64
         K.K_CARET: (6, 6, ShiftReq.NONE),           # ↑ (up-arrow) on C64
     }
