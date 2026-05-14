@@ -1200,13 +1200,15 @@ class CPU6502:
                 _worst = 8
                 cap = max(1, remaining // _worst)
                 batch_n = min(batch_n, cap)
-        # KERNAL wire decode + TcpDrive: Rust snapshots peer CLK/DATA only at the
-        # start of each ``run_fast_batch`` call. Listener-ready DATA is applied on
-        # the Python ``IECBus`` during CIA2 replay after a batch; a multi-instruction
-        # batch can spin on $DD00 polls before that replay. Cap at one instruction
-        # per batch while the tap's wire decoder is active (see ``_core.run_fast_batch``).
+        # Optional: one Rust instruction per batch so peer CLK/DATA match Python's IECBus
+        # after every opcode (Tcp listener-ready, etc.). Default is OFF — it cuts speed by
+        # ~50×+ vs normal C64PY_RUST_BATCH; use only while debugging PRINT# stalls on the
+        # Rust fast path. CIA2 $DD00 decode when CHAREN is off (memory.py) addresses the
+        # common "no wire transitions" case without this cap.
         if (
-            getattr(self.memory, "iec_bus", None) is not None
+            os.environ.get("C64PY_IEC_WIRE_DECODE_STRICT_RUST", "").strip().lower()
+            in ("1", "yes", "true", "on")
+            and getattr(self.memory, "iec_bus", None) is not None
             and getattr(
                 getattr(self.memory, "iec_kernal_tap", None), "_wire_decoder", None
             )
