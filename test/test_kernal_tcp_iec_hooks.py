@@ -19,6 +19,37 @@ def test_rust_delegate_includes_tcp_iec_vectors_when_memory_flag_set() -> None:
     assert 0xFFCF in stops
 
 
+def test_open_hook_uses_setlfs_zp_fa_sa_order() -> None:
+    """SETLFS stores device in $B9 and secondary in $BA (not the LOAD vector layout)."""
+    from c64py.kernal_tcp_iec_hooks import FAT, LAT, SAT, handle_kernal_tcp_iec
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    class SpyTcp(TcpDriveClient):
+        def __init__(self) -> None:
+            super().__init__(8, "localhost", 1)
+
+        def connect(self) -> bool:
+            return True
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.use_iec_bus = True
+    emu.kernal_load_shortcut_enabled = True
+    bus = IECBus()
+    emu.iec_bus = bus
+    spy = SpyTcp()
+    bus.attach_device(spy)
+    emu.iec_drives[8] = spy
+    emu.cpu.state.pc = 0xFFC0
+    emu.memory.write(0xB8, 1)
+    emu.memory.write(0xB9, 8)
+    emu.memory.write(0xBA, 15)
+    emu.memory.write(0xB7, 0)
+    assert handle_kernal_tcp_iec(emu) is True
+    idx = next(i for i in range(10) if emu.memory.read(LAT + i) == 1)
+    assert emu.memory.read(FAT + idx) == 8
+    assert emu.memory.read(SAT + idx) == 15
+
+
 def test_ciout_hook_skips_when_dflto_is_screen() -> None:
     from c64py.kernal_tcp_iec_hooks import handle_kernal_tcp_iec
 

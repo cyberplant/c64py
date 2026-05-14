@@ -86,9 +86,10 @@ def _tcp_client(emu: "C64", device: int):
 
 
 def _hook_open(emu: "C64", bus) -> bool:
+    # SETLFS ($FFBA): A→$B8 (LA), X→$B9 (FA device), Y→$BA (SA secondary).
     lfn = emu.memory.read(0xB8)
-    secondary = emu.memory.read(0xB9)
-    device = emu.memory.read(0xBA)
+    device = emu.memory.read(0xB9)
+    secondary = emu.memory.read(0xBA)
     client = _tcp_client(emu, device)
     if client is None:
         return False
