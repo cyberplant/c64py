@@ -56,6 +56,9 @@ class MemoryMap:
     # CIA2 Port A state (for IEC bus control)
     cia2_pra: int = 0xFF  # Port A data register
     cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)
+    cia2_timer_a: CIATimer = field(default_factory=CIATimer)
+    cia2_timer_b: CIATimer = field(default_factory=CIATimer)
+    cia2_icr: int = 0  # Interrupt control register (read clears)
     # Scheduled inject-keys: joystick bits to hold low on CIA1 reads (active low, OR mask).
     joy_inject1_clear: int = 0
     joy_inject2_clear: int = 0
@@ -104,6 +107,8 @@ class MemoryMap:
     _per_cycle_geom_obj: Optional[object] = field(default=None, init=False, repr=False)
     # Optional :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives need KERNAL line tracing.
     iec_kernal_tap: Optional[object] = field(default=None, repr=False)
+    # When True, :class:`cpu.CPU6502` adds KERNAL TCP IEC vector PCs to Rust delegate stops.
+    kernal_tcp_iec_vectors: bool = False
     # Cached 6510 $01 effective value for MemoryMap.read() hot path (invalidated on $00/$01 writes).
     _port01_read_cache_valid: bool = field(default=False, init=False, repr=False)
     _port01_read_cache_value: int = field(default=0, init=False, repr=False)
@@ -868,7 +873,7 @@ class MemoryMap:
 
     def _read_cia2(self, reg: int) -> int:
         """Read CIA2 register.
-        
+
         CIA2 Port A controls the IEC serial bus:
         - Bit 3: ATN OUT
         - Bit 4: CLK OUT
@@ -878,39 +883,120 @@ class MemoryMap:
         """
         if reg == 0x00:  # Port A (IEC bus control)
             result = self.cia2_pra
-            # If IEC bus is attached, read actual bus state
             if self.iec_bus is not None:
-                # Bits 6-7 are direct inputs (CLK IN, DATA IN). The 7406
-                # inverters on the serial interface drive only the output
-                # lines (PA3/PA4/PA5). The input lines PA6/PA7 reach CIA2
-                # directly from the bus connector:
-                #   bit set (=1) → line is HIGH (released)
-                #   bit clear (=0) → line is LOW (asserted)
                 result &= 0x3F
-                if self.iec_bus.clk:   # CLK high (released)
+                if self.iec_bus.clk:
                     result |= 0x40
-                if self.iec_bus.data:  # DATA high (released)
+                if self.iec_bus.data:
                     result |= 0x80
             return result
-        elif reg == 0x02:  # Data direction register A
+        if reg == 0x01:
+            return 0xFF
+        if reg == 0x02:
             return self.cia2_ddra
-        # Other registers return 0
+        if reg == 0x03:
+            return 0x00
+        if reg == 0x04:
+            return self.cia2_timer_a.counter & 0xFF
+        if reg == 0x05:
+            return (self.cia2_timer_a.counter >> 8) & 0xFF
+        if reg == 0x06:
+            return self.cia2_timer_b.counter & 0xFF
+        if reg == 0x07:
+            return (self.cia2_timer_b.counter >> 8) & 0xFF
+        if reg == 0x0D:
+            result = self.cia2_icr
+            self.cia2_icr = 0
+            return result
+        if reg == 0x0E:
+            result = 0
+            if self.cia2_timer_a.running:
+                result |= 0x01
+            if self.cia2_timer_a.one_shot:
+                result |= 0x08
+            if self.cia2_timer_a.input_mode != 0:
+                result |= (self.cia2_timer_a.input_mode << 5)
+            return result
+        if reg == 0x0F:
+            result = 0
+            if self.cia2_timer_b.running:
+                result |= 0x01
+            if self.cia2_timer_b.one_shot:
+                result |= 0x08
+            if self.cia2_timer_b.input_mode != 0:
+                result |= (self.cia2_timer_b.input_mode << 5)
+            return result
         return 0
 
     def _write_cia2(self, reg: int, value: int) -> None:
         """Write CIA2 register.
-        
+
         CIA2 Port A controls the IEC serial bus:
         - Bit 3: ATN OUT
         - Bit 4: CLK OUT
         - Bit 5: DATA OUT
         """
-        if reg == 0x00:  # Port A (IEC bus control)
+        value &= 0xFF
+        if reg == 0x00:
             self.cia2_pra = value
             if self.iec_bus is not None:
                 self.apply_cia2_port_a_to_iec_bus()
-        elif reg == 0x02:  # Data direction register A
+            return
+        if reg == 0x02:
             self.cia2_ddra = value
+            return
+        if reg == 0x04:
+            self.cia2_timer_a.latch = (self.cia2_timer_a.latch & 0xFF00) | value
+            if not self.cia2_timer_a.running:
+                self.cia2_timer_a.counter = (self.cia2_timer_a.counter & 0xFF00) | value
+            return
+        if reg == 0x05:
+            self.cia2_timer_a.latch = (self.cia2_timer_a.latch & 0x00FF) | (value << 8)
+            if not self.cia2_timer_a.running:
+                self.cia2_timer_a.counter = (self.cia2_timer_a.counter & 0x00FF) | (value << 8)
+            return
+        if reg == 0x06:
+            self.cia2_timer_b.latch = (self.cia2_timer_b.latch & 0xFF00) | value
+            if not self.cia2_timer_b.running:
+                self.cia2_timer_b.counter = (self.cia2_timer_b.counter & 0xFF00) | value
+            return
+        if reg == 0x07:
+            self.cia2_timer_b.latch = (self.cia2_timer_b.latch & 0x00FF) | (value << 8)
+            if not self.cia2_timer_b.running:
+                self.cia2_timer_b.counter = (self.cia2_timer_b.counter & 0x00FF) | (value << 8)
+            return
+        if reg == 0x0D:
+            if value & 0x80:
+                if value & 0x01:
+                    self.cia2_timer_a.irq_enabled = True
+                if value & 0x02:
+                    self.cia2_timer_b.irq_enabled = True
+            else:
+                if value & 0x01:
+                    self.cia2_timer_a.irq_enabled = False
+                if value & 0x02:
+                    self.cia2_timer_b.irq_enabled = False
+            return
+        if reg == 0x0E:
+            if value & 0x01:
+                if not self.cia2_timer_a.running:
+                    self.cia2_timer_a.counter = self.cia2_timer_a.latch
+                self.cia2_timer_a.running = True
+            else:
+                self.cia2_timer_a.running = False
+            self.cia2_timer_a.one_shot = (value & 0x08) != 0
+            self.cia2_timer_a.input_mode = (value >> 5) & 0x03
+            return
+        if reg == 0x0F:
+            if value & 0x01:
+                if not self.cia2_timer_b.running:
+                    self.cia2_timer_b.counter = self.cia2_timer_b.latch
+                self.cia2_timer_b.running = True
+            else:
+                self.cia2_timer_b.running = False
+            self.cia2_timer_b.one_shot = (value & 0x08) != 0
+            self.cia2_timer_b.input_mode = (value >> 5) & 0x03
+            return
 
     def _scroll_screen_up(self) -> None:
         """Scroll the screen up by one line (optimized)"""

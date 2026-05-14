@@ -92,6 +92,9 @@ pub struct C64MemoryMap<'a> {
     pub joy_held2_clear: u8,
     pub cia2_pra: u8,
     pub cia2_ddra: u8,
+    pub cia2_timer_a: CiaTimer,
+    pub cia2_timer_b: CiaTimer,
+    pub cia2_icr: u8,
     /// When true, CIA2 port A reads merge peer IEC CLK/DATA like Python ``MemoryMap._read_cia2``.
     pub iec_merge_cia2: bool,
     /// Non-C64 devices release CLK (high) when true; snapshot at batch start from Python.
@@ -143,6 +146,9 @@ impl<'a> C64MemoryMap<'a> {
             joy_held2_clear: 0,
             cia2_pra: 0xFF,
             cia2_ddra: 0xFF,
+            cia2_timer_a: CiaTimer::default(),
+            cia2_timer_b: CiaTimer::default(),
+            cia2_icr: 0,
             iec_merge_cia2: false,
             iec_peer_clk_high: true,
             iec_peer_data_high: true,
@@ -488,7 +494,7 @@ impl<'a> C64MemoryMap<'a> {
         }
     }
 
-    fn read_cia2(&self, reg: u8) -> u8 {
+    fn read_cia2(&mut self, reg: u8) -> u8 {
         match reg {
             0x00 => {
                 if !self.iec_merge_cia2 {
@@ -510,7 +516,44 @@ impl<'a> C64MemoryMap<'a> {
                 };
                 (self.cia2_pra & 0x3F) | (u8::from(clk_hi) << 6) | (u8::from(data_hi) << 7)
             }
+            0x01 => 0xFF,
             0x02 => self.cia2_ddra,
+            0x03 => 0x00,
+            0x04 => (self.cia2_timer_a.counter as u16) as u8,
+            0x05 => ((self.cia2_timer_a.counter as u16) >> 8) as u8,
+            0x06 => (self.cia2_timer_b.counter as u16) as u8,
+            0x07 => ((self.cia2_timer_b.counter as u16) >> 8) as u8,
+            0x0D => {
+                let r = self.cia2_icr;
+                self.cia2_icr = 0;
+                r
+            }
+            0x0E => {
+                let mut result = 0u8;
+                if self.cia2_timer_a.running {
+                    result |= 0x01;
+                }
+                if self.cia2_timer_a.one_shot {
+                    result |= 0x08;
+                }
+                if self.cia2_timer_a.input_mode != 0 {
+                    result |= self.cia2_timer_a.input_mode << 5;
+                }
+                result
+            }
+            0x0F => {
+                let mut result = 0u8;
+                if self.cia2_timer_b.running {
+                    result |= 0x01;
+                }
+                if self.cia2_timer_b.one_shot {
+                    result |= 0x08;
+                }
+                if self.cia2_timer_b.input_mode != 0 {
+                    result |= self.cia2_timer_b.input_mode << 5;
+                }
+                result
+            }
             _ => 0,
         }
     }
@@ -527,6 +570,81 @@ impl<'a> C64MemoryMap<'a> {
                 self.cia2_pra = value;
             }
             0x02 => self.cia2_ddra = value,
+            0x04 => {
+                self.cia2_timer_a.latch =
+                    (self.cia2_timer_a.latch & 0xFF00) | u16::from(value);
+                if !self.cia2_timer_a.running {
+                    let hi = (self.cia2_timer_a.counter as u16) & 0xFF00;
+                    self.cia2_timer_a.counter = i32::from(hi | u16::from(value));
+                }
+            }
+            0x05 => {
+                self.cia2_timer_a.latch =
+                    (self.cia2_timer_a.latch & 0x00FF) | (u16::from(value) << 8);
+                if !self.cia2_timer_a.running {
+                    let lo = (self.cia2_timer_a.counter as u16) & 0x00FF;
+                    self.cia2_timer_a.counter =
+                        i32::from(lo | (u16::from(value) << 8));
+                }
+            }
+            0x06 => {
+                self.cia2_timer_b.latch =
+                    (self.cia2_timer_b.latch & 0xFF00) | u16::from(value);
+                if !self.cia2_timer_b.running {
+                    let hi = (self.cia2_timer_b.counter as u16) & 0xFF00;
+                    self.cia2_timer_b.counter = i32::from(hi | u16::from(value));
+                }
+            }
+            0x07 => {
+                self.cia2_timer_b.latch =
+                    (self.cia2_timer_b.latch & 0x00FF) | (u16::from(value) << 8);
+                if !self.cia2_timer_b.running {
+                    let lo = (self.cia2_timer_b.counter as u16) & 0x00FF;
+                    self.cia2_timer_b.counter =
+                        i32::from(lo | (u16::from(value) << 8));
+                }
+            }
+            0x0D => {
+                if value & 0x80 != 0 {
+                    if value & 0x01 != 0 {
+                        self.cia2_timer_a.irq_enabled = true;
+                    }
+                    if value & 0x02 != 0 {
+                        self.cia2_timer_b.irq_enabled = true;
+                    }
+                } else {
+                    if value & 0x01 != 0 {
+                        self.cia2_timer_a.irq_enabled = false;
+                    }
+                    if value & 0x02 != 0 {
+                        self.cia2_timer_b.irq_enabled = false;
+                    }
+                }
+            }
+            0x0E => {
+                if value & 0x01 != 0 {
+                    if !self.cia2_timer_a.running {
+                        self.cia2_timer_a.counter = i32::from(self.cia2_timer_a.latch);
+                    }
+                    self.cia2_timer_a.running = true;
+                } else {
+                    self.cia2_timer_a.running = false;
+                }
+                self.cia2_timer_a.one_shot = (value & 0x08) != 0;
+                self.cia2_timer_a.input_mode = (value >> 5) & 0x03;
+            }
+            0x0F => {
+                if value & 0x01 != 0 {
+                    if !self.cia2_timer_b.running {
+                        self.cia2_timer_b.counter = i32::from(self.cia2_timer_b.latch);
+                    }
+                    self.cia2_timer_b.running = true;
+                } else {
+                    self.cia2_timer_b.running = false;
+                }
+                self.cia2_timer_b.one_shot = (value & 0x08) != 0;
+                self.cia2_timer_b.input_mode = (value >> 5) & 0x03;
+            }
             _ => {}
         }
     }

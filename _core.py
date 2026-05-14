@@ -112,6 +112,8 @@ def run_fast_batch(
 
     ta = memory.cia1_timer_a
     tb = memory.cia1_timer_b
+    t2a = memory.cia2_timer_a
+    t2b = memory.cia2_timer_b
     vs = memory.video_standard
     if vs not in ("pal", "ntsc"):
         vs = "pal"
@@ -204,6 +206,19 @@ def run_fast_batch(
         memory.cia1_icr,
         memory.cia2_pra,
         memory.cia2_ddra,
+        memory.cia2_icr,
+        t2a.latch,
+        t2a.counter,
+        t2a.running,
+        t2a.irq_enabled,
+        t2a.one_shot,
+        t2a.input_mode,
+        t2b.latch,
+        t2b.counter,
+        t2b.running,
+        t2b.irq_enabled,
+        t2b.one_shot,
+        t2b.input_mode,
         int(memory.cia1_pra) & 0xFF,
         int(memory.cia1_prb) & 0xFF,
         int(memory.cia1_ddra) & 0xFF,
@@ -285,6 +300,19 @@ def run_fast_batch(
         cia_icr,
         c2pra,
         c2ddra,
+        c2icr,
+        c2tala,
+        c2tac,
+        c2tar,
+        c2taie,
+        c2taos,
+        c2tai,
+        c2tbl,
+        c2tbc,
+        c2tbr,
+        c2tbie,
+        c2tbos,
+        c2tbi,
         tala,
         tac,
         tar,
@@ -335,6 +363,19 @@ def run_fast_batch(
     memory.pending_irq = pirq
     memory.cia1_icr = cia_icr
     memory.cia2_ddra = c2ddra
+    memory.cia2_icr = c2icr & 0xFF
+    t2a.latch = c2tala
+    t2a.counter = c2tac
+    t2a.running = c2tar
+    t2a.irq_enabled = c2taie
+    t2a.one_shot = c2taos
+    t2a.input_mode = c2tai
+    t2b.latch = c2tbl
+    t2b.counter = c2tbc
+    t2b.running = c2tbr
+    t2b.irq_enabled = c2tbie
+    t2b.one_shot = c2tbos
+    t2b.input_mode = c2tbi
     ta.latch = tala
     ta.counter = tac
     ta.running = tar

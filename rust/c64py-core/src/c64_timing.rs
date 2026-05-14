@@ -17,7 +17,9 @@ pub fn advance_raster(mem: &mut C64MemoryMap<'_>, cycles: u32) {
 pub fn update_cia_timers(mem: &mut C64MemoryMap<'_>, cycles: u32, recompute_irq: bool) {
     let t_a_running = mem.cia1_timer_a.running;
     let t_b_running = mem.cia1_timer_b.running;
-    if !recompute_irq && !t_a_running && !t_b_running {
+    let t2_a_running = mem.cia2_timer_a.running;
+    let t2_b_running = mem.cia2_timer_b.running;
+    if !recompute_irq && !t_a_running && !t_b_running && !t2_a_running && !t2_b_running {
         return;
     }
 
@@ -48,6 +50,34 @@ pub fn update_cia_timers(mem: &mut C64MemoryMap<'_>, cycles: u32, recompute_irq:
             mem.cia1_icr |= 0x80;
         }
         mem.cia1_timer_b.counter = i32::from(mem.cia1_timer_b.latch);
+    }
+
+    if mem.cia2_timer_a.update(cycles) {
+        if mem.cia2_timer_a.irq_enabled {
+            mem.cia2_icr |= 0x01;
+            mem.cia2_icr |= 0x80;
+        }
+        mem.cia2_timer_a.counter = i32::from(mem.cia2_timer_a.latch);
+    }
+
+    let t2a_under = mem.cia2_timer_a.counter <= 0 && mem.cia2_timer_a.running;
+
+    if mem.cia2_timer_b.input_mode == 2 {
+        if t2a_under {
+            if mem.cia2_timer_b.update(1) {
+                if mem.cia2_timer_b.irq_enabled {
+                    mem.cia2_icr |= 0x02;
+                    mem.cia2_icr |= 0x80;
+                }
+                mem.cia2_timer_b.counter = i32::from(mem.cia2_timer_b.latch);
+            }
+        }
+    } else if mem.cia2_timer_b.update(cycles) {
+        if mem.cia2_timer_b.irq_enabled {
+            mem.cia2_icr |= 0x02;
+            mem.cia2_icr |= 0x80;
+        }
+        mem.cia2_timer_b.counter = i32::from(mem.cia2_timer_b.latch);
     }
 
     if recompute_irq {

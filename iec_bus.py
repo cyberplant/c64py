@@ -446,13 +446,15 @@ class IECBus:
         if not 0 <= channel <= 15:
             return False
         ok = self.send_command(0xF0 | channel)
-        if filename is not None and ok:
+        if not ok:
+            return False
+        if filename is not None:
             data = bytes(filename)
             if data:
                 for i, b in enumerate(data):
                     self.send_byte(b, eoi=(i == len(data) - 1))
-            self.unlisten()
-        return ok
+        self.unlisten()
+        return True
 
     def close_channel(self, channel: int) -> bool:
         """High-level helper: CLOSE ``channel`` on current listener/talker."""

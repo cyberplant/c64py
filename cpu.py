@@ -1019,15 +1019,19 @@ class CPU6502:
             self.memory.iec_bus is not None
             and not getattr(self.memory, "iec_disk_full_impl", False)
         )
+        tcp_iec = bool(getattr(self.memory, "kernal_tcp_iec_vectors", False))
         key = (
             self.kernal_disk_hook_vectors,
             iec_stub,
             self.memory.kernal_rom is None,
+            tcp_iec,
         )
         if self._rust_delegate_stop_pcs_key != key:
             pcs = [0xFFD2]
             if self.kernal_disk_hook_vectors or iec_stub:
                 pcs.extend((0xFFD5, 0xFFD8))
+            if tcp_iec:
+                pcs.extend((0xFFC0, 0xFFC3, 0xFFC6, 0xFFC9, 0xFFCC, 0xFFCF))
             if self.memory.kernal_rom is None:
                 pcs.extend((0xFF5B, 0xFFCF))
             self._rust_delegate_stop_pcs_cached = tuple(sorted(set(pcs)))
@@ -1231,16 +1235,24 @@ class CPU6502:
         mem = self.memory
         tA = mem.cia1_timer_a
         tB = mem.cia1_timer_b
-        if not recompute_irq and (not tA.running) and (not tB.running):
+        t2A = mem.cia2_timer_a
+        t2B = mem.cia2_timer_b
+        if (
+            not recompute_irq
+            and (not tA.running)
+            and (not tB.running)
+            and (not t2A.running)
+            and (not t2B.running)
+        ):
             return
-        # Update Timer A
+        # Update CIA1 Timer A
         if tA.update(cycles):
             if tA.irq_enabled:
                 mem.cia1_icr |= 0x01  # Timer A interrupt
                 mem.cia1_icr |= 0x80  # IRQ flag
             tA.reset()
 
-        # Update Timer B (can be clocked by Timer A underflow)
+        # Update CIA1 Timer B (can be clocked by Timer A underflow)
         timer_a_underflow = False
         if tA.counter <= 0 and tA.running:
             timer_a_underflow = True
@@ -1256,6 +1268,28 @@ class CPU6502:
                 mem.cia1_icr |= 0x02  # Timer B interrupt
                 mem.cia1_icr |= 0x80  # IRQ flag
                 tB.reset()
+
+        # CIA2 (NM on real hardware; we only model ICR bits for KERNAL polling.)
+        if t2A.update(cycles):
+            if t2A.irq_enabled:
+                mem.cia2_icr |= 0x01
+                mem.cia2_icr |= 0x80
+            t2A.reset()
+
+        t2a_under = t2A.counter <= 0 and t2A.running
+        if t2B.input_mode == 2:
+            if t2a_under:
+                if t2B.update(1):
+                    if t2B.irq_enabled:
+                        mem.cia2_icr |= 0x02
+                        mem.cia2_icr |= 0x80
+                    t2B.reset()
+        else:
+            if t2B.update(cycles):
+                if t2B.irq_enabled:
+                    mem.cia2_icr |= 0x02
+                    mem.cia2_icr |= 0x80
+                t2B.reset()
 
         if recompute_irq:
             mem.recompute_pending_irq()

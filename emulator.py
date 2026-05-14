@@ -1316,9 +1316,16 @@ class C64:
         self, cycles_before: int, max_cycles: Optional[int] = None
     ) -> int:
         """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
+        self.memory.kernal_tcp_iec_vectors = bool(
+            self.kernal_load_shortcut_enabled and self.use_iec_bus
+        )
         if self._handle_kernal_load():
             return 0
         if self._handle_kernal_save():
+            return 0
+        from .kernal_tcp_iec_hooks import handle_kernal_tcp_iec
+
+        if handle_kernal_tcp_iec(self):
             return 0
         return self.cpu.cpu_step_quantum(
             self.udp_debug, self.vice_trace, cycles_before, max_cycles

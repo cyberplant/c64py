@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from ..iec_bus import IECBus
     from ..d64 import D64Image
 
+from ..d64 import dos_filetype_byte_closed, parse_commodore_filename_mode
+
 
 @dataclass
 class ChannelState:
@@ -47,6 +49,11 @@ class ChannelState:
     byte_iter: Optional[Iterator[int]] = None
     pending: Optional[int] = None
     found: bool = True
+    # Host ``OPEN`` with ``,W`` (write): accumulate payload until CLOSE.
+    write_mode: bool = False
+    write_buf: Optional[bytearray] = None
+    open_stem: str = ""
+    dos_ft_nibble: int = 2
 
 
 class Drive1541Memory:
@@ -400,6 +407,16 @@ class Drive1541(IECDriveBackend):
         self.channels[channel] = ChannelState(channel=channel)
 
     def iec_close_channel(self, channel: int) -> None:
+        state = self.channels.get(channel)
+        if state is not None and state.write_mode and state.write_buf is not None:
+            disk = self._disk_helper.disk
+            name = state.open_stem.strip().strip('"').upper()[:16]
+            if disk is not None and self._disk_helper.has_disk() and name:
+                payload = bytes(state.write_buf)
+                if payload:
+                    ft = dos_filetype_byte_closed(state.dos_ft_nibble)
+                    if not disk.write_file(name, payload, filetype=ft):
+                        self._disk_helper.last_error = (63, "FILE EXISTS", 0, 0)
         self.channels.pop(channel, None)
         if self._opening_channel == channel:
             self._opening_channel = None
@@ -418,7 +435,23 @@ class Drive1541(IECDriveBackend):
         if state is None:
             return
         try:
-            filename = state.filename_buf.decode("ascii", errors="replace")
+            raw_name = state.filename_buf.decode("ascii", errors="replace")
+        except Exception:
+            raw_name = ""
+        if ",W" in raw_name.upper():
+            stem, want = parse_commodore_filename_mode(raw_name)
+            state.write_mode = True
+            state.dos_ft_nibble = int(want) if want is not None else 2
+            state.open_stem = stem.strip().strip('"').upper()[:16]
+            state.write_buf = bytearray()
+            state.found = True
+            state.byte_iter = iter(())
+            state.is_open = True
+            state.pending = None
+            state.filename_buf.clear()
+            return
+        try:
+            filename = raw_name
         except Exception:
             filename = ""
         data = self._disk_helper.load_file(filename, secondary_address=ch)
@@ -443,6 +476,12 @@ class Drive1541(IECDriveBackend):
             state.filename_buf.append(byte)
             return
         ch = self.current_channel
+        if ch is None:
+            return
+        st = self.channels.get(ch)
+        if st is not None and st.write_buf is not None:
+            st.write_buf.append(byte)
+            return
         if ch == 15:
             self.command_buffer.append(byte)
             return
