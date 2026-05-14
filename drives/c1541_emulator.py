@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator, Optional
+
+from pathlib import Path
 
 from ..cpu import CPU6502
 from ..cpu_state import CIATimer
@@ -527,6 +529,58 @@ class Drive1541(IECDriveBackend):
 # Standalone TCP drive server
 # ---------------------------------------------------------------------------
 
+def _resolve_c1541_log_path(template: str, device: int) -> Path:
+    """Expand ``{date}`` / ``{device}`` in *template* and return an absolute :class:`pathlib.Path`."""
+    from datetime import date
+
+    s = (
+        str(template)
+        .replace("{date}", date.today().isoformat())
+        .replace("{device}", str(int(device)))
+    )
+    p = Path(s)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p
+
+
+def _install_c1541_file_log_handler(logger: logging.Logger, device: int, log_level: int) -> None:
+    """If ``[c1541] file_logging_enabled`` is true in TOML config, append logs to a file."""
+    try:
+        from c64py.config import DEFAULT_CONFIG, _config_get, load_config
+    except ImportError:
+        return
+
+    cfg = load_config()
+    enabled = _config_get(cfg, "c1541.file_logging_enabled")
+    if enabled is None:
+        enabled = _config_get(DEFAULT_CONFIG, "c1541.file_logging_enabled")
+    if not bool(enabled):
+        return
+
+    template = _config_get(cfg, "c1541.file_logging_filename")
+    if not template:
+        template = _config_get(DEFAULT_CONFIG, "c1541.file_logging_filename")
+    path = _resolve_c1541_log_path(str(template), device)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler):
+            try:
+                if Path(h.baseFilename) == path.resolve():  # type: ignore[attr-defined]
+                    return
+            except (AttributeError, OSError, ValueError):
+                continue
+
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setLevel(log_level)
+    fh.setFormatter(
+        logging.Formatter(f"%(asctime)s [drive{device}] %(levelname)s %(message)s")
+    )
+    logger.addHandler(fh)
+    logger.info("c1541 file log: %s", path)
+
+
 def _run_server(device: int, port: int, disk_path: Optional[str],
                 dos_rom_path: Optional[str], serial_rom_path: Optional[str],
                 interface: str = "headless",
@@ -561,6 +615,8 @@ def _run_server(device: int, port: int, disk_path: Optional[str],
     _rh = _RingHandler()
     _rh.setFormatter(logging.Formatter())
     log.addHandler(_rh)
+
+    _install_c1541_file_log_handler(log, device, log_level)
 
     log.info("interface=%s emulation=%s", interface, emulation)
 

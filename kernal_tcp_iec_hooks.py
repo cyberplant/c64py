@@ -6,9 +6,9 @@ calling convention at the official vectors and return via synthetic ``RTS`` with
 executing KERNAL ROM, so the bit-level CIA2 wire decoder remains available when this
 path is disabled.
 
-Disk ``PRINT#`` / ``PRINT`` to a file typically sends bytes through **CIOUT** at
-``$FDF9`` (not only **CHROUT** at ``$FFD2``); both entry points share the same
-:meth:`_hook_ciout` implementation.
+Disk ``PRINT#`` sends bytes through **BSOUT** at ``$F9ED`` (BASIC calls this after
+``CHKOUT``). KERNAL may also use **CIOUT** at ``$FDF9`` or **CHROUT** at ``$FFD2``;
+all three share :meth:`_hook_ciout`.
 """
 
 from __future__ import annotations
@@ -78,8 +78,8 @@ def handle_kernal_tcp_iec(emu: "C64") -> bool:
         return _hook_chkin(emu, bus)
     if pc == 0xFFCF:
         return _hook_basin(emu, bus)
-    # CHROUT ($FFD2) and CIOUT ($FDF9) — PRINT# loops usually hit CIOUT per character.
-    if pc in (0xFFD2, 0xFDF9):
+    # BSOUT ($F9ED): BASIC PRINT#; CIOUT ($FDF9); CHROUT ($FFD2).
+    if pc in (0xF9ED, 0xFDF9, 0xFFD2):
         return _hook_ciout(emu, bus)
     return False
 
@@ -303,7 +303,7 @@ def _hook_basin(emu: "C64", bus) -> bool:
 
 
 def _hook_ciout(emu: "C64", bus) -> bool:
-    """CHROUT ($FFD2) and CIOUT ($FDF9): send one byte to the current LISTEN device."""
+    """BSOUT / CIOUT / CHROUT: send one byte to the current LISTEN device (DFLTO 8–11)."""
     if (emu.memory.read(DFLTO) & 0xFF) < 8 or (emu.memory.read(DFLTO) & 0xFF) > 11:
         return False
     device = emu.memory.read(DFLTO) & 0xFF
@@ -324,6 +324,7 @@ def _hook_ciout(emu: "C64", bus) -> bool:
 def kernal_tcp_iec_stop_pcs() -> tuple[int, ...]:
     """PC values where the Rust fast batch must yield for TCP IEC hooks (sorted)."""
     return (
+        0xF9ED,
         0xFDF9,
         0xFFC0,
         0xFFC3,

@@ -1033,6 +1033,7 @@ class CPU6502:
             if tcp_iec:
                 pcs.extend(
                     (
+                        0xF9ED,
                         0xFDF9,
                         0xFFC0,
                         0xFFC3,

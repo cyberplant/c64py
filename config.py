@@ -58,6 +58,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "disk_emulation": "fast",
         "vic_emulation": "fast",
     },
+    "c1541": {
+        "file_logging_enabled": False,
+        "file_logging_filename": "logs/c1541-{date}.log",
+    },
     "debug": {
         "turbo": False,
         "udp_debug": False,
@@ -393,6 +397,8 @@ _COMMENTS: Dict[str, str] = {
     "emulation.interface": 'Interface mode: "textual", "headless", or "graphics"',
     "emulation.disk_emulation": 'Disk emulation tier: "fast", "accurate-python", "accurate-rust"',
     "emulation.vic_emulation": 'VIC timing tier: "fast", "accurate-python", "accurate-rust"',
+    "c1541.file_logging_enabled": "Append c1541_emulator logs to a file (standalone TCP drive)",
+    "c1541.file_logging_filename": 'Log path; "{date}" → ISO date, "{device}" → drive number',
     "debug.turbo": "Run at maximum speed (no throttle)",
     "debug.udp_debug": "Emit debug events over UDP",
     "debug.udp_port": "UDP port for debug events when udp_debug = true",

@@ -52,6 +52,12 @@ interface     = "textual"    # "textual" | "headless" | "graphics"
 disk_emulation = "fast"      # "fast" | "accurate-python" | "accurate-rust"
 vic_emulation  = "fast"      # "fast" | "accurate-python" | "accurate-rust"
 
+[c1541]
+# Standalone TCP drive (`python -m c64py.drives.c1541_emulator`).
+# `{date}` → ISO date, `{device}` → drive number (8–11).
+file_logging_enabled = false
+file_logging_filename = "logs/c1541-{date}.log"
+
 [debug]
 turbo     = false            # run at maximum speed (no throttle)
 udp_debug = false            # emit debug events over UDP

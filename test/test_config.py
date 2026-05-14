@@ -54,6 +54,8 @@ def test_defaults_when_no_file_present(isolated_env):
     assert cfg["emulation"]["interface"] == "textual"
     assert cfg["emulation"]["disk_emulation"] == "fast"
     assert cfg["emulation"]["vic_emulation"] == "fast"
+    assert cfg["c1541"]["file_logging_enabled"] is False
+    assert "logs/c1541-{date}.log" in cfg["c1541"]["file_logging_filename"]
     assert cfg["debug"]["turbo"] is False
     assert cfg["debug"]["udp_debug"] is False
     assert cfg["debug"]["screen_update_interval"] == 0.1
