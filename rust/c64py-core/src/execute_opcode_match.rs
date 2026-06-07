@@ -38,7 +38,7 @@ match opcode {
             return ldx_abs(cpu, mem);
             },
             0xb6 => {
-            let zp_addr = (mr(mem, cpu, cpu.pc.wrapping_add(1)) + cpu.y) & 0xFF;
+            let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.y);
             cpu.x = mr(mem, cpu, u16::from(zp_addr));
             update_nz(cpu, cpu.x);
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
@@ -120,12 +120,12 @@ match opcode {
             },
             0xc7 => {
             let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1));
-            let value = (mr(mem, cpu, u16::from(zp_addr)) - 1) & 0xFF;
+            let value = mr(mem, cpu, u16::from(zp_addr)).wrapping_sub(1);
             mw(mem, cpu, zp_addr as u16, value);
-            let result = cpu.a - value;
-            set_flag(cpu, 0x01, result >= 0);
-            set_flag(cpu, 0x02, result == 0);
-            set_flag(cpu, 0x80, (result & 0x80) != 0);
+            set_flag(cpu, 0x01, cpu.a >= value);
+            let diff = cpu.a.wrapping_sub(value);
+            set_flag(cpu, 0x02, diff == 0);
+            set_flag(cpu, 0x80, (diff & 0x80) != 0);
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
             return 5;
             },
@@ -520,7 +520,7 @@ match opcode {
             return plp(cpu, mem);
             },
             0x7a => {
-            cpu.sp = (cpu.sp + 1) & 0xFF;
+            cpu.sp = cpu.sp.wrapping_add(1);
             cpu.y = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16));
             update_nz(cpu, cpu.y);
             cpu.pc = (cpu.pc.wrapping_add(1)) & 0xFFFF;
@@ -571,7 +571,7 @@ match opcode {
             0xff => {
             let base = read_word_at(mem, cpu.pc.wrapping_add(1));
             let addr = base.wrapping_add(cpu.x as u16);
-            let value = (mr(mem, cpu, addr) + 1) & 0xFF;
+            let value = mr(mem, cpu, addr).wrapping_add(1);
             mw(mem, cpu, addr, value);
             let carry: u8 = if (cpu.p & 0x01) != 0 { 1 } else { 0 };
             let result: i32 = i32::from(cpu.a) - i32::from(value) - (1 - i32::from(carry));

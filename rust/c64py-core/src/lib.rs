@@ -182,9 +182,9 @@ fn run_fast_batch_py<'py>(
         None
     };
 
-    // Beam: raw pointers into Python-owned bytearrays (valid while buffer is not resized).
-    let mut beam_vic_ptr_usize: usize = 0;
-    let mut beam_cia2_ptr_usize: usize = 0;
+    // Beam: copy Python bytearrays into Rust-owned buffers before releasing the GIL.
+    let mut beam_vic_backing: Option<Vec<u8>> = None;
+    let mut beam_cia2_backing: Option<Vec<u8>> = None;
     let mut beam_capture_active = false;
     if beam_render_enabled {
         let n = beam_nlines as usize;
@@ -203,29 +203,27 @@ fn run_fast_batch_py<'py>(
                 "beam_cia2_flat is required when beam_render_enabled",
             ));
         };
-        unsafe {
-            let vs = bv.as_bytes_mut();
-            let cs = bc.as_bytes_mut();
-            if vs.len() != n * 64 || cs.len() != n {
-                return Err(PyValueError::new_err(format!(
-                    "beam buffers must be {} and {} bytes, got {} and {}",
-                    n * 64,
-                    n,
-                    vs.len(),
-                    cs.len()
-                )));
-            }
-            let vp = vs.as_mut_ptr();
-            let cp = cs.as_mut_ptr();
-            beam_vic_ptr_usize = vp as usize;
-            beam_cia2_ptr_usize = cp as usize;
-            beam_capture_active = true;
+        let (vs, cs) = unsafe {
+            (bv.as_bytes().to_vec(), bc.as_bytes().to_vec())
+        };
+        if vs.len() != n * 64 || cs.len() != n {
+            return Err(PyValueError::new_err(format!(
+                "beam buffers must be {} and {} bytes, got {} and {}",
+                n * 64,
+                n,
+                vs.len(),
+                cs.len()
+            )));
         }
+        beam_vic_backing = Some(vs);
+        beam_cia2_backing = Some(cs);
+        beam_capture_active = true;
     }
 
     // Run the heavy batch outside the GIL so Python-side audio/UI threads can run.
-    // Safe: we copied the bytearray into `backing` and do not touch Python objects inside.
-    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 14]), String> =
+    // Safe: RAM and beam buffers are copied into Rust-owned Vecs; no Python objects are
+    // touched inside the detached closure. Beam results are copied back after detach.
+    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 14], Option<Vec<u8>>, Option<Vec<u8>>), String> =
         py.detach(move || (move || {
         let ram_arr: &mut [u8; 65536] = backing
             .as_mut_slice()
@@ -268,8 +266,12 @@ fn run_fast_batch_py<'py>(
         if beam_capture_active {
             mem.beam_enabled = true;
             mem.beam_nlines = beam_nlines;
-            mem.beam_vic_ptr = beam_vic_ptr_usize as *mut u8;
-            mem.beam_cia2_ptr = beam_cia2_ptr_usize as *mut u8;
+            if let Some(ref mut bv) = beam_vic_backing {
+                mem.beam_vic_ptr = bv.as_mut_ptr();
+            }
+            if let Some(ref mut bc) = beam_cia2_backing {
+                mem.beam_cia2_ptr = bc.as_mut_ptr();
+            }
         }
 
         let mut resid_box: Option<Box<ResidSession>> =
@@ -353,11 +355,24 @@ fn run_fast_batch_py<'py>(
         mem.beam_vic_ptr = std::ptr::null_mut();
         mem.beam_cia2_ptr = std::ptr::null_mut();
         mem.beam_enabled = false;
-        Ok((out, backing, pcm_bytes, vpack))
+        Ok((out, backing, pcm_bytes, vpack, beam_vic_backing, beam_cia2_backing))
     })());
-    let (out, backing_out, pcm_bytes, vpack) = result.map_err(|e: String| PyValueError::new_err(e))?;
+    let (out, backing_out, pcm_bytes, vpack, beam_vic_out, beam_cia2_out) =
+        result.map_err(|e: String| PyValueError::new_err(e))?;
     let dst = unsafe { ram.as_bytes_mut() };
     dst.copy_from_slice(&backing_out);
+    if let (Some(ref bv), Some(ref py_bv)) = (beam_vic_out.as_ref(), beam_vic_flat.as_ref()) {
+        let dst = unsafe { py_bv.as_bytes_mut() };
+        if dst.len() == bv.len() {
+            dst.copy_from_slice(bv);
+        }
+    }
+    if let (Some(ref bc), Some(ref py_bc)) = (beam_cia2_out.as_ref(), beam_cia2_flat.as_ref()) {
+        let dst = unsafe { py_bc.as_bytes_mut() };
+        if dst.len() == bc.len() {
+            dst.copy_from_slice(bc);
+        }
+    }
 
     let (
         ins,

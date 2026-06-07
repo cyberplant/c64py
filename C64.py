@@ -302,9 +302,9 @@ def main():
         default="fast",
         help=(
             "Pygame output sampling. fast: one VIC latch per presented frame (default). "
-            "accurate: per-raster-line VIC + CIA2 bank for vertical splits when the Python "
-            "CPU runs every instruction (e.g. --vic-emulation accurate-python, or no Rust core); "
-            "with the Rust batch + default accurate-rust, output uses the same latch as fast. "
+            "accurate: per-raster-line VIC + CIA2 bank for vertical splits; with the Rust "
+            "fast-batch path and --vic-emulation accurate-rust, beam capture runs in Rust "
+            "into shared flat buffers when the extension is built. "
             "See docs/DEBUGGING.md."
         ),
     )
