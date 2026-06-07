@@ -458,7 +458,7 @@ def main():
 
         # Start server if requested (runs in parallel with UI)
         server = None
-        if (args.tcp_port or args.udp_port) and emu.interface is not None:
+        if args.tcp_port or args.udp_port:
             server = EmulatorServer(emu, tcp_port=args.tcp_port, udp_port=args.udp_port)
             server.start()
             if show_ui_logs and emu.interface is not None:

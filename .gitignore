@@ -31,9 +31,8 @@ htmlcov/
 .tox/
 .nox/
 
-# Local logs (keep aggregated benchmark NDJSON for optional commit)
+# Local logs and benchmark NDJSON (see scripts/run_benchmark.sh)
 logs/*
-!logs/benchmark-log.json
 *.log
 
 # C64 Copyrighted roms

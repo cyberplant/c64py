@@ -85,7 +85,7 @@ class ViciiCycleEngine:
     """Minimal VICE-aligned VIC-II cycle engine for badlines + BA arbitration (PAL 6569R3)."""
 
     raster_line: int = 0
-    raster_cycle: int = 0  # 0..62 maps to cycles 1..63
+    raster_cycle: int = -1  # pre-increment in tick(); 0..62 PAL ≡ chip cycles 1..63
     cycles_per_line: int = 63
     num_raster_lines: int = 312
 

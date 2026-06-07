@@ -124,7 +124,11 @@ class CPU6502:
         if irq_edge:
             self.memory.trigger_vic_irq(0x01)
 
-        if self.vic.raster_line == 0 and self.vic.raster_cycle == 0:
+        if (
+            self.vic.raster_line == 0
+            and self.vic.raster_cycle == 0
+            and prev_line != 0
+        ):
             if self.memory.vic_snapshot_each_emulated_frame:
                 self.memory.snapshot_vic_render_state()
 
