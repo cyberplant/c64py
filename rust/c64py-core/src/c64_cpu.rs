@@ -15,6 +15,35 @@ pub struct CpuState {
     pub p: u8,
     pub cycles: u64,
     pub stopped: bool,
+    /// Canonical 6502 CLI/SEI/PLP 1-instruction IRQ-poll delay.
+    ///
+    /// Set by those opcodes *after* updating `p`; the *next* post-instruction
+    /// IRQ poll uses [`CpuState::pre_i_flag`] (the I bit as it was *before*
+    /// the opcode modified it), and then clears this flag. Matches VICE and
+    /// real NMOS 6502 — see `test/test_cli_irq_delay.py` (Python) for the
+    /// canonical regression cases.
+    pub cli_sei_delay: bool,
+    /// Value of the I flag (`p & 0x04`) before the most recent CLI/SEI/PLP
+    /// updated `p`. Consumed by the following IRQ poll when
+    /// [`CpuState::cli_sei_delay`] is set.
+    pub pre_i_flag: u8,
+}
+
+/// Post-instruction IRQ poll with the canonical CLI/SEI/PLP 1-instruction delay.
+///
+/// Returns `true` iff an IRQ should be dispatched *now*. Consumes
+/// [`CpuState::cli_sei_delay`] regardless of the return value, so a CLI/SEI/PLP
+/// followed by a non-pending cycle still correctly clears the delay before the
+/// next instruction completes.
+#[inline]
+pub fn irq_should_dispatch(cpu: &mut CpuState, mem_pending_irq: bool) -> bool {
+    let i_masked = if cpu.cli_sei_delay {
+        cpu.cli_sei_delay = false;
+        (cpu.pre_i_flag & 0x04) != 0
+    } else {
+        (cpu.p & 0x04) != 0
+    };
+    mem_pending_irq && !i_masked
 }
 
 #[inline]

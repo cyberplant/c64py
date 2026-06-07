@@ -75,6 +75,20 @@ pub struct C64MemoryMap<'a> {
     pub cia1_timer_a: CiaTimer,
     pub cia1_timer_b: CiaTimer,
     pub cia1_icr: u8,
+    /// CIA1 PRA/PRB output latches and DDR direction registers ($DC00-$DC03).
+    pub cia1_pra: u8,
+    pub cia1_prb: u8,
+    pub cia1_ddra: u8,
+    pub cia1_ddrb: u8,
+    /// 8x8 keyboard matrix; bit set = key held in (row, col). Active-low
+    /// semantics applied at scan time, mirroring ``MemoryMap._scan_keyboard``.
+    pub kbd_matrix: [u8; 8],
+    /// Joystick inject masks (``--inject-keys``). Cleared bits forced low on read.
+    pub joy_inject1_clear: u8,
+    pub joy_inject2_clear: u8,
+    /// Held-while-pressed joystick masks (host-key joystick mapping, item C).
+    pub joy_held1_clear: u8,
+    pub joy_held2_clear: u8,
     pub cia2_pra: u8,
     pub cia2_ddra: u8,
     /// When true, CIA2 port A reads merge peer IEC CLK/DATA like Python ``MemoryMap._read_cia2``.
@@ -109,6 +123,15 @@ impl<'a> C64MemoryMap<'a> {
             cia1_timer_a: CiaTimer::default(),
             cia1_timer_b: CiaTimer::default(),
             cia1_icr: 0,
+            cia1_pra: 0xFF,
+            cia1_prb: 0xFF,
+            cia1_ddra: 0xFF,
+            cia1_ddrb: 0x00,
+            kbd_matrix: [0; 8],
+            joy_inject1_clear: 0,
+            joy_inject2_clear: 0,
+            joy_held1_clear: 0,
+            joy_held2_clear: 0,
             cia2_pra: 0xFF,
             cia2_ddra: 0xFF,
             iec_merge_cia2: false,
@@ -198,6 +221,18 @@ impl<'a> C64MemoryMap<'a> {
                 v
             }
             0x1A => self.vic_regs[0x1A] & 0x0F,
+            // Sprite-to-sprite collision ($D01E) - cleared on read
+            0x1E => {
+                let val = self.vic_regs[0x1E];
+                self.vic_regs[0x1E] = 0; // Clear on read per C64 VIC-II spec
+                val
+            }
+            // Sprite-to-background collision ($D01F) - cleared on read
+            0x1F => {
+                let val = self.vic_regs[0x1F];
+                self.vic_regs[0x1F] = 0; // Clear on read per C64 VIC-II spec
+                val
+            }
             0x20 => self.vic_regs[0x20] & 0x0F,
             0x21 => self.vic_regs[0x21] & 0x0F,
             _ => *self.vic_regs.get(reg).unwrap_or(&0),
@@ -213,13 +248,74 @@ impl<'a> C64MemoryMap<'a> {
             self.vic_regs[0x1A] = value & 0x0F;
         } else if reg == 0x12 {
             self.vic_regs[0x12] = value & 0xFF;
+            // Clear raster IRQ pending when compare line changes (real C64 resets edge detect).
+            self.vic_interrupt_state &= !0x01;
         }
         self.recompute_pending_irq();
     }
 
+    fn scan_keyboard(&self) -> (u8, u8) {
+        // Mirrors ``MemoryMap._scan_keyboard`` in memory.py. Convention:
+        // ``row`` is the $DC00 (PA) bit driven low, ``col`` is the $DC01 (PB)
+        // bit that reads back low. ``kbd_matrix[row]`` holds cols as bits.
+        let pra_lat = self.cia1_pra;
+        let prb_lat = self.cia1_prb;
+        let ddra = self.cia1_ddra;
+        let ddrb = self.cia1_ddrb;
+        let pa_drive_low = (!pra_lat) & ddra;
+        let pb_drive_low = (!prb_lat) & ddrb;
+        let mut pra_pull_low: u8 = 0;
+        let mut prb_pull_low: u8 = 0;
+        for r in 0..8 {
+            let held = self.kbd_matrix[r];
+            if held == 0 {
+                continue;
+            }
+            // Standard scan: CPU drives PA bit r low → pull all held cols on PB.
+            if pa_drive_low & (1 << r) != 0 {
+                prb_pull_low |= held;
+            }
+            // Inverse scan: held key in a PB-driven-low col pulls PA bit r.
+            if held & pb_drive_low != 0 {
+                pra_pull_low |= 1 << r;
+            }
+        }
+        let pra_input_high = !ddra;
+        let prb_input_high = !ddrb;
+        let mut pra = (pra_lat & ddra) | (pra_input_high & !pra_pull_low);
+        let mut prb = (prb_lat & ddrb) | (prb_input_high & !prb_pull_low);
+        pra &= !self.joy_inject2_clear;
+        prb &= !self.joy_inject1_clear;
+        pra &= !self.joy_held2_clear;
+        prb &= !self.joy_held1_clear;
+        (pra, prb)
+    }
+
+    /// Hold a C64 matrix key; called from the Python host on KEYDOWN.
+    pub fn press_matrix_key(&mut self, row: u8, col: u8) {
+        if row < 8 && col < 8 {
+            self.kbd_matrix[row as usize] |= 1 << col;
+        }
+    }
+
+    /// Release a previously-held matrix key; called from the Python host on KEYUP.
+    pub fn release_matrix_key(&mut self, row: u8, col: u8) {
+        if row < 8 && col < 8 {
+            self.kbd_matrix[row as usize] &= !(1 << col);
+        }
+    }
+
+    /// Drop every held matrix key (focus loss / reset).
+    pub fn release_all_keys(&mut self) {
+        self.kbd_matrix = [0; 8];
+    }
+
     fn read_cia1(&mut self, reg: u8) -> u8 {
         match reg {
-            0x00 | 0x01 => 0xFF,
+            0x00 => self.scan_keyboard().0,
+            0x01 => self.scan_keyboard().1,
+            0x02 => self.cia1_ddra,
+            0x03 => self.cia1_ddrb,
             0x04 => (self.cia1_timer_a.counter as u16) as u8,
             0x05 => ((self.cia1_timer_a.counter as u16) >> 8) as u8,
             0x06 => (self.cia1_timer_b.counter as u16) as u8,
@@ -262,6 +358,18 @@ impl<'a> C64MemoryMap<'a> {
 
     fn write_cia1(&mut self, reg: u8, value: u8) {
         match reg {
+            0x00 => {
+                self.cia1_pra = value;
+            }
+            0x01 => {
+                self.cia1_prb = value;
+            }
+            0x02 => {
+                self.cia1_ddra = value;
+            }
+            0x03 => {
+                self.cia1_ddrb = value;
+            }
             0x04 => {
                 self.cia1_timer_a.latch =
                     (self.cia1_timer_a.latch & 0xFF00) | u16::from(value);

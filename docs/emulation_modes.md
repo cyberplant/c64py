@@ -29,7 +29,7 @@ Programmatic **`C64(..., vic_emulation=...)`** defaults to **`fast`** so tests a
 
 ## Accurate Rust (`--vic-emulation accurate-rust`, default)
 
-- **Behavior:** Same CPU instruction semantics as accurate modes; on **PAL** with **`c64py_rust_core`** installed, the inner batch advances VIC via the Rust hybrid engine (see [rust_core_future.md](rust_core_future.md)). **Known gap:** no BA/CPU stall arbitration in Rust vs full Python accurate path.
+- **Behavior:** Same CPU instruction semantics as accurate modes; on **PAL** with **`c64py_rust_core`** installed, the inner batch advances VIC via the Rust hybrid engine (see [rust_core.md](rust_core.md)). **Known gap:** no BA/CPU stall arbitration in Rust vs full Python accurate path.
 - **ReSID:** With **`--enable-resid`**, Rust can drive **`resid_c`** during batches when the shared library is found; PCM is queued for pygame as today.
 - **Graphics + PAL:** Frame snapshots after Rust batches match the Python accurate path so pygame sees stable latched regs.
 

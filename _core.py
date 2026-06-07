@@ -34,6 +34,40 @@ def rust_core_version() -> str:
     return str(_rust.rust_core_version())
 
 
+def _pack_sprite_arrays(vic_engine):
+    """Pack ``sprite_y``, ``sprite_mc``, ``sprite_mcbase`` into (y_lo, y_hi, mc_lo,
+    mc_hi, mcbase_lo, mcbase_hi) u32s for the Rust signature.
+
+    Each u32 carries 4 × u8 little-endian (byte 0 = lowest-indexed sprite).
+    Keeping them packed avoids 24 extra PyO3 parameters.
+    """
+    def pack4(arr, off):
+        return (
+            int(arr[off]) & 0xFF
+            | (int(arr[off + 1]) & 0xFF) << 8
+            | (int(arr[off + 2]) & 0xFF) << 16
+            | (int(arr[off + 3]) & 0xFF) << 24
+        )
+    if vic_engine is None:
+        return (0, 0, 0, 0, 0, 0)
+    y = getattr(vic_engine, "sprite_y", [0] * 8)
+    mc = getattr(vic_engine, "sprite_mc", [0] * 8)
+    mcb = getattr(vic_engine, "sprite_mcbase", [0] * 8)
+    return (
+        pack4(y, 0), pack4(y, 4),
+        pack4(mc, 0), pack4(mc, 4),
+        pack4(mcb, 0), pack4(mcb, 4),
+    )
+
+
+def _unpack_sprite_array(lo: int, hi: int) -> list:
+    """Inverse of :func:`_pack_sprite_arrays` for a single 8-byte packed pair."""
+    return [
+        lo & 0xFF, (lo >> 8) & 0xFF, (lo >> 16) & 0xFF, (lo >> 24) & 0xFF,
+        hi & 0xFF, (hi >> 8) & 0xFF, (hi >> 16) & 0xFF, (hi >> 24) & 0xFF,
+    ]
+
+
 def run_fast_batch(
     memory: "MemoryMap",
     *,
@@ -54,6 +88,7 @@ def run_fast_batch(
     vic_engine: Optional[object] = None,
     resid_lib_path: Optional[str] = None,
     resid_ptr: Optional[int] = None,
+    trace_path: Optional[str] = None,
 ) -> Tuple[int, int, int, int, int, int, int, int, int, bool]:
     """Run the Rust fast batch; sync ``memory.ram`` via a shared ``bytearray``.
 
@@ -135,6 +170,15 @@ def run_fast_batch(
         memory.cia1_icr,
         memory.cia2_pra,
         memory.cia2_ddra,
+        int(memory.cia1_pra) & 0xFF,
+        int(memory.cia1_prb) & 0xFF,
+        int(memory.cia1_ddra) & 0xFF,
+        int(memory.cia1_ddrb) & 0xFF,
+        bytes(memory.keyboard_matrix),
+        int(memory.joy_inject1_clear) & 0xFF,
+        int(memory.joy_inject2_clear) & 0xFF,
+        int(memory.joy_held1_clear) & 0xFF,
+        int(memory.joy_held2_clear) & 0xFF,
         ta.latch,
         ta.counter,
         ta.running,
@@ -166,6 +210,13 @@ def run_fast_batch(
         0 if vic_engine is None else int(getattr(vic_engine, "sprite_enable_mask", 0)),
         63 if vic_engine is None else int(getattr(vic_engine, "cycles_per_line", 63)),
         312 if vic_engine is None else int(getattr(vic_engine, "num_raster_lines", 312)),
+        # VICE-style sprite DMA state round-tripped with the engine. Packed as
+        # u32 pairs (low/high) for the 8-sprite per-sprite arrays so the PyO3
+        # signature stays compact.
+        0 if vic_engine is None else int(getattr(vic_engine, "sprite_dma_mask", 0)),
+        0xFF if vic_engine is None else int(getattr(vic_engine, "sprite_exp_flop", 0xFF)),
+        0 if vic_engine is None else int(getattr(vic_engine, "sprite_y_expand_mask", 0)),
+        *_pack_sprite_arrays(vic_engine),
         resid_lib_path,
         None if resid_ptr is None else int(resid_ptr),
         iec_enabled,
@@ -175,6 +226,7 @@ def run_fast_batch(
         beam_n if beam_rust else 0,
         bv_ba if beam_rust else None,
         bc_ba if beam_rust else None,
+        trace_path,
     )
     (
         ins,
@@ -207,6 +259,10 @@ def run_fast_batch(
         tbie,
         tbos,
         tbi,
+        out_cia1_pra,
+        out_cia1_prb,
+        out_cia1_ddra,
+        out_cia1_ddrb,
         pcm_bytes,
         v_raster_line,
         v_raster_cycle,
@@ -222,6 +278,14 @@ def run_fast_batch(
         v_sprite_enable_mask,
         v_cycles_per_line,
         v_num_raster_lines,
+        v_sprite_sprite_collision,
+        v_sprite_bg_collision,
+        v_sprite_dma_mask,
+        v_sprite_exp_flop,
+        v_sprite_mc_lo,
+        v_sprite_mc_hi,
+        v_sprite_mcbase_lo,
+        v_sprite_mcbase_hi,
         beam_vic_bytes,
         beam_cia2_bytes,
     ) = t
@@ -245,6 +309,10 @@ def run_fast_batch(
     tb.irq_enabled = tbie
     tb.one_shot = tbos
     tb.input_mode = tbi
+    memory.cia1_pra = int(out_cia1_pra) & 0xFF
+    memory.cia1_prb = int(out_cia1_prb) & 0xFF
+    memory.cia1_ddra = int(out_cia1_ddra) & 0xFF
+    memory.cia1_ddrb = int(out_cia1_ddrb) & 0xFF
     if vic_engine is not None:
         vic_engine.raster_line = int(v_raster_line)
         vic_engine.raster_cycle = int(v_raster_cycle)
@@ -260,6 +328,12 @@ def run_fast_batch(
         vic_engine.sprite_enable_mask = int(v_sprite_enable_mask)
         vic_engine.cycles_per_line = int(v_cycles_per_line)
         vic_engine.num_raster_lines = int(v_num_raster_lines)
+        vic_engine.sprite_sprite_collision = int(v_sprite_sprite_collision)
+        vic_engine.sprite_bg_collision = int(v_sprite_bg_collision)
+        vic_engine.sprite_dma_mask = int(v_sprite_dma_mask) & 0xFF
+        vic_engine.sprite_exp_flop = int(v_sprite_exp_flop) & 0xFF
+        vic_engine.sprite_mc = _unpack_sprite_array(int(v_sprite_mc_lo), int(v_sprite_mc_hi))
+        vic_engine.sprite_mcbase = _unpack_sprite_array(int(v_sprite_mcbase_lo), int(v_sprite_mcbase_hi))
         if hybrid_vic_pal and memory.vic_snapshot_each_emulated_frame:
             # Rust hybrid VIC advances per emulated CPU cycle; detect frame wrap(s) in batch and
             # preserve the same render-latch behavior as Python accurate path.

@@ -18,9 +18,9 @@ Examples:
   python3 scripts/vice_trace_to_inject.py --file vice_full_trace.log --match-vice-cycle 90487723 \\
       --zp-2d-to-30 f5,4c,53,e7
 
-  # Full suggested command (replace C64PY_CYCLE with e.g. value from compare_loader_branches):
+  # Full suggested command (replace C64PY_CYCLE with the desired inject cycle):
   python3 scripts/vice_trace_to_inject.py ... --inject-cycle 12794852 --print-c64py-command \\
-      programs/BruceLee.prg /path/to/roms
+      programs/your_game.prg /path/to/roms
 
 Output: maps VICE NV-BDIZC string to P for c64py (bit 5 = 0x20 set like typical trace display).
 
@@ -208,7 +208,7 @@ def main() -> int:
             print("ERROR: --print-c64py-command needs --inject-cycle (c64py side)", file=sys.stderr)
             return 2
         rest = args.remainder
-        prg = rest[0] if rest else "programs/BruceLee.prg"
+        prg = rest[0] if rest else "programs/your_game.prg"
         rom = ""
         if len(rest) >= 2:
             rom = f" --rom-dir {rest[1]}"

@@ -65,12 +65,15 @@ def test_memory_apply_cia2_to_iec_bus() -> None:
     bus = IECBus()
     mem = MemoryMap()
     mem.iec_bus = bus
-    mem.cia2_pra = 0xFF
+    # CIA2 PRA bit 3 (ATN) drives the bus through a 7406 inverter on
+    # the C64 schematic: bit set → bus pulled LOW. Same for bits 4
+    # (CLK) and 5 (DATA).
+    mem.cia2_pra = 0xFF & ~0x08      # ATN bit cleared → not pulled
     mem.apply_cia2_port_a_to_iec_bus()
-    assert bus.atn is True
-    mem.cia2_pra = 0xFF & ~0x08
+    assert bus.atn is True, "ATN bit clear → line released (high)"
+    mem.cia2_pra = 0xFF              # ATN bit set → pull line low
     mem.apply_cia2_port_a_to_iec_bus()
-    assert bus.atn is False
+    assert bus.atn is False, "ATN bit set → line asserted (low)"
 
 
 def test_iec_send_byte_reaches_listener() -> None:
@@ -90,9 +93,20 @@ def test_c64_disk_emulation_default_fast() -> None:
     assert emu.disk_emulation == "fast"
 
 
-def test_c64_disk_emulation_accurate_ctor() -> None:
-    emu = C64(interface_factory=lambda _e: None, disk_emulation="accurate")
-    assert emu.disk_emulation == "accurate"
+def test_c64_disk_emulation_accurate_python_ctor() -> None:
+    emu = C64(interface_factory=lambda _e: None, disk_emulation="accurate-python")
+    assert emu.disk_emulation == "accurate-python"
+
+
+def test_c64_disk_emulation_accurate_rust_ctor() -> None:
+    emu = C64(interface_factory=lambda _e: None, disk_emulation="accurate-rust")
+    assert emu.disk_emulation == "accurate-rust"
+
+
+def test_c64_disk_emulation_rejects_legacy_names() -> None:
+    for legacy in ("accurate", "semi-accurate"):
+        with pytest.raises(ValueError):
+            C64(interface_factory=lambda _e: None, disk_emulation=legacy)
 
 
 def test_kernal_load_save_hooks_skipped_when_iec_bus_active() -> None:
@@ -102,6 +116,24 @@ def test_kernal_load_save_hooks_skipped_when_iec_bus_active() -> None:
     assert emu._handle_kernal_load() is False
     emu.cpu.state.pc = 0xFFD8
     assert emu._handle_kernal_save() is False
+
+
+def test_kernal_load_save_hooks_skipped_when_shortcut_disabled() -> None:
+    """In `accurate-python` / `accurate-rust` we disable the KERNAL LOAD/SAVE
+    shortcut so the real KERNAL serial routines run end-to-end through the
+    IEC bus."""
+    emu = C64(interface_factory=lambda _e: None)
+    emu.kernal_load_shortcut_enabled = False
+    emu.cpu.state.pc = 0xFFD5
+    assert emu._handle_kernal_load() is False
+    emu.cpu.state.pc = 0xFFD8
+    assert emu._handle_kernal_save() is False
+
+
+def test_kernal_load_shortcut_enabled_default_true() -> None:
+    """Default is True so legacy / `fast` tier behaviour is unchanged."""
+    emu = C64(interface_factory=lambda _e: None)
+    assert emu.kernal_load_shortcut_enabled is True
 
 
 def test_rust_stop_pcs_omit_disk_vectors_when_kernal_disk_hooks_off() -> None:
@@ -128,13 +160,25 @@ def test_rust_stop_pcs_omit_disk_vectors_when_kernal_disk_hooks_off() -> None:
 
 
 def test_initialize_iec_idempotent(tmp_path) -> None:
-    """Without drive ROMs in the given dir, IEC init fails; must not scan other paths."""
-    empty = tmp_path / "roms"
-    empty.mkdir()
-    with patch("c64py.roms.iter_candidate_rom_dirs", return_value=[]):
-        emu = C64(interface_factory=lambda _e: None)
-        assert emu.initialize_iec_bus(rom_dir=str(empty)) is False
-        assert emu.initialize_iec_bus(rom_dir=str(empty)) is False
+    """IEC bus initialises successfully (no ROM needed; TCP drives connect later).
+    Second call is idempotent and returns True from the cached state."""
+    emu = C64(interface_factory=lambda _e: None)
+    assert emu.initialize_iec_bus() is True
+    assert emu.initialize_iec_bus() is True  # idempotent
+
+
+def test_kernal_shortcut_rule_no_drives_avoids_iec_hang_policy() -> None:
+    """Mirror C64.py: with no drive clients, KERNAL LOAD shortcut stays enabled."""
+    from c64py.drives.tcp_drive_client import TcpDriveClient
+
+    emu = C64(interface_factory=lambda _e: None)
+    emu.initialize_iec_bus(tcp_drives=None)
+    any_tcp = any(
+        isinstance(x, TcpDriveClient) for x in emu.iec_drives.values()
+    )
+    tier = "accurate-python"
+    shortcut = tier == "fast" or any_tcp or not emu.iec_drives
+    assert shortcut is True
 
 
 def test_find_drive_rom_vice_plus_name_16k_dos_only(tmp_path) -> None:

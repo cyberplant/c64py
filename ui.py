@@ -4,6 +4,7 @@ Textual User Interface
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING, List, Optional
 from rich.console import Console
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key
 from textual.reactive import reactive
 from textual.widget import Widget
@@ -79,12 +80,18 @@ class TextualInterface(App):
         layout: vertical;
     }
 
+    #main-row {
+        layout: horizontal;
+        height: 1fr;
+        width: 100%;
+    }
+
     #c64-display {
         border: solid $primary;
         margin: 0 1;
         padding: 0;
-        height: 40fr;
-        width: 10fr;
+        height: 100%;
+        width: 2fr;
         background: #0000AA;
         color: #FFFFFF;
     }
@@ -102,7 +109,8 @@ class TextualInterface(App):
         margin: 0 0;
         overflow-y: scroll;
         padding: 0 0;
-        height: 25%;
+        height: 100%;
+        width: 3fr;
     }
 
     #status-bar {
@@ -133,13 +141,16 @@ class TextualInterface(App):
         self.cursor_blink_on = True
 
     def compose(self) -> ComposeResult:
-        if not self.fullscreen:
+        if self.fullscreen:
+            yield C64Display(self.emulator, id="c64-display")
+        else:
             yield Header()
-        yield C64Display(self.emulator, id="c64-display")
-        if not self.fullscreen:
-            yield RichLog(id="debug-panel", auto_scroll=True)
+            yield Horizontal(
+                C64Display(self.emulator, id="c64-display"),
+                RichLog(id="debug-panel", auto_scroll=True),
+                id="main-row",
+            )
             yield Static("Initializing...", id="status-bar")
-        if not self.fullscreen:
             yield Footer()
 
     def on_mount(self):
@@ -219,7 +230,9 @@ class TextualInterface(App):
                             self.add_debug_log(f"❌ Failed to attach disk: {e}")
                             self.emulator.disk_image_path = None  # Clear path even on error
 
-                step_cycles = self.emulator.run_cpu_instruction_quantum(cycles)
+                step_cycles = self.emulator.run_cpu_instruction_quantum(
+                    cycles, max_cycles
+                )
                 if step_cycles == 0:
                     continue
 
@@ -259,7 +272,10 @@ class TextualInterface(App):
                             stuck_count += 1
                         
                         if stuck_count > 1000:
-                            self.add_debug_log(f"⚠️ PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
+                            msg = f"PC stuck at ${pc:04X} for {stuck_count} steps - stopping"
+                            self.add_debug_log(f"⚠️ {msg}")
+                            # Also print to stdout for headless mode
+                            print(msg, flush=True)
                             self.emulator.running = False
                             break
                     else:
@@ -270,15 +286,23 @@ class TextualInterface(App):
                 last_pc = pc
 
             # Log why we stopped
+            stop_reason = "unknown"
+            if max_cycles is not None and cycles >= max_cycles:
+                stop_reason = "max_cycles_reached"
+            elif stuck_count > 1000:
+                stop_reason = "stuck_pc"
             if hasattr(self, 'add_debug_log'):
-                if max_cycles is not None and cycles >= max_cycles:
+                if stop_reason == "max_cycles_reached":
                     self.add_debug_log(f"🛑 Stopped at cycle {cycles} (reached max_cycles={max_cycles})")
                 else:
-                    self.add_debug_log(f"🛑 Stopped at cycle {cycles} (unknown reason, stuck_count={stuck_count})")
+                    self.add_debug_log(f"🛑 Stopped at cycle {cycles} (reason={stop_reason}, stuck_count={stuck_count})")
+            # Honor --save-snapshot-at-exit in Rich UI path.
+            self.emulator.service_exit_snapshot(stop_reason)
 
         except Exception as e:
             if hasattr(self, 'add_debug_log'):
                 self.add_debug_log(f"❌ Emulator error: {e}")
+            self.emulator.service_exit_snapshot("exception")
 
     def _update_ui(self):
         """Update the UI periodically"""
@@ -332,6 +356,7 @@ class TextualInterface(App):
                 bg = emu.memory.peek_vic(0x21) & 0x0F
                 border = emu.memory.peek_vic(0x20) & 0x0F
                 cli_count = getattr(emu.cpu, 'cli_count', 0)
+                
                 status_text = (
                     f"🎮 C64 | Cycle: {emu.current_cycles:,} | PC: ${emu.cpu.state.pc:04X} | "
                     f"A: ${emu.cpu.state.a:02X} | X: ${emu.cpu.state.x:02X} | Y: ${emu.cpu.state.y:02X} | "
@@ -340,6 +365,7 @@ class TextualInterface(App):
                 )
                 if self.status_bar:
                     self.status_bar.update(status_text)
+
 
             # Debug: show screen content periodically
             if hasattr(self.emulator, 'debug') and self.emulator.debug:
@@ -455,6 +481,36 @@ class TextualInterface(App):
             self.add_debug_log(f"📝 BASIC start pointer ($2B/$2C): ${basic_start:04X}")
             self.add_debug_log(f"📝 BASIC end pointer ($2D/$2E): ${basic_end:04X}")
 
+    def _toggle_turbo(self) -> None:
+        if not self.emulator:
+            return
+        self.emulator.turbo = not bool(getattr(self.emulator, "turbo", False))
+        self.add_debug_log(f"⚡ Turbo {'enabled' if self.emulator.turbo else 'disabled'}")
+
+    def _toggle_fullscreen_mode(self) -> None:
+        # Textual "fullscreen" is a layout mode toggle. This works best when
+        # the app started with the standard composed widgets.
+        self.fullscreen = not self.fullscreen
+        if self.fullscreen:
+            self.screen.add_class("fullscreen")
+        else:
+            self.screen.remove_class("fullscreen")
+        self.add_debug_log(f"🖥️ Fullscreen mode: {'ON' if self.fullscreen else 'OFF'}")
+
+    def _save_textual_snapshot(self) -> None:
+        if not self.emulator:
+            return
+        os.makedirs("snapshots", exist_ok=True)
+        cycle = int(getattr(self.emulator, "current_cycles", 0))
+        path = os.path.join("snapshots", f"textual_screen_{int(time.time())}_c{cycle}.txt")
+        try:
+            content = self.emulator.render_text_screen(no_colors=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            self.add_debug_log(f"📸 Text snapshot saved: {path}")
+        except Exception as exc:
+            self.add_debug_log(f"❌ Snapshot failed: {exc}")
+
     def _ascii_to_petscii(self, char: str) -> int:
         """Convert ASCII character to PETSCII code"""
         if not char:
@@ -485,6 +541,18 @@ class TextualInterface(App):
 
     def on_key(self, event: Key) -> None:
         """Handle keyboard input and send to C64 keyboard buffer"""
+        if event.key == "f10":
+            self._toggle_turbo()
+            event.prevent_default()
+            return
+        if event.key == "f11":
+            self._toggle_fullscreen_mode()
+            event.prevent_default()
+            return
+        if event.key == "f12":
+            self._save_textual_snapshot()
+            event.prevent_default()
+            return
         # Don't handle keys in fullscreen mode (or handle differently)
         if self.fullscreen:
             # In fullscreen, only allow quit

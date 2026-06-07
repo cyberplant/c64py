@@ -15,6 +15,7 @@ dependencies = [
   "rich>=13.0.0",
   "textual>=0.40.0",
   "pygame-ce>=2.5.0",
+  "tomli>=2.0.0; python_version<\"3.11\"",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -34,11 +35,11 @@ Homepage = "https://github.com/luar/c64py"
 c64py = "c64py.C64:main"
 
 [tool.setuptools]
-packages = ["c64py"]
+packages = ["c64py", "c64py.drives"]
 
 # This repository's root directory is the Python package directory.
 # It allows importing modules as `c64py.*` without moving files.
-package-dir = { c64py = "." }
+package-dir = { c64py = ".", "c64py.drives" = "drives" }
 
 [tool.setuptools.exclude-package-data]
 c64py = ["__pycache__/*", "*.pyc", "*.pyo", "*.pyd"]
@@ -52,4 +53,9 @@ module-name = "c64py_rust_core"
 
 [project.optional-dependencies]
 native = ["maturin>=1.7,<2"]
+
+[tool.pytest.ini_options]
+markers = [
+    "quick: subset of tests for fast feedback",
+]
 

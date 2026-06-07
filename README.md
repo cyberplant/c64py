@@ -7,7 +7,7 @@ A Commodore 64 emulator implemented in Python with both text-based and graphical
 - **6502 CPU Emulation**: Full 6502 instruction set implementation
 - **Memory Management**: Complete C64 memory map with ROM/RAM mapping
 - **I/O Devices**: VIC-II, SID, CIA1, CIA2 emulation
-- **SID Audio Output**: Optional pygame-ce-based SID sound (`--enable-sid`), or higher-accuracy reSID via ctypes (`--enable-resid`; build `resid_c` from `src/resid_wrapper/`)
+- **SID Audio Output**: Selectable audio backend via `--audio-emulation` (`resid`, `python-sid`, `disabled`)
 - **Text Mode Interface**: Beautiful textual UI using Rich and Textual libraries
 - **Graphics Modes**: Full VIC-II graphics mode support
   - Standard text mode (40x25 characters)
@@ -17,11 +17,11 @@ A Commodore 64 emulator implemented in Python with both text-based and graphical
   - Extended color mode
   - Hardware sprites (8 sprites, 24x21 pixels)
 - **Dual Rendering**:
-  - **--graphics mode**: Full-resolution pygame window with bitmap and sprite support
+  - **--interface graphics mode**: Full-resolution pygame window with bitmap and sprite support
   - **Text mode**: ASCII art representation of graphics using Unicode block characters
 - **PRG File Loading**: Load and auto-run Commodore 64 programs
 - **Server Mode**: TCP/UDP server for remote control
-- **Debug Support**: UDP debug logging and detailed debug output; archived Bruce Lee loader investigation (historical; runtime env hooks removed): [docs/bruce_lee_loader_investigation.md](docs/bruce_lee_loader_investigation.md) (roadmap: [docs/LOADER_DEBUG_PLAN.md](docs/LOADER_DEBUG_PLAN.md))
+- **Debug Support**: UDP debug logging and detailed debug output ([docs/DEBUGGING.md](docs/DEBUGGING.md))
 - **Memory Dumping**: Export memory state to files
 - **PAL/NTSC Support**: Configurable video standard
 
@@ -86,12 +86,11 @@ c64py
 - `--screen-update-interval SECONDS`: Screen update interval (default: 0.1)
 - `--video-standard {pal,ntsc}`: Video standard (default: pal)
 - `--no-colors`: Disable ANSI color output
-- `--graphics`: Render output in a pygame graphics window
+- `--interface {textual,text,tui,headless,graphics,pygame}`: Select UI mode
 - `--graphics-scale N`: Scale factor for graphics window (default: 2)
 - `--graphics-fps N`: Target FPS for graphics window (default: 30)
 - `--graphics-border N`: Border size in pixels for graphics window (default: 32)
-- `--enable-sid`: Enable SID audio output via pygame-ce
-- `--enable-resid`: Enable reSID-based SID audio (requires building/installing `resid_c.so` / `resid_c.dylib`; see `src/resid_wrapper/README.md`)
+- `--audio-emulation {resid,python-sid,disabled}`: Select SID backend
 
 ### Examples
 
@@ -122,7 +121,37 @@ c64py program.prg --dump-memory memory.prg
 
 Run with graphics window:
 ```bash
-c64py program.prg --graphics --graphics-scale 3
+c64py program.prg --interface graphics --graphics-scale 3
+```
+
+## Configuration
+
+c64py reads an optional TOML config file so you don't have to retype CLI
+flags. The first existing file wins (cwd → `~/.c64py.toml` →
+`~/.config/c64py/c64py.toml`); CLI flags always override config.
+
+```toml
+# ~/.c64py.toml
+[video]
+rendering = "per-raster"
+scale     = 3
+
+[audio]
+emulation = "resid"
+volume = 0.8
+```
+
+Generate a fully-populated default with `c64py --write-config`. See
+[`docs/config.md`](docs/config.md) for the full schema, search order,
+and override rules.
+
+## VICE Test Assets
+
+The VICE compatibility corpus is external and not stored in this repository.
+Fetch the pinned snapshot on demand with:
+
+```bash
+./scripts/fetch_vice_tests.sh
 ```
 
 ## Graphics Mode Support
@@ -163,7 +192,7 @@ The emulator supports all VIC-II graphics modes:
 
 ### Graphics Rendering
 
-**Pygame Window (--graphics mode):**
+**Pygame Window (`--interface graphics`):**
 - Full-resolution rendering (320x200 pixels)
 - Proper bitmap and sprite rendering
 - Accurate C64 color palette

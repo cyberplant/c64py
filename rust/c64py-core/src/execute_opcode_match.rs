@@ -94,6 +94,9 @@ match opcode {
             0x8e => {
             return stx_abs(cpu, mem);
             },
+            0x96 => {
+            return stx_zpy(cpu, mem);
+            },
             0x84 => {
             return sty_zp(cpu, mem);
             },
@@ -120,12 +123,12 @@ match opcode {
             },
             0xc7 => {
             let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1));
-            let value = mr(mem, cpu, u16::from(zp_addr)).wrapping_sub(1);
+            let value = (mr(mem, cpu, u16::from(zp_addr)) - 1) & 0xFF;
             mw(mem, cpu, zp_addr as u16, value);
-            set_flag(cpu, 0x01, cpu.a >= value);
-            let diff = cpu.a.wrapping_sub(value);
-            set_flag(cpu, 0x02, diff == 0);
-            set_flag(cpu, 0x80, (diff & 0x80) != 0);
+            let result = cpu.a - value;
+            set_flag(cpu, 0x01, result >= 0);
+            set_flag(cpu, 0x02, result == 0);
+            set_flag(cpu, 0x80, (result & 0x80) != 0);
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
             return 5;
             },
@@ -137,6 +140,9 @@ match opcode {
             },
             0x65 => {
             return adc_zp(cpu, mem);
+            },
+            0x75 => {
+            return adc_zpx(cpu, mem);
             },
             0x6d => {
             return adc_abs(cpu, mem);
@@ -234,6 +240,9 @@ match opcode {
             0x25 => {
             return and_zp(cpu, mem);
             },
+            0x35 => {
+            return and_zpx(cpu, mem);
+            },
             0x2d => {
             return and_abs(cpu, mem);
             },
@@ -243,11 +252,20 @@ match opcode {
             0x39 => {
             return and_absy(cpu, mem);
             },
+            0x21 => {
+            return and_indx(cpu, mem);
+            },
+            0x31 => {
+            return and_indy(cpu, mem);
+            },
             0x09 => {
             return ora_imm(cpu, mem);
             },
             0x05 => {
             return ora_zp(cpu, mem);
+            },
+            0x15 => {
+            return ora_zpx(cpu, mem);
             },
             0x0d => {
             return ora_abs(cpu, mem);
@@ -258,11 +276,20 @@ match opcode {
             0x19 => {
             return ora_absy(cpu, mem);
             },
+            0x01 => {
+            return ora_indx(cpu, mem);
+            },
+            0x11 => {
+            return ora_indy(cpu, mem);
+            },
             0x49 => {
             return eor_imm(cpu, mem);
             },
             0x45 => {
             return eor_zp(cpu, mem);
+            },
+            0x55 => {
+            return eor_zpx(cpu, mem);
             },
             0x4d => {
             return eor_abs(cpu, mem);
@@ -272,6 +299,9 @@ match opcode {
             },
             0x59 => {
             return eor_absy(cpu, mem);
+            },
+            0x41 => {
+            return eor_indx(cpu, mem);
             },
             0x51 => {
             return eor_indy(cpu, mem);
@@ -436,6 +466,9 @@ match opcode {
             0x26 => {
             return rol_zp(cpu, mem);
             },
+            0x36 => {
+            return rol_zpx(cpu, mem);
+            },
             0x2e => {
             return rol_abs(cpu, mem);
             },
@@ -520,7 +553,7 @@ match opcode {
             return plp(cpu, mem);
             },
             0x7a => {
-            cpu.sp = cpu.sp.wrapping_add(1);
+            cpu.sp = (cpu.sp + 1) & 0xFF;
             cpu.y = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16));
             update_nz(cpu, cpu.y);
             cpu.pc = (cpu.pc.wrapping_add(1)) & 0xFFFF;
@@ -613,12 +646,16 @@ match opcode {
             return 2;
             },
             0x58 => {
+            cpu.pre_i_flag = cpu.p & 0x04;
             set_flag(cpu, 0x04, false);
+            cpu.cli_sei_delay = true;
             cpu.pc = (cpu.pc.wrapping_add(1)) & 0xFFFF;
             return 2;
             },
             0x78 => {
+            cpu.pre_i_flag = cpu.p & 0x04;
             set_flag(cpu, 0x04, true);
+            cpu.cli_sei_delay = true;
             cpu.pc = (cpu.pc.wrapping_add(1)) & 0xFFFF;
             return 2;
             },
