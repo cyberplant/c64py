@@ -70,7 +70,6 @@ class TextualInterface(App):
 
     BINDINGS = [
         ("ctrl+x", "quit", "Quit the emulator"),
-        ("ctrl+r", "random_screen", "Fill screen with random characters"),
         ("ctrl+k", "dump_memory", "Dump screen memory and $0801 to debug logs"),
     ]
 
@@ -433,19 +432,6 @@ class TextualInterface(App):
             self.emulator.running = False
             self.emulator.shutdown()
         self.exit()
-
-    def action_random_screen(self):
-        """Fill screen with random characters for testing"""
-        import random
-        if self.emulator:
-            # Fill screen memory with random visible characters
-            for addr in range(0x0400, 0x0400 + 1000):  # Full screen
-                # Use random printable ASCII characters (0x20-0x7E)
-                char_code = random.randint(0x20, 0x7E)
-                self.emulator.memory.ram[addr] = char_code
-            self.add_debug_log("🎲 Filled screen with random characters")
-            # Trigger immediate screen update
-            self.emulator._update_text_screen()
 
     def action_dump_memory(self):
         """Dump screen memory and $0801 bytes to debug logs"""

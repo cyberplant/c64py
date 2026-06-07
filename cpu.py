@@ -29,8 +29,34 @@ from .constants import (
     CURSOR_ROW_ADDR,
     CURSOR_COL_ADDR,
 )
+from .config import _petscii_to_screen_code_chrout
 from .cpu_state import CPUState
 from .memory import MemoryMap
+
+# PETSCII color controls → VIC text color ($0286 low nybble).
+# CHR$ values from https://www.c64-wiki.com/wiki/Color (BSOUT / PRINT CHR$).
+_CHROUT_PETSCII_COLORS: dict[int, int] = {
+    0x90: 0,  # CHR$(144) black
+    0x05: 1,  # CHR$(5) white
+    0x1C: 2,  # CHR$(28) red
+    0x9F: 3,  # CHR$(159) cyan
+    0x9C: 4,  # CHR$(156) violet
+    0x1E: 5,  # CHR$(30) green
+    0x1F: 6,  # CHR$(31) blue
+    0x9E: 7,  # CHR$(158) yellow
+    0x81: 8,  # CHR$(129) orange
+    0x95: 9,  # CHR$(149) brown
+    0x96: 10,  # CHR$(150) light red
+    0x97: 11,  # CHR$(151) dark grey
+    0x98: 12,  # CHR$(152) grey
+    0x99: 13,  # CHR$(153) light green
+    0x9A: 14,  # CHR$(154) light blue
+    0x9B: 15,  # CHR$(155) light grey
+}
+
+TAB_STOP_BASE = 0x02B0
+# KERNAL screen editor: print reverse when nonzero (LIST / directory header).
+_CHROUT_RVS_FLAG_ADDR = 0xC7
 
 # Per 6502 instruction cycle: bus activity for BA vs CPU (VICE-style: stall only on reads).
 _BUS_INTERNAL = 0
@@ -73,6 +99,7 @@ class CPU6502:
         # Don't read it here as ROMs might not be loaded yet
         self.state.pc = 0x0000
         self.chrout_count = 0
+        self._chrout_rvs_on = False
         self.trace_enabled = False
         self.trace_size = 0
         self.trace_buffer = []
@@ -540,32 +567,131 @@ class CPU6502:
         )
         print(msg, file=sys.stderr)
 
+    def _chrout_write_cursor(self, cursor_addr: int) -> None:
+        self.memory.write(0xD1, cursor_addr & 0xFF)
+        self.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        self.memory.write(CURSOR_ROW_ADDR, row)
+        self.memory.write(CURSOR_COL_ADDR, col)
+
+    def _chrout_tab_forward(self, cursor_addr: int) -> int:
+        col = (cursor_addr - SCREEN_MEM) % 40
+        row_base = cursor_addr - col
+        next_col: Optional[int] = None
+        for i in range(16):
+            stop = self.memory.read(TAB_STOP_BASE + i) & 0xFF
+            if stop == 0 or stop > 39:
+                continue
+            if stop > col and (next_col is None or stop < next_col):
+                next_col = stop
+        if next_col is None:
+            next_col = ((col // 10) + 1) * 10
+            if next_col <= col:
+                next_col = min(col + 10, 39)
+        if next_col >= 40:
+            row = (cursor_addr - SCREEN_MEM) // 40
+            if row < 24:
+                return SCREEN_MEM + (row + 1) * 40
+            return SCREEN_MEM + 24 * 40
+        return row_base + next_col
+
+    def _chrout_cursor_right(self, cursor_addr: int) -> int:
+        col = (cursor_addr - SCREEN_MEM) % 40
+        row = (cursor_addr - SCREEN_MEM) // 40
+        if col < 39:
+            return cursor_addr + 1
+        if row < 24:
+            return SCREEN_MEM + (row + 1) * 40
+        return cursor_addr
+
+    def _chrout_cursor_left(self, cursor_addr: int) -> int:
+        if cursor_addr <= SCREEN_MEM:
+            return cursor_addr
+        col = (cursor_addr - SCREEN_MEM) % 40
+        if col > 0:
+            return cursor_addr - 1
+        row = (cursor_addr - SCREEN_MEM) // 40
+        if row > 0:
+            return SCREEN_MEM + (row - 1) * 40 + 39
+        return cursor_addr
+
+    def _chrout_cursor_down(self, cursor_addr: int) -> int:
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        if row < 24:
+            return SCREEN_MEM + (row + 1) * 40 + col
+        return cursor_addr
+
+    def _chrout_cursor_up(self, cursor_addr: int) -> int:
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        if row > 0:
+            return SCREEN_MEM + (row - 1) * 40 + col
+        return cursor_addr
+
+    def _chrout_apply_control(self, c: int, cursor_addr: int) -> tuple[int, bool]:
+        """Handle PETSCII controls. Returns (cursor_addr, True) if consumed."""
+        color = _CHROUT_PETSCII_COLORS.get(c)
+        if color is not None:
+            self.memory.write(0x0286, color)
+            return cursor_addr, True
+        if c == 0x12:
+            self._chrout_rvs_on = True
+            self.memory.write(_CHROUT_RVS_FLAG_ADDR, 1)
+            return cursor_addr, True
+        if c == 0x92:
+            self._chrout_rvs_on = False
+            self.memory.write(_CHROUT_RVS_FLAG_ADDR, 0)
+            return cursor_addr, True
+        if c == 0x13:
+            return SCREEN_MEM, True
+        if c == 0x09:
+            return self._chrout_tab_forward(cursor_addr), True
+        if c == 0x1D:
+            return self._chrout_cursor_right(cursor_addr), True
+        if c == 0x9D:
+            return self._chrout_cursor_left(cursor_addr), True
+        if c == 0x11:
+            return self._chrout_cursor_down(cursor_addr), True
+        if c == 0x91:
+            return self._chrout_cursor_up(cursor_addr), True
+        if c < 0x20 or 0x80 <= c <= 0x9F:
+            return cursor_addr, True
+        return cursor_addr, False
+
+    def _chrout_rvs_active(self) -> bool:
+        return self._chrout_rvs_on or bool(self.memory.read(_CHROUT_RVS_FLAG_ADDR))
+
     def _chrout_petscii_screen_effect(self, char: int) -> None:
         """Update screen/cursor for one PETSCII character (CHROUT semantics, no RTS)."""
-        self.memory.write(0xD0, 0)
         cursor_low = self.memory.read(0xD1)
         cursor_high = self.memory.read(0xD2)
         cursor_addr = cursor_low | (cursor_high << 8)
         if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + 1000:
             cursor_addr = SCREEN_MEM
         self.last_chrout_char = char
-        if char == 0x0D:
+        c = char & 0xFF
+        if c == 0x0D:
+            # KERNAL clears reverse at end of each printed line (directory LIST).
+            self._chrout_rvs_on = False
+            self.memory.write(_CHROUT_RVS_FLAG_ADDR, 0)
             row = (cursor_addr - SCREEN_MEM) // 40
             if row < 24:
                 cursor_addr = SCREEN_MEM + (row + 1) * 40
             else:
                 self.memory._scroll_screen_up()
                 cursor_addr = SCREEN_MEM + 24 * 40
-        elif char == 0x0A:
+        elif c == 0x0A:
             pass
-        elif char == 0x14:
+        elif c == 0x14:
             if cursor_addr > SCREEN_MEM:
                 cursor_addr -= 1
                 if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
                     self.memory.write(cursor_addr, 0x20)
                     current_color = self.memory.read(0x0286) & 0x0F
                     self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
-        elif char == 0x93:
+        elif c == 0x93:
             for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
                 self.memory.write(addr, 0x20)
             current_color = self.memory.read(0x0286) & 0x0F
@@ -573,28 +699,11 @@ class CPU6502:
                 self.memory.write(addr, current_color)
             cursor_addr = SCREEN_MEM
         else:
-            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-                # Convert PETSCII to C64 screen code before storing in screen RAM.
-                # Standard mapping (matches KERNAL BSOUT at $E716):
-                #   $20-$3F → $20-$3F  (space, punctuation, digits — identity)
-                #   $40-$5F → $00-$1F  (@, A-Z, [\]↑← — subtract $40)
-                #   $60-$7F → $40-$5F  (subtract $20)
-                #   $A0-$BF → $60-$7F  (subtract $40)
-                #   $C0-$FE → $80-$BE  (subtract $40)
-                #   $FF     → $5E
-                c = char & 0xFF
-                if 0x40 <= c <= 0x5F:
-                    screen_code = c - 0x40
-                elif 0x60 <= c <= 0x7F:
-                    screen_code = c - 0x20
-                elif 0xA0 <= c <= 0xBF:
-                    screen_code = c - 0x40
-                elif 0xC0 <= c <= 0xFE:
-                    screen_code = c - 0x40
-                elif c == 0xFF:
-                    screen_code = 0x5E
-                else:
-                    screen_code = c
+            cursor_addr, handled = self._chrout_apply_control(c, cursor_addr)
+            if not handled and SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
+                screen_code = _petscii_to_screen_code_chrout(c)
+                if self._chrout_rvs_active():
+                    screen_code |= 0x80
                 self.memory.write(cursor_addr, screen_code)
                 current_color = self.memory.read(0x0286) & 0x0F
                 self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
@@ -602,12 +711,7 @@ class CPU6502:
                 if cursor_addr >= SCREEN_MEM + 1000:
                     self.memory._scroll_screen_up()
                     cursor_addr = SCREEN_MEM + 24 * 40
-        self.memory.write(0xD1, cursor_addr & 0xFF)
-        self.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
-        row = (cursor_addr - SCREEN_MEM) // 40
-        col = (cursor_addr - SCREEN_MEM) % 40
-        self.memory.write(CURSOR_ROW_ADDR, row)
-        self.memory.write(CURSOR_COL_ADDR, col)
+        self._chrout_write_cursor(cursor_addr)
 
     def apply_chrout_petscii(self, char: int) -> None:
         """Emit one PETSCII character using the same screen rules as CHROUT (no JSR/RTS)."""

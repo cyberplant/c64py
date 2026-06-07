@@ -182,9 +182,9 @@ class TestHostToJoystick(unittest.TestCase):
         from c64py.host_keymap import ShiftReq, build_host_to_matrix
 
         m = build_host_to_matrix()
-        semi = (6, 2, ShiftReq.NONE)
-        self.assertEqual(m[pygame.K_QUOTE], semi)
-        self.assertEqual(m[pygame.K_SEMICOLON], semi)
+        self.assertEqual(m[pygame.K_QUOTE], (6, 2, ShiftReq.NONE))
+        self.assertEqual(m[pygame.K_SEMICOLON], (5, 5, ShiftReq.NONE))
+        self.assertEqual(m[pygame.K_COLON], (5, 5, ShiftReq.NONE))
         at = (5, 6, ShiftReq.NONE)
         self.assertEqual(m[pygame.K_LEFTBRACKET], at)
         self.assertEqual(m[pygame.K_AT], at)

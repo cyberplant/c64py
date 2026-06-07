@@ -159,7 +159,7 @@ def build_host_to_matrix() -> Dict[int, Tuple[int, int, ShiftReq]]:
         K.K_KP_MULTIPLY: (6, 1, ShiftReq.NONE),
         K.K_LEFTBRACKET: (5, 6, ShiftReq.NONE),   # host [ → C64 @
         K.K_RIGHTBRACKET: (6, 1, ShiftReq.NONE),  # host ] → C64 *
-        K.K_SEMICOLON: (6, 2, ShiftReq.NONE),
+        K.K_SEMICOLON: (5, 5, ShiftReq.NONE),      # host ; → C64 :
         K.K_QUOTE: (6, 2, ShiftReq.NONE),          # host ' → C64 ;
         K.K_COLON: (5, 5, ShiftReq.NONE),
         K.K_AT: (5, 6, ShiftReq.NONE),

@@ -275,30 +275,54 @@ class DiskDrive:
         # Current address in memory (for line pointers)
         current_addr = 0x0801
         
-        # First line: disk header
-        # Line number = 0; text = '"DISK NAME" ID'
-        header_line = f'"{disk_name}" {disk_id}'
-        current_addr = self._add_basic_line(prg_data, current_addr, 0, header_line)
-        
-        # Add each file as a line
+        # Line 0: 1541 DOS header — $12 RVS ON, 16-char padded title, ID, "2A".
+        # Trailing "2A" is the fixed disk-type suffix on every 1541 listing (not the
+        # BAM id). No $92; KERNAL clears reverse at end of line (see cpu CHROUT).
+        name_field = disk_name[:16].ljust(16)
+        id_field = (disk_id[:2] if disk_id else "  ").ljust(2)[:2]
+        header_bytes = (
+            bytes([0x12, ord('"')])
+            + name_field.encode("ascii")
+            + bytes([ord('"'), ord(" ")])
+            + id_field.encode("ascii")
+            + b" 2A"
+        )
+        current_addr = self._add_basic_line_bytes(prg_data, current_addr, 0, header_bytes)
+
+        # File lines: line number = block count; text aligns quotes per 1541 rules.
         for entry in entries:
             type_name = type_names.get(entry.filetype, "???")
-            # Line number IS the block count; text is just "FILENAME" TYPE
-            # Filename padded to 16 chars with PETSCII spaces (0x20)
-            file_line = f'"{entry.filename:16s}" {type_name}'
-            current_addr = self._add_basic_line(prg_data, current_addr, entry.blocks, file_line)
-        
-        # Last line: blocks free
+            blocks = entry.blocks
+            prefix = b" " * max(1, 4 - len(str(blocks)))
+            fname = entry.filename.rstrip()[:16].ljust(16)
+            file_bytes = prefix + b'"' + fname.encode("ascii") + b'" ' + type_name.encode("ascii")
+            current_addr = self._add_basic_line_bytes(
+                prg_data, current_addr, blocks, file_bytes
+            )
+
+        # Last line: blocks free (line number = free count).
         total_blocks = sum(e.blocks for e in entries)
         blocks_free = max(0, TOTAL_DISK_BLOCKS - total_blocks)
-        free_line = f'BLOCKS FREE.'
-        current_addr = self._add_basic_line(prg_data, current_addr, blocks_free, free_line)
+        free_bytes = b"BLOCKS FREE." + b" " * 18
+        current_addr = self._add_basic_line_bytes(prg_data, current_addr, blocks_free, free_bytes)
         
         # End of program marker
         prg_data.extend([0x00, 0x00])
         
         return bytes(prg_data)
     
+    def _add_basic_line_bytes(
+        self, prg_data: bytearray, current_addr: int, line_number: int, text: bytes
+    ) -> int:
+        """Append one BASIC line with raw PETSCII line text (no trailing $00 in *text*)."""
+        line_length = 2 + 2 + len(text) + 1
+        next_addr = current_addr + line_length
+        prg_data.extend([next_addr & 0xFF, (next_addr >> 8) & 0xFF])
+        prg_data.extend([line_number & 0xFF, (line_number >> 8) & 0xFF])
+        prg_data.extend(text)
+        prg_data.append(0x00)
+        return next_addr
+
     def _add_basic_line(self, prg_data: bytearray, current_addr: int, line_number: int, text: str) -> int:
         """Add a BASIC line to PRG data.
         

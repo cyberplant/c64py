@@ -66,6 +66,13 @@ def test_disk_drive(disk_path):
     # BASIC start ($0801) is the canonical directory load address.
     load_addr = dir_data[0] | (dir_data[1] << 8)
     assert load_addr == 0x0801
+    # First BASIC line (header): line number 0, text starts with RVS ON ($12).
+    assert dir_data[4:6] == b"\x00\x00"
+    assert dir_data[6] == 0x12
+    assert dir_data[7] == ord('"')
+    assert dir_data[24] == ord('"')
+    first_line_text = dir_data[6 : dir_data.index(0, 6)]
+    assert first_line_text.endswith(b" 2A")
     drive.detach_disk()
     assert not drive.has_disk()
 
