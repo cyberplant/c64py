@@ -52,4 +52,13 @@
 940 print "total: ";tt;" jiffies"
 950 print "(";tt/60;" seconds)"
 960 print "benchmark complete!"
-999 end
+
+1000 rem exiting emulator using host command control
+1005 print "{clr}"
+1010 t = 49152 : r = 49408
+1015 a$="quit"
+1030 for i = 1 to len(a$) : poke t+i, asc(mid$(a$,i,1)) : next
+1040 poke t, len(a$)
+1045 print "waiting.."
+
+9999 end

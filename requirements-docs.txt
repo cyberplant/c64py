@@ -1,0 +1,3 @@
+# Documentation-only dependencies (README screenshot scripts).
+# Not required to run the emulator itself.
+Pillow>=10.0.0

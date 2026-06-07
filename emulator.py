@@ -162,6 +162,8 @@ class C64:
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
         self.turbo = False  # When True, no wall-clock throttling (see --turbo)
         self.inject_key_rules: List[InjectKeyRule] = []
+        # Matrix-key injections awaiting timed auto-release: (row, col) -> until_cycle.
+        self._matrix_inject_until: dict[tuple[int, int], int] = {}
 
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
 
@@ -817,30 +819,110 @@ class C64:
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
 
-    def _fire_inject_key_rule(self, rule: InjectKeyRule, cpu_cycles: int) -> None:
-        """Apply one ``--inject-keys`` rule (keyboard + optional joystick hold)."""
+    def _matrix_hold_cycles(self, ms: float = 80.0) -> int:
+        """Default matrix key hold in CPU cycles for the current video standard."""
+        standard = str(getattr(self.memory, "video_standard", "pal")).lower()
+        clock_hz = 1_022_727 if standard == "ntsc" else 985_248
+        return max(1, int(round(ms / 1000.0 * clock_hz)))
+
+    def _inject_matrix_stroke(self, stroke, hold_cycles: int) -> None:
+        """Press one matrix keystroke now; schedule release after *hold_cycles*."""
+        until = int(self.current_cycles) + max(1, int(hold_cycles))
+        for cell in stroke.cells:
+            self.memory.press_matrix_key(cell[0], cell[1])
+            prev = self._matrix_inject_until.get(cell, 0)
+            self._matrix_inject_until[cell] = max(prev, until)
+
+    def inject_keys(self, payload: str, mode: str = "auto",
+                    hold_cycles: Optional[int] = None) -> str:
+        """Inject a key payload via the matrix (real press) or KERNAL buffer.
+
+        ``mode``: ``"auto"`` (single keystroke → matrix, multi → buffer),
+        ``"matrix"``, or ``"buffer"``. Returns a human-readable status string.
+        """
+        from .keyboard_matrix import parse_matrix_strokes
         from .keyboard_inject import expand_inject_payload
 
+        try:
+            strokes, unknown = parse_matrix_strokes(payload)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        resolved = mode
+        if resolved == "auto":
+            resolved = "matrix" if len(strokes) == 1 else "buffer"
+
+        if resolved == "matrix":
+            if len(strokes) != 1:
+                return (
+                    f"ERROR: matrix inject needs exactly one keystroke "
+                    f"(got {len(strokes)}); use BUFFER for strings"
+                )
+            hold = hold_cycles if hold_cycles is not None else self._matrix_hold_cycles()
+            self._inject_matrix_stroke(strokes[0], hold)
+            note = f" (skipped {unknown})" if unknown else ""
+            return f"OK matrix key {strokes[0].label} held {hold} cyc{note}"
+
+        kb, _j1, _j2, _hold = expand_inject_payload(payload)
+        dropped = sum(0 if self.send_petscii(int(b)) else 1 for b in kb)
+        msg = f"OK buffer {len(kb)} byte(s)"
+        if dropped:
+            msg += f", {dropped} dropped (buffer full)"
+        return msg
+
+    def inject_joystick(self, port: int, mask: int, hold_cycles: int) -> str:
+        """Hold a joystick direction/button mask on *port* for *hold_cycles*."""
+        if port not in (1, 2):
+            return f"ERROR: joystick port must be 1 or 2 (got {port})"
+        until = int(self.current_cycles) + max(1, int(hold_cycles))
+        self.memory.arm_joystick_inject(port, mask, until)
+        return f"OK joystick {port} mask=0x{mask:02X} held {hold_cycles} cyc"
+
+    def _fire_inject_key_rule(self, rule: InjectKeyRule, cpu_cycles: int) -> None:
+        """Apply one ``--inject-keys`` rule (keyboard + optional joystick hold).
+
+        Keyboard payloads that resolve to a single keystroke (e.g. ``{F1}``, a
+        letter, SPACE) are pressed in the CIA1 matrix so games that scan the
+        keyboard directly see them; multi-key strings still use the KERNAL buffer.
+        """
+        from .keyboard_inject import expand_inject_payload
+        from .keyboard_matrix import parse_matrix_strokes
+
         kb, j1, j2, hold = expand_inject_payload(rule.payload_raw)
-        dropped = 0
-        for b in kb:
-            if not self.send_petscii(int(b)):
-                dropped += 1
-        if dropped and self.interface:
-            self.interface.add_debug_log(
-                f"⌨️ inject-keys: {dropped} byte(s) dropped (keyboard buffer full)"
-            )
         until = cpu_cycles + max(hold, 0)
         if j1:
             self.memory.arm_joystick_inject(1, j1, until)
         if j2:
             self.memory.arm_joystick_inject(2, j2, until)
+
+        if kb:
+            try:
+                strokes, _unknown = parse_matrix_strokes(rule.payload_raw)
+            except ValueError:
+                strokes = []
+            if len(strokes) == 1:
+                self._inject_matrix_stroke(strokes[0], self._matrix_hold_cycles())
+            else:
+                dropped = 0
+                for b in kb:
+                    if not self.send_petscii(int(b)):
+                        dropped += 1
+                if dropped and self.interface:
+                    self.interface.add_debug_log(
+                        f"⌨️ inject-keys: {dropped} byte(s) dropped (keyboard buffer full)"
+                    )
         if self.interface:
             self.interface.add_debug_log(
                 f"⌨️ inject-keys fired at cycle {cpu_cycles}: {rule.payload_raw!r}"
             )
 
     def _process_scheduled_inject_keys(self, cpu_cycles: int, wall_seconds: float) -> None:
+        # Release any matrix-injected keys whose hold window has elapsed.
+        if self._matrix_inject_until:
+            expired = [c for c, u in self._matrix_inject_until.items() if cpu_cycles >= u]
+            for cell in expired:
+                self.memory.release_matrix_key(cell[0], cell[1])
+                del self._matrix_inject_until[cell]
         for rule in self.inject_key_rules:
             if rule.fired:
                 continue
@@ -1818,8 +1900,7 @@ class C64:
         # Fast dirty-check using bytes comparison
         current_screen_bytes = bytes(self.memory.ram[(screen_base + i) & 0xFFFF] for i in range(1000))
         current_color_bytes = bytes(self.memory.ram[color_base:color_base + 1000])
-        cursor_color = self.memory.ram[0x0286] & 0x0F
-        
+
         # Fast comparison using bytes
         if (current_screen_bytes == self._prev_screen_data and 
             current_color_bytes == self._prev_color_data and
@@ -1844,7 +1925,6 @@ class C64:
                 self.text_reversed[:] = (screen_2d & 0x80) != 0
                 char_codes = screen_2d & 0x7F
                 self.text_colors[:] = color_2d & 0x0F
-                self.text_colors[self.text_reversed] = cursor_color
                 
                 for row in range(25):
                     for col in range(40):
@@ -1861,7 +1941,7 @@ class C64:
                         char_code = raw_code & 0x7F
                         
                         self.text_reversed[row][col] = reversed_char
-                        self.text_colors[row][col] = cursor_color if reversed_char else color_code
+                        self.text_colors[row][col] = color_code
                         self.text_screen[row][col] = lookup[char_code]
         
         return True  # Screen was updated

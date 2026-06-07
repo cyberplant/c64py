@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "comment": "Copy to manifest.local.json and drop PRG/D64 files beside it. Nothing here is committed except this example.",
+  "defaults": {
+    "boot_cycles": 5000000,
+    "after_run_cycles": 10000000,
+    "vic_emulation": "fast",
+    "turbo": true,
+    "render": {
+      "mode": "latched",
+      "border_size": 32,
+      "interface": "graphics"
+    }
+  },
+  "entries": [
+    {
+      "id": "my_demo",
+      "media": "mydemo.prg",
+      "output": "output/mydemo.png",
+      "skip_if_missing": true,
+      "auto_run": true,
+      "boot_cycles": 5000000,
+      "after_run_cycles": 15000000,
+      "comment": "Runs only when mydemo.prg is present in this directory"
+    },
+    {
+      "id": "title_from_disk",
+      "media": "somedemo.d64",
+      "output": "output/somedemo.png",
+      "skip_if_missing": true,
+      "attach_drive": 8,
+      "load_prg": "TITLE.PRG",
+      "auto_run": true,
+      "after_run_cycles": 20000000
+    },
+    {
+      "id": "press_space_to_start",
+      "media": "intro.prg",
+      "output": "output/intro.png",
+      "skip_if_missing": true,
+      "auto_run": true,
+      "after_run_cycles": 20000000,
+      "keys": [
+        { "cycles": 8000000, "press": " " },
+        { "cycles": 12000000, "press": "{F1}" }
+      ],
+      "comment": "keys[].cycles are offsets from media-load completion (start of the after_run window); 'press' uses --inject-keys syntax (' '=SPACE, {F1}-{F8}, letters, \\n=RETURN)"
+    },
+    {
+      "id": "multi_frame",
+      "media": "effect.prg",
+      "output": "output/effect.png",
+      "skip_if_missing": true,
+      "auto_run": true,
+      "after_run_cycles": 8000000,
+      "frames": [
+        { "cycles": 0, "output": "output/effect_f0.png" },
+        { "cycles": 19656, "output": "output/effect_f1.png" },
+        { "cycles": 39312, "output": "output/effect_f2.png" }
+      ],
+      "comment": "frames[] are extra captures after the base run, stepping PAL frames from the saved state"
+    },
+    {
+      "id": "movie_script",
+      "media": "demo.prg",
+      "skip_if_missing": true,
+      "auto_run": true,
+      "vic_emulation": "accurate-python",
+      "render": { "mode": "per-cycle", "border_size": 32, "interface": "graphics" },
+      "comment": "Timeline mode: 'script' supersedes after_run_cycles/keys/frames. Times are offsets from media-load completion; units c=cycles, s=seconds, ms, f=PAL frames. For raster-split / mid-line VIC tricks use vic_emulation=accurate-rust (or accurate-python) + render.mode=per-cycle to match the live 'per-cycle' video; 'beam' is per-raster-line (coarser, can glitch mid-line) and 'latched'/'fast' is per-frame only.",
+      "script": [
+        { "at": "0c", "screenshot": "output/demo_title.png" },
+        { "at": "2s", "key": " " },
+        { "at": "3s", "video": "20s:output/demo.mp4" },
+        { "at": "5s", "key": "{F1}" },
+        { "at": "10s", "screenshot": "output/demo_mid.png" },
+        { "at": "30s", "video": { "duration": "8s", "output": "output/demo_end.mp4", "fps": 50, "audio": true } }
+      ]
+    },
+    {
+      "id": "game_with_joystick",
+      "media": "game.prg",
+      "skip_if_missing": true,
+      "auto_run": true,
+      "comment": "method:matrix emulates a real key press (CIA1 matrix) for games that scan the keyboard directly; joystick events hold a stick line low.",
+      "script": [
+        { "at": "0c", "screenshot": "output/game_title.png" },
+        { "at": "3s", "key": " ", "method": "matrix", "hold": "100ms" },
+        { "at": "5s", "video": "15s:output/game.mp4" },
+        { "at": "6s", "joy": "2:fire:300ms" },
+        { "at": "8s", "joy": "2:right:600ms" },
+        { "at": "10s", "joystick": { "port": 2, "press": "up+fire", "hold": "400ms" } }
+      ]
+    }
+  ]
+}

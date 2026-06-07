@@ -24,8 +24,14 @@ MEMORY <address>    - Read memory at address (hex, e.g. $0400 or 0400)
 WRITE <addr> <val>  - Write value to memory address (hex)
 DUMP [start] [end]  - Dump memory range as hex (default: $0000-$FFFF)
 SCREEN              - Get current screen contents (plain text)
-SEND_KEY <code>     - Inject PETSCII key code (hex or decimal)
-SEND_KEYS <codes..> - Inject multiple PETSCII key codes
+SEND_KEY <code>     - Inject PETSCII key code (hex or decimal) into KERNAL buffer
+SEND_KEYS <codes..> - Inject multiple PETSCII key codes into KERNAL buffer
+INJECT <payload>    - Inject keys (auto: 1 keystroke=matrix, many=buffer).
+                      Syntax: letters, {F1}-{F8}, {space}, {return}, {up}.. etc.
+INJECT MATRIX <pl>  - Force real key press via CIA1 matrix (single keystroke)
+INJECT BUFFER <pl>  - Force KERNAL buffer injection (typed string)
+INJECT JOY <p>:<d>[:<hold>] - Hold joystick: port 1/2, dirs up+down+..+fire,
+                      optional hold (e.g. 200ms / 200000c). E.g. INJECT JOY 2:fire:300ms
 SHOW_KEYBOARD_BUFFER- Show keyboard buffer length and contents
 SHOW_CURRENT_LINE   - Show current screen line at cursor
 LOAD <file>         - Load PRG file
@@ -34,6 +40,36 @@ DETACH-DISKS        - Detach all disk images
 STOP                - Stop emulator execution
 QUIT/EXIT           - Quit server and emulator
 HELP/?              - Show this help message"""
+
+
+def _parse_hold_cycles(raw: str, *, clock_hz: int) -> int:
+    """Parse a hold spec: ``<n>c`` cycles, ``<n>ms`` / bare number = milliseconds."""
+    s = raw.strip().lower()
+    if not s:
+        return int(round(250.0 / 1000.0 * clock_hz))
+    if s.endswith("c"):
+        return max(1, int(s[:-1]))
+    if s.endswith("ms"):
+        s = s[:-2]
+    return max(1, int(round(float(s) / 1000.0 * clock_hz)))
+
+
+def _inject_joystick(emu: "C64", spec: str) -> str:
+    """Parse ``<port>:<dirs>[:<hold>]`` and arm the joystick on *emu*."""
+    from .keyboard_matrix import parse_joy_mask
+
+    bits = spec.split(":")
+    if len(bits) < 2 or not bits[0].strip() or not bits[1].strip():
+        return "ERROR: Use INJECT JOY <port>:<dirs>[:<hold>], e.g. 2:up+fire:300ms"
+    try:
+        port = int(bits[0].strip())
+        mask, _label = parse_joy_mask(bits[1])
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    standard = str(getattr(emu.memory, "video_standard", "pal")).lower()
+    clock_hz = 1_022_727 if standard == "ntsc" else 985_248
+    hold = _parse_hold_cycles(bits[2] if len(bits) >= 3 else "", clock_hz=clock_hz)
+    return emu.inject_joystick(port, mask, hold)
 
 
 def _parse_keycode(raw: str) -> int:
@@ -146,6 +182,21 @@ def dispatch_text_command(emu: "C64", command: str) -> str:
             return f"ERROR: Invalid key code: {e}"
         emu.send_petscii_sequence(codes)
         return "OK"
+
+    elif cmd == "INJECT":
+        if len(parts) < 2:
+            return "ERROR: Missing payload (e.g. INJECT {F1} or INJECT JOY 2:fire:300ms)"
+        sub = parts[1].upper()
+        if sub == "JOY":
+            spec = command.split(None, 2)[2] if len(parts) > 2 else ""
+            return _inject_joystick(emu, spec)
+        if sub in ("MATRIX", "BUFFER"):
+            payload = command.split(None, 2)[2] if len(parts) > 2 else ""
+            if not payload:
+                return "ERROR: Missing payload"
+            return emu.inject_keys(payload, mode=sub.lower())
+        payload = command.split(None, 1)[1]
+        return emu.inject_keys(payload, mode="auto")
 
     elif cmd == "SHOW_KEYBOARD_BUFFER":
         kb_buf_base = KEYBOARD_BUFFER_BASE
