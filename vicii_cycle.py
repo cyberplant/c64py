@@ -79,15 +79,48 @@ def _parse_cycle_tab_pal() -> list[tuple[int, int, int, int]]:
 
 PAL_6569R3_CYCLE_TABLE = _parse_cycle_tab_pal()
 
+# NTSC MOS 6567R8 — VICE ``cycle_tab_ntsc`` (65 entries; index 0..64 ≡ cycles 1..65).
+NTSC_6567R8_CYCLE_TABLE: list[tuple[int, int, int, int]] = [
+    (0x38, 0, 0, 0),
+    (0x30, 0, 0, 0),
+    (0x70, 0, 0, 0),
+    (0x60, 0, 0, 0),
+    (0xE0, 0, 0, 0),
+    (0xC0, 0, 0, 0),
+    (0xC0, 0, 0, 0),
+    (0x80, 0, 0, 0),
+    (0x80, 0, 0, 0),
+    (0x00, 0, 0, 0),
+    (0x00, 0, 0, 0),
+    (0x00, 1, 0, 0),
+    (0x00, 1, 0, 0),
+    (0x00, 1, 0, 0),
+    (0x00, 1, 1, 0),
+    *[(0x00, 1, 1, 1)] * 39,
+    (0x00, 0, 0, 1),
+    (0x01, 0, 0, 0),
+    (0x01, 0, 0, 0),
+    (0x03, 0, 0, 0),
+    (0x03, 0, 0, 0),
+    (0x07, 0, 0, 0),
+    (0x06, 0, 0, 0),
+    (0x0E, 0, 0, 0),
+    (0x0C, 0, 0, 0),
+    (0x1C, 0, 0, 0),
+    (0x18, 0, 0, 0),
+]
+assert len(NTSC_6567R8_CYCLE_TABLE) == 65
+
 
 @dataclass
 class ViciiCycleEngine:
-    """Minimal VICE-aligned VIC-II cycle engine for badlines + BA arbitration (PAL 6569R3)."""
+    """Minimal VICE-aligned VIC-II cycle engine for badlines + BA arbitration (PAL/NTSC)."""
 
     raster_line: int = 0
-    raster_cycle: int = 0  # 0..62 PAL (index); tick() uses then advances
+    raster_cycle: int = 0  # 0..62 PAL / 0..64 NTSC (index); tick() uses then advances
     cycles_per_line: int = 63
     num_raster_lines: int = 312
+    video_standard: str = "pal"
 
     # From VICE `vicii_cycle_start_of_line` / `allow_bad_lines` gating
     allow_bad_lines: bool = False
@@ -150,7 +183,12 @@ class ViciiCycleEngine:
             else:
                 self.bad_line = ((rl & 7) == (self.ysmooth & 7))
 
-        sprite_ba_mask, fetch_ba, _phi2_fetch_c, _visible = PAL_6569R3_CYCLE_TABLE[rc]
+        table = (
+            NTSC_6567R8_CYCLE_TABLE
+            if self.video_standard == "ntsc"
+            else PAL_6569R3_CYCLE_TABLE
+        )
+        sprite_ba_mask, fetch_ba, _phi2_fetch_c, _visible = table[rc]
 
         ba_matrix = bool(self.bad_line and fetch_ba)
         sprite_ba = (sprite_ba_mask & self.sprite_enable_mask) != 0

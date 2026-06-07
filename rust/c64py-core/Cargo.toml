@@ -1,0 +1,19 @@
+[package]
+name = "c64py_rust_core"
+version = "0.1.0"
+edition = "2021"
+description = "Optional native fast-path core for c64py (PyO3 extension)"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+name = "c64py_rust_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+libloading = "0.8"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

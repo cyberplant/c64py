@@ -6,6 +6,9 @@ __pycache__/
 *.so
 *.dylib
 
+# Rust (maturin / cargo)
+rust/c64py-core/target/
+
 # Local reSID source tree (nested clone / autotools build from setup_resid.sh; not part of this repo)
 src/resid_wrapper/resid/
 

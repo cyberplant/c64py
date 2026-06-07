@@ -21,19 +21,75 @@ Runtime library search order
 2. Paths listed in the ``RESID_LIB_PATH`` environment variable
    (colon-separated on POSIX, semicolon on Windows).
 3. Standard OS library search paths (``LD_LIBRARY_PATH``, etc.).
+
+Audio queue diagnostics (lockstep / Rust PCM path)
+----------------------------------------------------
+Set ``C64PY_RESID_TRACE=1`` to emit rate-limited ``C64PY_RESID_AUDIO`` JSON lines to stderr
+when the pending PCM queue **underruns** (mixer asked for a full buffer but less PCM was
+ready, so silence was padded) or **overruns** (pending bytes exceeded the cap and oldest
+samples were dropped). Optional ``C64PY_RESID_TRACE_INTERVAL`` (seconds, default ``1``)
+controls the minimum gap between lines. A final summary line is printed on ``close()``
+when tracing is enabled. Use ``ReSIDEmulator.get_resid_audio_stats()`` for live totals
+without stderr noise.
+
+WAV capture (same PCM as pygame)
+----------------------------------
+Set ``C64PY_RESID_WAV`` to a filesystem path (e.g. ``/tmp/c64_resid.wav``). Every mixer
+buffer produced by ``_render_buffer`` — the **same** int16 mono PCM sent to pygame,
+including underrun silence — is appended. On ``close()``, a WAV file is written (sample
+rate matches the emulator, default 44100 Hz). Optional ``C64PY_RESID_WAV_MAX_SEC`` caps
+how much audio is kept (float seconds).
+
+Playback smoothness (pygame mixer)
+-----------------------------------
+SDL only sees what we ``play``/``queue``. The worker used to sleep for half a mixer buffer
+when a chunk was already queued, which delayed the *next* queue and caused audible gaps even
+when ``_pcm_pending`` was healthy. Polling uses a short sleep (default ~1–4 ms, override with
+``C64PY_RESID_QUEUE_POLL_SEC``) and we prime one follow-up buffer immediately after ``play()``.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import json
 import os
 import signal
 import sys
 import threading
 import time
 import warnings
-from typing import Optional
+import wave
+from typing import Any, Dict, Optional
+
+
+def _env_resid_trace() -> bool:
+    v = os.environ.get("C64PY_RESID_TRACE", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _resid_trace_interval_sec() -> float:
+    try:
+        x = float(os.environ.get("C64PY_RESID_TRACE_INTERVAL", "1.0").strip())
+    except ValueError:
+        x = 1.0
+    return max(0.05, x)
+
+
+def _env_resid_wav_path() -> Optional[str]:
+    p = os.environ.get("C64PY_RESID_WAV", "").strip()
+    return p if p else None
+
+
+def _env_resid_queue_poll_sleep_sec(buffer_seconds: float) -> float:
+    """How long to sleep when pygame already has a sound queued (short = refill sooner)."""
+    raw = os.environ.get("C64PY_RESID_QUEUE_POLL_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.0003, float(raw))
+        except ValueError:
+            pass
+    return min(0.004, max(0.001, buffer_seconds / 32.0))
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +128,11 @@ def _find_resid_lib() -> Optional[str]:
         return path
 
     return None
+
+
+def find_resid_lib() -> Optional[str]:
+    """Public helper for Rust batch path."""
+    return _find_resid_lib()
 
 
 def _load_resid_lib() -> ctypes.CDLL:
@@ -208,6 +269,7 @@ class ReSIDEmulator:
         self._sample_rate = int(sample_rate)
         self._buffer_samples = max(64, int(self._sample_rate * buffer_ms / 1000))
         self._buffer_seconds = self._buffer_samples / self._sample_rate
+        self._queue_poll_sleep = _env_resid_queue_poll_sleep_sec(self._buffer_seconds)
         self._sampling_method = sampling_method
 
         # Clock frequency
@@ -251,6 +313,20 @@ class ReSIDEmulator:
         # PCM queued from tick_cpu_cycles() when cpu_lockstep (accurate path).
         self._pcm_pending = bytearray()
         self._pcm_pending_max = self._sample_rate * 2 * 8  # cap ~8 s mono int16 bytes
+        self._pcm_pending_peak = 0  # max len(_pcm_pending) seen (producer-side), under _lock
+        # True when Rust batch is feeding PCM (drain queue even if cpu_lockstep is False).
+        self._rust_pcm_mode = False
+
+        # Lockstep queue diagnostics (underrun = padded silence; overrun = dropped front samples).
+        self._stats_lock = threading.Lock()
+        self._resid_underrun_buffers = 0
+        self._resid_underrun_pad_samples = 0
+        self._resid_overrun_events = 0
+        self._resid_overrun_drop_bytes = 0
+        self._trace_last_emit = 0.0
+        self._trace_window_underrun_buffers = 0
+        self._trace_window_overrun_events = 0
+        self._trace_window_drop_bytes = 0
 
         # Legacy field (audio thread no longer clocks SID directly).
         self._cycle_remainder = 0
@@ -266,7 +342,180 @@ class ReSIDEmulator:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
+        # Optional WAV capture: same buffers as pygame (see module docstring).
+        self._wav_path: Optional[str] = _env_resid_wav_path()
+        self._wav_buf: Optional[bytearray] = (
+            bytearray() if self._wav_path else None
+        )
+        self._wav_max_bytes: Optional[int] = None
+        if self._wav_buf is not None:
+            raw_max = os.environ.get("C64PY_RESID_WAV_MAX_SEC", "").strip()
+            if raw_max:
+                try:
+                    sec = float(raw_max)
+                    self._wav_max_bytes = max(0, int(sec * self._sample_rate * 2))
+                except ValueError:
+                    self._wav_max_bytes = None
+
         self._init_audio(mixer_buffer)
+
+    # ------------------------------------------------------------------
+    # Lockstep queue stats / trace (underrun & overrun)
+    # ------------------------------------------------------------------
+
+    def get_resid_audio_stats(self) -> Dict[str, Any]:
+        """Snapshot of PCM queue diagnostics (lockstep or ``extend_pcm_from_rust`` path).
+
+        * **underrun_buffers** — ``_render_buffer`` calls that padded with silence.
+        * **underrun_pad_samples** — total mono samples replaced by padding.
+        * **overrun_events** — times the pending queue was trimmed after exceeding the cap.
+        * **overrun_drop_bytes** — total bytes removed from the front (int16 mono PCM).
+        """
+        # Always take _lock before _stats_lock (same order as trace helpers) to avoid deadlock.
+        with self._lock:
+            pending_now = len(self._pcm_pending) if self._sid_ptr else 0
+            peak = self._pcm_pending_peak
+        with self._stats_lock:
+            return {
+                "underrun_buffers": self._resid_underrun_buffers,
+                "underrun_pad_samples": self._resid_underrun_pad_samples,
+                "overrun_events": self._resid_overrun_events,
+                "overrun_drop_bytes": self._resid_overrun_drop_bytes,
+                "pending_bytes_now": pending_now,
+                "pending_peak_bytes": peak,
+                "pending_cap_bytes": self._pcm_pending_max,
+                "buffer_samples": self._buffer_samples,
+                "wav_path": self._wav_path,
+                "wav_recorded_bytes": (
+                    len(self._wav_buf) if self._wav_buf is not None else None
+                ),
+            }
+
+    def _note_lockstep_underrun(self, pad_samples: int) -> None:
+        if pad_samples <= 0:
+            return
+        with self._stats_lock:
+            self._resid_underrun_buffers += 1
+            self._resid_underrun_pad_samples += pad_samples
+            self._trace_window_underrun_buffers += 1
+        self._maybe_emit_resid_trace()
+
+    def _note_overrun(self, drop_bytes: int, events: int = 1) -> None:
+        if drop_bytes <= 0 or events <= 0:
+            return
+        with self._stats_lock:
+            self._resid_overrun_events += events
+            self._resid_overrun_drop_bytes += drop_bytes
+            self._trace_window_overrun_events += events
+            self._trace_window_drop_bytes += drop_bytes
+        self._maybe_emit_resid_trace()
+
+    def _maybe_emit_resid_trace(self) -> None:
+        if not _env_resid_trace():
+            return
+        interval = _resid_trace_interval_sec()
+        now = time.monotonic()
+        with self._lock:
+            pending_now = len(self._pcm_pending) if self._sid_ptr else 0
+            peak = self._pcm_pending_peak
+        with self._stats_lock:
+            if now - self._trace_last_emit < interval:
+                return
+            if (
+                self._trace_window_underrun_buffers == 0
+                and self._trace_window_overrun_events == 0
+            ):
+                return
+            wu = self._trace_window_underrun_buffers
+            wo = self._trace_window_overrun_events
+            wd = self._trace_window_drop_bytes
+            self._trace_window_underrun_buffers = 0
+            self._trace_window_overrun_events = 0
+            self._trace_window_drop_bytes = 0
+            self._trace_last_emit = now
+            tu = self._resid_underrun_buffers
+            tus = self._resid_underrun_pad_samples
+            to = self._resid_overrun_events
+            tob = self._resid_overrun_drop_bytes
+        rec = {
+            "pending_bytes_now": pending_now,
+            "pending_peak_bytes": peak,
+            "window_underrun_buffers": wu,
+            "window_overrun_events": wo,
+            "window_drop_bytes": wd,
+            "total_underrun_buffers": tu,
+            "total_underrun_pad_samples": tus,
+            "total_overrun_events": to,
+            "total_overrun_drop_bytes": tob,
+        }
+        print("C64PY_RESID_AUDIO " + json.dumps(rec, sort_keys=True), file=sys.stderr, flush=True)
+
+    def _emit_resid_trace_final(self) -> None:
+        if not _env_resid_trace():
+            return
+        with self._lock:
+            pending_now = len(self._pcm_pending) if self._sid_ptr else 0
+            peak = self._pcm_pending_peak
+        with self._stats_lock:
+            wu = self._trace_window_underrun_buffers
+            wo = self._trace_window_overrun_events
+            wd = self._trace_window_drop_bytes
+            self._trace_window_underrun_buffers = 0
+            self._trace_window_overrun_events = 0
+            self._trace_window_drop_bytes = 0
+            tu = self._resid_underrun_buffers
+            tus = self._resid_underrun_pad_samples
+            to = self._resid_overrun_events
+            tob = self._resid_overrun_drop_bytes
+        rec = {
+            "final": True,
+            "pending_bytes_now": pending_now,
+            "pending_peak_bytes": peak,
+            "window_underrun_buffers": wu,
+            "window_overrun_events": wo,
+            "window_drop_bytes": wd,
+            "total_underrun_buffers": tu,
+            "total_underrun_pad_samples": tus,
+            "total_overrun_events": to,
+            "total_overrun_drop_bytes": tob,
+        }
+        print("C64PY_RESID_AUDIO " + json.dumps(rec, sort_keys=True), file=sys.stderr, flush=True)
+
+    def _wav_record_chunk(self, chunk: bytes) -> None:
+        """Append PCM that was fed to pygame (audio thread only)."""
+        buf = self._wav_buf
+        if buf is None or not chunk:
+            return
+        max_b = self._wav_max_bytes
+        if max_b is not None:
+            room = max_b - len(buf)
+            if room <= 0:
+                return
+            if len(chunk) > room:
+                chunk = chunk[:room]
+        buf.extend(chunk)
+
+    def _flush_wav_file(self) -> None:
+        """Write captured mono int16 PCM to ``C64PY_RESID_WAV`` path."""
+        path = self._wav_path
+        buf = self._wav_buf
+        if not path or buf is None or len(buf) == 0:
+            return
+        try:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(self._sample_rate)
+                w.writeframes(bytes(buf))
+        except OSError as exc:
+            warnings.warn(
+                f"reSID WAV capture: could not write {path!r}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # ------------------------------------------------------------------
     # Clock / standard helpers
@@ -275,6 +524,11 @@ class ReSIDEmulator:
     @staticmethod
     def _clock_for_standard(video_standard: str) -> int:
         return 985248 if video_standard == "pal" else 1022727
+
+    @staticmethod
+    def find_resid_lib() -> Optional[str]:
+        """Path to resid_c shared library for Rust interop."""
+        return find_resid_lib()
 
     def set_video_standard(self, video_standard: str) -> None:
         """Update the SID clock frequency for the given video standard."""
@@ -303,6 +557,8 @@ class ReSIDEmulator:
         if not self._cpu_lockstep or n <= 0 or not self._sid_ptr:
             return
         scratch_n = self._clock_scratch_samples
+        drop_bytes = 0
+        overrun_events = 0
         with self._lock:
             remaining = int(n)
             while remaining > 0:
@@ -320,9 +576,40 @@ class ReSIDEmulator:
                         produced * 2,
                     )
                     self._pcm_pending += raw
-                    if len(self._pcm_pending) > self._pcm_pending_max:
+                    self._pcm_pending_peak = max(
+                        self._pcm_pending_peak, len(self._pcm_pending)
+                    )
+                    while len(self._pcm_pending) > self._pcm_pending_max:
                         drop = len(self._pcm_pending) - self._pcm_pending_max
                         del self._pcm_pending[:drop]
+                        drop_bytes += drop
+                        overrun_events += 1
+        if drop_bytes:
+            self._note_overrun(drop_bytes, overrun_events)
+
+    def rust_batch_sid_ptr(self) -> int:
+        """Opaque SID pointer for the Rust fast batch."""
+        return int(self._sid_ptr or 0)
+
+    def extend_pcm_from_rust(self, pcm_bytes: bytes) -> None:
+        """Append Rust-produced PCM to the lockstep queue (little-endian int16 mono)."""
+        if not pcm_bytes:
+            return
+        drop_bytes = 0
+        overrun_events = 0
+        with self._lock:
+            self._rust_pcm_mode = True
+            self._pcm_pending += pcm_bytes
+            self._pcm_pending_peak = max(
+                self._pcm_pending_peak, len(self._pcm_pending)
+            )
+            while len(self._pcm_pending) > self._pcm_pending_max:
+                drop = len(self._pcm_pending) - self._pcm_pending_max
+                del self._pcm_pending[:drop]
+                drop_bytes += drop
+                overrun_events += 1
+        if drop_bytes:
+            self._note_overrun(drop_bytes, overrun_events)
 
     # ------------------------------------------------------------------
     # Register access
@@ -352,6 +639,8 @@ class ReSIDEmulator:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
+        self._emit_resid_trace_final()
+        self._flush_wav_file()
         if self._channel:
             try:
                 self._channel.stop()
@@ -425,7 +714,14 @@ class ReSIDEmulator:
     # ------------------------------------------------------------------
 
     def _audio_worker(self) -> None:
-        """Background thread: render reSID output and feed pygame mixer."""
+        """Background thread: render reSID output and feed pygame mixer.
+
+        pygame.mixer is SDL_mixer chunk playback: there is no supported API to push raw PCM
+        into an already-playing stream without supplying a new ``Sound`` (each call wraps a
+        ``Mix_Chunk``). True streaming would use ``SDL_OpenAudioDevice`` / a callback
+        (e.g. PySDL2, ``sounddevice``) instead of mixer — a larger change than swapping this
+        loop.
+        """
         while self._running:
             if not self._pygame or not self._pygame.mixer.get_init():
                 break
@@ -437,7 +733,7 @@ class ReSIDEmulator:
                     continue
 
             if self._channel.get_queue() is not None:
-                time.sleep(self._buffer_seconds / 2)
+                time.sleep(self._queue_poll_sleep)
                 continue
 
             pcm_bytes = self._render_buffer()
@@ -445,6 +741,13 @@ class ReSIDEmulator:
             if not self._channel.get_busy():
                 self._current_sound = sound
                 self._channel.play(sound)
+                # Pygame allows at most one queued chunk after the current; prime it
+                # immediately so SDL is less likely to underrun before the next loop.
+                if self._running and self._channel.get_queue() is None:
+                    pcm2 = self._render_buffer()
+                    s2 = self._pygame.mixer.Sound(buffer=pcm2)
+                    self._queued_sound = s2
+                    self._channel.queue(s2)
             else:
                 self._queued_sound = sound
                 self._channel.queue(sound)
@@ -457,9 +760,15 @@ class ReSIDEmulator:
           (historical behaviour; matches pre-lockstep performance).
         """
         need = self._buffer_samples * 2
-        if not self._cpu_lockstep:
-            return self._render_buffer_decoupled()
+        if not self._cpu_lockstep and not self._rust_pcm_mode:
+            chunk = self._render_buffer_decoupled()
+        else:
+            chunk = self._render_buffer_lockstep(need)
+        self._wav_record_chunk(chunk)
+        return chunk
 
+    def _render_buffer_lockstep(self, need: int) -> bytes:
+        """Drain ``_pcm_pending`` or pad with silence (lockstep / Rust PCM queue)."""
         with self._lock:
             if not self._sid_ptr:
                 return bytes(need)
@@ -471,6 +780,7 @@ class ReSIDEmulator:
             self._pcm_pending.clear()
         pad = need - len(chunk)
         if pad > 0:
+            self._note_lockstep_underrun(pad // 2)
             chunk += bytes(pad)
         return chunk
 

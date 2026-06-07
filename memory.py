@@ -51,6 +51,11 @@ class MemoryMap:
     # CIA2 Port A state (for IEC bus control)
     cia2_pra: int = 0xFF  # Port A data register
     cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)
+    # Scheduled inject-keys: joystick bits to hold low on CIA1 reads (active low, OR mask).
+    joy_inject1_clear: int = 0
+    joy_inject2_clear: int = 0
+    joy_inject1_until: Optional[int] = None
+    joy_inject2_until: Optional[int] = None
     # Instruction context for optional debug hooks (UDP, accurate-VIC bus phases).
     debug_last_pc: int = 0
     debug_last_cycles: int = 0
@@ -358,14 +363,39 @@ class MemoryMap:
 
         self.recompute_pending_irq()
 
+    def sync_joystick_inject(self, cpu_cycles: int) -> None:
+        """Clear expired joystick inject bits (``--inject-keys``)."""
+        if self.joy_inject1_until is not None and cpu_cycles >= self.joy_inject1_until:
+            self.joy_inject1_clear = 0
+            self.joy_inject1_until = None
+        if self.joy_inject2_until is not None and cpu_cycles >= self.joy_inject2_until:
+            self.joy_inject2_clear = 0
+            self.joy_inject2_until = None
+
+    def arm_joystick_inject(self, port: int, clear_mask: int, until_cycle: int) -> None:
+        """OR combined directions; extend hold until max(until_cycle)."""
+        clear_mask &= 0x1F
+        if port == 1:
+            self.joy_inject1_clear |= clear_mask
+            prev = self.joy_inject1_until
+            self.joy_inject1_until = (
+                until_cycle if prev is None else max(prev, until_cycle)
+            )
+        elif port == 2:
+            self.joy_inject2_clear |= clear_mask
+            prev = self.joy_inject2_until
+            self.joy_inject2_until = (
+                until_cycle if prev is None else max(prev, until_cycle)
+            )
+
     def _read_cia1(self, reg: int) -> int:
         """Read CIA1 register"""
         # Port A (directly connected to keyboard columns and joystick 2)
         if reg == 0x00:
-            return 0xFF  # No keys pressed / joystick idle
+            return 0xFF & ~self.joy_inject2_clear
         # Port B (keyboard rows and joystick 1)
         elif reg == 0x01:
-            return 0xFF  # No keys pressed / joystick idle
+            return 0xFF & ~self.joy_inject1_clear
         # Timer A low byte
         elif reg == 0x04:
             return self.cia1_timer_a.counter & 0xFF

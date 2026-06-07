@@ -278,6 +278,7 @@ class PygameInterface:
                 max_cycles = self.max_cycles
                 last_pc = None
                 stuck_count = 0
+                inject_wall_t0 = time.perf_counter()
 
                 # Prime render latch so pygame sees consistent regs before first PAL frame completes.
                 self.emulator.memory.snapshot_vic_render_state()
@@ -318,19 +319,16 @@ class PygameInterface:
                                 self.add_debug_log(f"Failed to attach disk: {exc}")
                                 self.emulator.disk_image_path = None  # Clear path even on error
 
-                    # Check for KERNAL LOAD hook (before executing instruction)
-                    if self.emulator._handle_kernal_load():
-                        # LOAD was handled, skip this CPU instruction
+                    step_cycles = self.emulator.run_cpu_instruction_quantum(cycles)
+                    if step_cycles == 0:
                         continue
 
-                    # Check for KERNAL SAVE hook (before executing instruction)
-                    if self.emulator._handle_kernal_save():
-                        # SAVE was handled, skip this CPU instruction
-                        continue
-
-                    step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles, self.emulator.vice_trace)
                     cycles += step_cycles
                     self.emulator.current_cycles = cycles
+                    self.emulator.memory.sync_joystick_inject(cycles)
+                    self.emulator._process_scheduled_inject_keys(
+                        cycles, time.perf_counter() - inject_wall_t0
+                    )
                     self.emulator.throttle_emulation_if_needed(cycles)
 
                     pc = self.emulator.cpu.state.pc

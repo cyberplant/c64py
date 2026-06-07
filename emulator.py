@@ -9,7 +9,9 @@ import struct
 import sys
 import threading
 import time
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
+
+from .keyboard_inject import InjectKeyRule
 
 try:
     import numpy as np
@@ -78,8 +80,16 @@ class C64:
         interface_factory=None,
         enable_sid: bool = False,
         enable_resid: bool = False,
-        accurate_vic: bool = False,
+        vic_emulation: str = "fast",
     ):
+        allowed_vic = frozenset({"fast", "accurate-python", "accurate-rust"})
+        if vic_emulation not in allowed_vic:
+            raise ValueError(
+                f"vic_emulation must be one of {sorted(allowed_vic)}, got {vic_emulation!r}"
+            )
+        self.vic_emulation = vic_emulation
+        accurate_vic = vic_emulation != "fast"
+        rust_hybrid_vic = vic_emulation == "accurate-rust"
         self.memory = MemoryMap()
         if interface_factory is None:
             self.interface = TextualInterface(self)
@@ -87,7 +97,12 @@ class C64:
             self.interface = interface_factory(self)
 
         # Create CPU with interface reference
-        self.cpu = CPU6502(self.memory, self.interface, accurate_vic=accurate_vic)
+        self.cpu = CPU6502(
+            self.memory,
+            self.interface,
+            accurate_vic=accurate_vic,
+            rust_hybrid_vic=rust_hybrid_vic,
+        )
         self.accurate_vic = accurate_vic
         self.sid = None
 
@@ -113,6 +128,7 @@ class C64:
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
         self.turbo = False  # When True, no wall-clock throttling (see --turbo)
+        self.inject_key_rules: List[InjectKeyRule] = []
 
         # Disk drives (devices 8-11)
         self.drives: Dict[int, DiskDrive] = {}
@@ -575,6 +591,7 @@ class C64:
 
     def set_video_standard(self, standard: str) -> None:
         self.memory.video_standard = standard
+        self.cpu.apply_video_standard_geometry()
         if self.sid:
             self.sid.set_video_standard(standard)
 
@@ -657,6 +674,41 @@ class C64:
         
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
+
+    def _fire_inject_key_rule(self, rule: InjectKeyRule, cpu_cycles: int) -> None:
+        """Apply one ``--inject-keys`` rule (keyboard + optional joystick hold)."""
+        from .keyboard_inject import expand_inject_payload
+
+        kb, j1, j2, hold = expand_inject_payload(rule.payload_raw)
+        dropped = 0
+        for b in kb:
+            if not self.send_petscii(int(b)):
+                dropped += 1
+        if dropped and self.interface:
+            self.interface.add_debug_log(
+                f"⌨️ inject-keys: {dropped} byte(s) dropped (keyboard buffer full)"
+            )
+        until = cpu_cycles + max(hold, 0)
+        if j1:
+            self.memory.arm_joystick_inject(1, j1, until)
+        if j2:
+            self.memory.arm_joystick_inject(2, j2, until)
+        if self.interface:
+            self.interface.add_debug_log(
+                f"⌨️ inject-keys fired at cycle {cpu_cycles}: {rule.payload_raw!r}"
+            )
+
+    def _process_scheduled_inject_keys(self, cpu_cycles: int, wall_seconds: float) -> None:
+        for rule in self.inject_key_rules:
+            if rule.fired:
+                continue
+            if rule.when_cycles is not None:
+                if cpu_cycles >= rule.when_cycles:
+                    rule.fired = True
+                    self._fire_inject_key_rule(rule, cpu_cycles)
+            elif rule.when_seconds is not None and wall_seconds >= rule.when_seconds:
+                rule.fired = True
+                self._fire_inject_key_rule(rule, cpu_cycles)
 
     def _inject_load_directory_command(self, device: int = 8) -> None:
         """Inject 'LOAD"$",device' command into keyboard buffer to list disk directory."""
@@ -774,6 +826,15 @@ class C64:
             self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
         return True
 
+    def _kernal_hook_rts_return(self) -> None:
+        """Pop return address from stack like RTS after a simulated KERNAL vector call."""
+        sp = self.cpu.state.sp
+        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
+        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
+        ret_addr = ret_addr_low | (ret_addr_high << 8)
+        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
+        self.cpu.state.sp = (sp + 2) & 0xFF
+
     def _handle_kernal_load(self) -> bool:
         """Handle KERNAL LOAD operation for virtual disk drives.
         
@@ -810,8 +871,7 @@ class C64:
             self.memory.write(0x90, 0x80)  # Status byte: device not present
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
-            # Return from JSR
-            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            self._kernal_hook_rts_return()
             return True
         
         # Get LOAD parameters
@@ -839,8 +899,7 @@ class C64:
             self.memory.write(0x90, 0x40)  # Status byte: error
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
-            # Return from JSR (pop return address and continue)
-            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            self._kernal_hook_rts_return()
             return True
         
         # Get load address
@@ -890,18 +949,7 @@ class C64:
             self.memory.write(0x0031, end_addr & 0xFF)
             self.memory.write(0x0032, (end_addr >> 8) & 0xFF)
         
-        # Return from JSR (pop return address and continue)
-        # The JSR to $FFD5 pushed the return address on the stack
-        # We need to pop it and continue from there
-        sp = self.cpu.state.sp
-        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
-        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
-        ret_addr = ret_addr_low | (ret_addr_high << 8)
-        # JSR pushes PC+2 (where PC points to last byte of JSR instruction)
-        # RTS adds 1 to get to next instruction
-        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
-        self.cpu.state.sp = (sp + 2) & 0xFF
-        
+        self._kernal_hook_rts_return()
         return True
 
     def _handle_kernal_save(self) -> bool:
@@ -940,8 +988,7 @@ class C64:
             self.memory.write(0x90, 0x80)
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
-            # Return from JSR
-            self.cpu.state.sp = (self.cpu.state.sp + 2) & 0xFF
+            self._kernal_hook_rts_return()
             return True
         
         # Get SAVE parameters
@@ -1001,15 +1048,16 @@ class C64:
             # Set carry flag to indicate error
             self.cpu.state.p |= 0x01
         
-        # Return from JSR
-        sp = self.cpu.state.sp
-        ret_addr_low = self.memory.read(0x0100 + ((sp + 1) & 0xFF))
-        ret_addr_high = self.memory.read(0x0100 + ((sp + 2) & 0xFF))
-        ret_addr = ret_addr_low | (ret_addr_high << 8)
-        self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
-        self.cpu.state.sp = (sp + 2) & 0xFF
-        
+        self._kernal_hook_rts_return()
         return True
+
+    def run_cpu_instruction_quantum(self, cycles_before: int) -> int:
+        """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
+        if self._handle_kernal_load():
+            return 0
+        if self._handle_kernal_save():
+            return 0
+        return self.cpu.cpu_step_quantum(self.udp_debug, self.vice_trace, cycles_before)
 
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
@@ -1056,6 +1104,7 @@ class C64:
         # Main CPU emulation loop (runs as fast as possible)
         last_time = time.time()
         last_cycle_check = 0
+        inject_wall_t0 = time.perf_counter()
 
         while self.running:
             pc = self.cpu.state.pc
@@ -1096,19 +1145,16 @@ class C64:
                             self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
                         self.disk_image_path = None  # Clear path even on error
 
-            # Check for KERNAL LOAD hook (before executing instruction)
-            if self._handle_kernal_load():
-                # LOAD was handled, skip this CPU instruction
+            step_cycles = self.run_cpu_instruction_quantum(cycles)
+            if step_cycles == 0:
                 continue
 
-            # Check for KERNAL SAVE hook (before executing instruction)
-            if self._handle_kernal_save():
-                # SAVE was handled, skip this CPU instruction
-                continue
-
-            step_cycles = self.cpu.step(self.udp_debug, cycles, self.vice_trace)
             cycles += step_cycles
             self.current_cycles = cycles
+            self.memory.sync_joystick_inject(cycles)
+            self._process_scheduled_inject_keys(
+                cycles, time.perf_counter() - inject_wall_t0
+            )
             self.throttle_emulation_if_needed(cycles)
 
             # Check if we've reached max cycles
