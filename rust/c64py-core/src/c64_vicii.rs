@@ -250,12 +250,7 @@ impl ViciiEngine {
     pub fn step(&mut self, mem: &mut C64MemoryMap<'_>) -> bool {
         self.sync_shadow_from_mem(mem);
 
-        self.raster_cycle += 1;
-        if self.raster_cycle >= self.cycles_per_line {
-            self.raster_cycle = 0;
-            self.raster_line = (self.raster_line + 1) % self.num_raster_lines;
-            self.cycle_start_of_line();
-        }
+        let rc = self.raster_cycle;
 
         if !self.allow_bad_lines {
             self.bad_line = false;
@@ -277,7 +272,7 @@ impl ViciiEngine {
             false
         };
 
-        let idx = self.raster_cycle as usize;
+        let idx = rc as usize;
         let (sprite_ba_mask, fetch_ba, _phi2, _vis) = if mem.video_standard == 0 {
             PAL_6569R3_CYCLE_TABLE[idx]
         } else {
@@ -294,6 +289,13 @@ impl ViciiEngine {
             }
         } else {
             self.prefetch_cycles = 4;
+        }
+
+        self.raster_cycle += 1;
+        if self.raster_cycle >= self.cycles_per_line {
+            self.raster_cycle = 0;
+            self.raster_line = (self.raster_line + 1) % self.num_raster_lines;
+            self.cycle_start_of_line();
         }
 
         mem.raster_line = self.raster_line;

@@ -249,8 +249,8 @@ def main():
         default="accurate-rust",
         help=(
             "VIC timing: fast (coarse raster); accurate-python (per-cycle Python VIC+BA stalls); "
-            "accurate-rust (PAL hybrid VIC in optional Rust core when built — default). "
-            "NTSC accurate-rust falls back to Python accurate path."
+            "accurate-rust (PAL/NTSC hybrid VIC in optional Rust core when built — default; "
+            "requires the extension)."
         ),
     )
     ap.add_argument(

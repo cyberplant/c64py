@@ -34,9 +34,7 @@ fn pc_in_stop_set(pc: u16, stop_pcs: &[u16]) -> bool {
 fn service_irq_if_any(cpu: &mut CpuState, mem: &mut C64MemoryMap<'_>) {
     mem.recompute_pending_irq();
     if mem.pending_irq && (cpu.p & 0x04) == 0 {
-        if (mem.cia1_icr & 0x80) != 0 {
-            handle_irq_fast(cpu, mem);
-        }
+        handle_irq_fast(cpu, mem);
     }
 }
 
