@@ -85,7 +85,7 @@ class ViciiCycleEngine:
     """Minimal VICE-aligned VIC-II cycle engine for badlines + BA arbitration (PAL 6569R3)."""
 
     raster_line: int = 0
-    raster_cycle: int = -1  # pre-increment in tick(); 0..62 PAL ≡ chip cycles 1..63
+    raster_cycle: int = 0  # 0..62 PAL (index); tick() uses then advances
     cycles_per_line: int = 63
     num_raster_lines: int = 312
 
@@ -137,12 +137,7 @@ class ViciiCycleEngine:
         VICE nuance: when BA transitions low, the CPU can still complete a few cycles
         before reads are blocked. This is modeled via `prefetch_cycles`.
         """
-        # Move to next cycle (VICE updates cycle first, but our `raster_cycle` is for current).
-        self.raster_cycle += 1
-        if self.raster_cycle >= self.cycles_per_line:
-            self.raster_cycle = 0
-            self.raster_line = (self.raster_line + 1) % self.num_raster_lines
-            self._cycle_start_of_line()
+        rc = self.raster_cycle
 
         # Update badline state when allowed (VICE checks each cycle); inlined for hot path.
         al = self.allow_bad_lines
@@ -155,15 +150,7 @@ class ViciiCycleEngine:
             else:
                 self.bad_line = ((rl & 7) == (self.ysmooth & 7))
 
-        # Raster IRQ edge trigger
-        if self.raster_line == self.raster_irq_line:
-            irq_edge = not self.raster_irq_triggered
-            self.raster_irq_triggered = True
-        else:
-            irq_edge = False
-            self.raster_irq_triggered = False
-
-        sprite_ba_mask, fetch_ba, _phi2_fetch_c, _visible = PAL_6569R3_CYCLE_TABLE[self.raster_cycle]
+        sprite_ba_mask, fetch_ba, _phi2_fetch_c, _visible = PAL_6569R3_CYCLE_TABLE[rc]
 
         ba_matrix = bool(self.bad_line and fetch_ba)
         sprite_ba = (sprite_ba_mask & self.sprite_enable_mask) != 0
@@ -177,6 +164,20 @@ class ViciiCycleEngine:
             self.prefetch_cycles = 4  # 3 + 1 (VICE comment)
 
         ba_blocks_cpu = ba_low and (self.prefetch_cycles == 0)
+
+        self.raster_cycle += 1
+        if self.raster_cycle >= self.cycles_per_line:
+            self.raster_cycle = 0
+            self.raster_line = (self.raster_line + 1) % self.num_raster_lines
+            self._cycle_start_of_line()
+
+        # Raster IRQ edge trigger
+        if self.raster_line == self.raster_irq_line:
+            irq_edge = not self.raster_irq_triggered
+            self.raster_irq_triggered = True
+        else:
+            irq_edge = False
+            self.raster_irq_triggered = False
 
         return ba_low, ba_blocks_cpu, irq_edge
 
