@@ -1,13 +1,16 @@
 name: Docker Build
 
+# Same trigger policy as ci.yml: no duplicate push+PR on the same commit; skip draft PRs.
 on:
   push:
-    branches: ["main"]
+    branches: [main]
   pull_request:
-    branches: ["main"]
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   build-cpython:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +34,7 @@ jobs:
           docker run --rm -v $HOME/roms:/roms:ro c64py-cpython --benchmark
 
   build-pypy:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

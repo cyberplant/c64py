@@ -4,7 +4,9 @@ Pygame graphics interface for the C64 emulator.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
 from .constants import (
@@ -21,11 +23,16 @@ from .constants import (
     SCREEN_ROWS as C64_SCREEN_ROWS,
     SCREEN_SIZE as C64_SCREEN_SIZE,
     STUCK_PC_THRESHOLD,
-    VIC_MEMORY_CONTROL_REG,
 )
+from .presenter import RgbFrameBuffer
 
 if TYPE_CHECKING:
     from .emulator import C64
+
+
+def _env_truthy(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 class PygameInterface:
@@ -34,6 +41,11 @@ class PygameInterface:
     Owns the pygame window, handles input, and renders the emulator screen.
     The main event loop runs in the caller thread while CPU execution runs
     on a background thread started by `run()`.
+
+    Pixels are composed in :class:`presenter.RgbFrameBuffer` (host presenter, not the
+    VIC) and uploaded to pygame; see ``presenter`` module docs for the core/presenter
+    boundary. Presentation is throttled to ``fps`` so the main thread does less work
+    between uploads than the emulated frame rate.
     """
 
     CHAR_WIDTH = 8
@@ -65,11 +77,14 @@ class PygameInterface:
         self._pygame = None
         self._display_surface = None
         self._frame_surface = None
+        self._frame_scaled_src = None  # display-format native size; used when scale > 1
+        self._rgb_frame: Optional[RgbFrameBuffer] = None
         self._screen_rect = None
         self._native_size: Optional[Tuple[int, int]] = None
         self._display_size: Optional[Tuple[int, int]] = None
-        self._glyph_surfaces = None
-        self._glyph_rom_id = None
+        # Standard hires text when RAM charset matches char ROM: pygame blit (built once per ROM+offset).
+        self._rom_glyph_key: Optional[Tuple[int, int]] = None  # (id(char_rom), rom_offset)
+        self._rom_glyph_surfaces: Optional[list] = None
 
         self._palette = {
             0: (0, 0, 0),
@@ -140,6 +155,8 @@ class PygameInterface:
         self.emulator_thread.start()
 
         clock = pygame.time.Clock()
+        present_period = 1.0 / float(self.fps)
+        last_present = 0.0
         try:
             while self.running:
                 for event in pygame.event.get():
@@ -151,13 +168,28 @@ class PygameInterface:
                 if self.emulator and not self.emulator.running:
                     self.running = False
 
-                self._render_frame()
-                if self.scale == 1:
-                    self._display_surface.blit(self._frame_surface, (0, 0))
+                now = time.perf_counter()
+                if last_present == 0.0 or (now - last_present) >= present_period:
+                    self._render_frame()
+                    if self.scale == 1:
+                        self._display_surface.blit(self._frame_surface, (0, 0))
+                    else:
+                        self._frame_scaled_src.blit(self._frame_surface, (0, 0))
+                        pygame.transform.scale(
+                            self._frame_scaled_src, self._display_size, self._display_surface
+                        )
+                    pygame.display.flip()
+                    last_present = time.perf_counter()
+                    clock.tick(self.fps)
                 else:
-                    pygame.transform.scale(self._frame_surface, self._display_size, self._display_surface)
-                pygame.display.flip()
-                clock.tick(self.fps)
+                    # Sleep until the next present window instead of polling every 1 ms.
+                    # Tight 1 ms wakeups (~1000/s) fight the CPU thread for the GIL and
+                    # dominated the graphics+reSID+turbo regression vs older pygame loops.
+                    slack = present_period - (now - last_present)
+                    if slack > 0:
+                        time.sleep(slack * 0.95)
+                    else:
+                        time.sleep(0)
         finally:
             self.running = False
             if self.emulator:
@@ -177,7 +209,19 @@ class PygameInterface:
         self._native_size = (native_w, native_h)
         self._display_size = (native_w * self.scale, native_h * self.scale)
         self._display_surface = self._pygame.display.set_mode(self._display_size)
-        self._frame_surface = self._pygame.Surface(self._native_size)
+        nw, nh = self._native_size
+        self._rgb_frame = RgbFrameBuffer(nw, nh)
+        self._frame_surface = self._pygame.image.frombuffer(
+            memoryview(self._rgb_frame.buf), self._native_size, "RGB"
+        )
+        # frombuffer RGB (24-bit) often differs from set_mode pixel layout; transform.scale
+        # requires matching formats, so blit into a display-converted surface first.
+        if self.scale == 1:
+            self._frame_scaled_src = None
+        else:
+            self._frame_scaled_src = self._pygame.Surface(self._native_size).convert(
+                self._display_surface
+            )
         self._screen_rect = self._pygame.Rect(self.border_size, self.border_size, screen_w, screen_h)
 
     def _request_quit(self) -> None:
@@ -220,170 +264,346 @@ class PygameInterface:
 
     def _run_emulator(self) -> None:
         """Run the emulator CPU loop on a background thread."""
+        prof = None
+        if _env_truthy("C64PY_PROFILE_CPU_THREAD"):
+            import cProfile
+
+            prof = cProfile.Profile()
+            prof.enable()
         try:
-            self.emulator.running = True
-            self.emulator.reset_speed_throttle()
-            cycles = 0
-            max_cycles = self.max_cycles
-            last_pc = None
-            stuck_count = 0
+            try:
+                self.emulator.running = True
+                self.emulator.reset_speed_throttle()
+                cycles = 0
+                max_cycles = self.max_cycles
+                last_pc = None
+                stuck_count = 0
 
-            while self.emulator.running:
-                if max_cycles is not None and cycles >= max_cycles:
-                    if hasattr(self.emulator, "autoquit") and self.emulator.autoquit:
-                        self.emulator.running = False
-                    break
+                # Prime render latch so pygame sees consistent regs before first PAL frame completes.
+                self.emulator.memory.snapshot_vic_render_state()
 
-                if self.emulator.prg_file_path and not hasattr(self.emulator, "_program_loaded_after_boot"):
-                    # BASIC init takes roughly this many cycles before the prompt is ready.
-                    if cycles > BASIC_BOOT_CYCLES:
-                        try:
-                            self.emulator.load_prg(self.emulator.prg_file_path)
-                            self.emulator.prg_file_path = None
-                            self.emulator._program_loaded_after_boot = True
-                            self.add_debug_log("Program loaded after BASIC boot completed")
-                            # Inject "RUN" command into keyboard buffer for autorun
-                            self.emulator._inject_run_command()
-                        except Exception as exc:
-                            self.add_debug_log(f"Failed to load program: {exc}")
-                            self.emulator.prg_file_path = None
+                while self.emulator.running:
+                    if max_cycles is not None and cycles >= max_cycles:
+                        if hasattr(self.emulator, "autoquit") and self.emulator.autoquit:
+                            self.emulator.running = False
+                        break
 
-                step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles)
-                cycles += step_cycles
-                self.emulator.current_cycles = cycles
-                self.emulator.throttle_emulation_if_needed(cycles)
+                    if self.emulator.prg_file_path and not hasattr(self.emulator, "_program_loaded_after_boot"):
+                        # BASIC init takes roughly this many cycles before the prompt is ready.
+                        if cycles > BASIC_BOOT_CYCLES:
+                            try:
+                                self.emulator.load_prg(self.emulator.prg_file_path)
+                                self.emulator.prg_file_path = None
+                                self.emulator._program_loaded_after_boot = True
+                                self.add_debug_log("Program loaded after BASIC boot completed")
+                                # Inject "RUN" command into keyboard buffer for autorun
+                                self.emulator._inject_run_command()
+                            except Exception as exc:
+                                self.add_debug_log(f"Failed to load program: {exc}")
+                                self.emulator.prg_file_path = None
 
-                pc = self.emulator.cpu.state.pc
-                if pc == last_pc:
-                    # Check if we're in a graphics mode wait loop
-                    # A simple JMP * (4C XX XX where XX XX = current PC) is ok in graphics mode
-                    mode_info = self.emulator.memory.get_display_mode()
-                    in_graphics_mode = mode_info['bitmap_mode'] or self.emulator.memory.is_sprite_enabled(0)
-                    
-                    if self.emulator.memory.kernal_rom and ROM_KERNAL_START <= pc < ROM_KERNAL_END:
-                        stuck_count = 0
-                    elif pc != KERNAL_CHRIN_ADDR:
-                        # Check if it's a simple wait loop (JMP to self or nearby)
-                        opcode = self.emulator.memory.read(pc)
-                        if opcode == 0x4C:  # JMP absolute
-                            target_low = self.emulator.memory.read(pc + 1)
-                            target_high = self.emulator.memory.read(pc + 2)
-                            target = target_low | (target_high << 8)
-                            # Allow JMP * in graphics mode (infinite wait loop)
-                            if in_graphics_mode and abs(target - pc) <= 10:
-                                stuck_count = 0
+                    # Attach disk if pending (after BASIC boot completes)
+                    if self.emulator.disk_image_path and not hasattr(self.emulator, '_disk_attached_after_boot'):
+                        # BASIC is ready - attach disk now (after boot has completed)
+                        # Wait until we're past boot sequence
+                        if cycles > BASIC_BOOT_CYCLES:
+                            try:
+                                self.emulator.attach_disk(self.emulator.disk_image_path, device=8)
+                                self.emulator.disk_image_path = None  # Clear path after attaching
+                                self.emulator._disk_attached_after_boot = True
+                                self.add_debug_log("Disk attached after BASIC boot completed")
+                                # Inject LOAD"$",8 command into keyboard buffer to list directory
+                                self.emulator._inject_load_directory_command(device=8)
+                            except Exception as exc:
+                                self.add_debug_log(f"Failed to attach disk: {exc}")
+                                self.emulator.disk_image_path = None  # Clear path even on error
+
+                    # Check for KERNAL LOAD hook (before executing instruction)
+                    if self.emulator._handle_kernal_load():
+                        # LOAD was handled, skip this CPU instruction
+                        continue
+
+                    # Check for KERNAL SAVE hook (before executing instruction)
+                    if self.emulator._handle_kernal_save():
+                        # SAVE was handled, skip this CPU instruction
+                        continue
+
+                    step_cycles = self.emulator.cpu.step(self.emulator.udp_debug, cycles, self.emulator.vice_trace)
+                    cycles += step_cycles
+                    self.emulator.current_cycles = cycles
+                    self.emulator.throttle_emulation_if_needed(cycles)
+
+                    pc = self.emulator.cpu.state.pc
+                    if pc == last_pc:
+                        # Check if we're in a graphics mode wait loop
+                        # A simple JMP * (4C XX XX where XX XX = current PC) is ok in graphics mode
+                        mode_info = self.emulator.memory.get_display_mode()
+                        in_graphics_mode = (
+                            mode_info['bitmap_mode']
+                            or mode_info.get('multicolor', False)
+                            or self.emulator.memory.is_sprite_enabled(0)
+                        )
+
+                        if self.emulator.memory.kernal_rom and ROM_KERNAL_START <= pc < ROM_KERNAL_END:
+                            stuck_count = 0
+                        elif pc != KERNAL_CHRIN_ADDR:
+                            # Check if it's a simple wait loop (JMP to self or nearby)
+                            opcode = self.emulator.memory.read(pc)
+                            if opcode == 0x4C:  # JMP absolute
+                                target_low = self.emulator.memory.read(pc + 1)
+                                target_high = self.emulator.memory.read(pc + 2)
+                                target = target_low | (target_high << 8)
+                                # Allow JMP * in graphics mode (infinite wait loop)
+                                if in_graphics_mode and abs(target - pc) <= 10:
+                                    stuck_count = 0
+                                else:
+                                    stuck_count += 1
                             else:
                                 stuck_count += 1
+
+                            if stuck_count > STUCK_PC_THRESHOLD:
+                                self.add_debug_log(f"PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
+                                self.emulator.running = False
+                                break
                         else:
-                            stuck_count += 1
-                        
-                        if stuck_count > STUCK_PC_THRESHOLD:
-                            self.add_debug_log(f"PC stuck at ${pc:04X} for {stuck_count} steps - stopping")
-                            self.emulator.running = False
-                            break
+                            stuck_count = 0
                     else:
                         stuck_count = 0
+                    last_pc = pc
+
+                if max_cycles is not None and cycles >= max_cycles:
+                    self.add_debug_log(f"Stopped at cycle {cycles} (reached max_cycles={max_cycles})")
                 else:
-                    stuck_count = 0
-                last_pc = pc
+                    self.add_debug_log(f"Stopped at cycle {cycles} (stuck_count={stuck_count})")
+            except Exception as exc:
+                self.add_debug_log(f"Emulator error ({type(exc).__name__}): {exc}")
+        finally:
+            if prof is not None:
+                prof.disable()
+                out = (os.environ.get("C64PY_PROFILE_CPU_OUT") or "cpu_thread.prof").strip() or "cpu_thread.prof"
+                parent = os.path.dirname(os.path.abspath(out))
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                prof.dump_stats(out)
+                if _env_truthy("C64PY_PROFILE_CPU_THREAD_PRINT"):
+                    import pstats
 
-            if max_cycles is not None and cycles >= max_cycles:
-                self.add_debug_log(f"Stopped at cycle {cycles} (reached max_cycles={max_cycles})")
-            else:
-                self.add_debug_log(f"Stopped at cycle {cycles} (stuck_count={stuck_count})")
-        except Exception as exc:
-            self.add_debug_log(f"Emulator error ({type(exc).__name__}): {exc}")
+                    pstats.Stats(prof).sort_stats("cumtime").print_stats(40)
 
-    def _build_glyph_surfaces(self) -> None:
-        char_rom = self.emulator.memory.char_rom
-        if not char_rom:
-            return
+    def _fetch_glyph_rows(self, charset_ram_base: int, screen_code: int) -> bytes:
+        """Read 8 bytes of charset definition from the VIC 16K bank (video matrix RAM)."""
+        ram = self.emulator.memory.ram
+        addr = (charset_ram_base + screen_code * 8) & 0xFFFF
+        if addr <= 0xFFF8:
+            return bytes(ram[addr : addr + 8])
+        return bytes(ram[(addr + i) & 0xFFFF] for i in range(8))
 
-        if self._glyph_rom_id == id(char_rom):
-            return
-
-        pygame = self._pygame
-        glyph_count = len(char_rom) // 8
-        glyph_surfaces = []
-        for glyph_index in range(glyph_count):
-            rows = char_rom[glyph_index * 8 : (glyph_index + 1) * 8]
-            color_surfaces = []
-            for color_index in range(16):
-                surface = pygame.Surface((self.CHAR_WIDTH, self.CHAR_HEIGHT), flags=pygame.SRCALPHA)
-                fg = self._palette[color_index]
-                for y in range(self.CHAR_HEIGHT):
-                    row_bits = rows[y]
-                    for x in range(self.CHAR_WIDTH):
-                        if row_bits & (1 << (7 - x)):
-                            surface.set_at((x, y), (*fg, 255))
-                color_surfaces.append(surface)
-            glyph_surfaces.append(color_surfaces)
-
-        self._glyph_surfaces = glyph_surfaces
-        self._glyph_rom_id = id(char_rom)
-
-    def _get_charset_offset(self) -> int:
-        if not hasattr(self.emulator.memory, "_vic_regs"):
-            return 0
-        regs = self.emulator.memory._vic_regs
-        if len(regs) <= VIC_MEMORY_CONTROL_REG:
-            return 0
-        char_addr = (regs[VIC_MEMORY_CONTROL_REG] & 0x0E) << 10
-        return 0x800 if (char_addr & 0x0800) else 0
+    def _plot_hires_text_cell(self, x: int, y: int, rows: bytes, fg_idx: int) -> None:
+        """Draw an 8×8 hires glyph; unset bits leave the existing background."""
+        fg = self._palette.get(fg_idx, (255, 255, 255))
+        self._rgb_frame.plot_hires_glyph(x, y, rows, fg)
 
     def _petscii_to_screen_code(self, petscii_char: int) -> int:
         return self.emulator._petscii_to_screen_code(petscii_char)
 
+    @staticmethod
+    def _read_wrapped_charset_block(ram: bytearray, base: int) -> bytes:
+        """Read 2048 bytes (256×8) for charset at *base*, wrapping at 64K."""
+        b = base & 0xFFFF
+        out = bytearray(2048)
+        for i in range(2048):
+            out[i] = ram[(b + i) & 0xFFFF]
+        return bytes(out)
+
+    @staticmethod
+    def _charset_matches_char_rom_slice(block: bytes, char_rom: Optional[bytes]) -> Optional[int]:
+        """If *block* equals char ROM uppercase or lowercase 2K window, return that offset; else None."""
+        if not char_rom or len(block) != 2048:
+            return None
+        for off in (0, 2048):
+            if off + 2048 <= len(char_rom) and block == char_rom[off : off + 2048]:
+                return off
+        return None
+
+    def _ensure_rom_glyph_surfaces(self, char_rom: bytes, rom_offset: int) -> None:
+        """Build 256×16 blit surfaces from a char ROM slice (once per ROM object + offset)."""
+        pygame = self._pygame
+        if pygame is None:
+            return
+        key = (id(char_rom), rom_offset)
+        if key == self._rom_glyph_key and self._rom_glyph_surfaces is not None:
+            return
+        self._rom_glyph_key = key
+        block = char_rom[rom_offset : rom_offset + 2048]
+        glyphs: list = []
+        for gi in range(256):
+            rows = block[gi * 8 : (gi + 1) * 8]
+            color_layers = []
+            for ci in range(16):
+                surf = pygame.Surface((self.CHAR_WIDTH, self.CHAR_HEIGHT), flags=pygame.SRCALPHA)
+                fg = self._palette.get(ci, (255, 255, 255))
+                for yy in range(self.CHAR_HEIGHT):
+                    row_b = rows[yy]
+                    for xx in range(self.CHAR_WIDTH):
+                        if row_b & (1 << (7 - xx)):
+                            surf.set_at((xx, yy), (*fg, 255))
+                color_layers.append(surf)
+            glyphs.append(color_layers)
+        self._rom_glyph_surfaces = glyphs
+
+    def _render_text_mode_blit_rom(
+        self,
+        mode_info: dict,
+        snap: Optional[Tuple[bytes, int]],
+    ) -> None:
+        """Hires text via pygame blit using :attr:`_rom_glyph_surfaces`."""
+        if self._frame_surface is None:
+            return
+        glyphs = self._rom_glyph_surfaces
+        if not glyphs:
+            return
+        mem = self.emulator.memory.ram
+        vic_bank = self.emulator.memory.get_render_vic_bank_base()
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
+
+        if snap:
+            regb, _ = snap
+            bg_colors = [
+                regb[0x21] & 0x0F if len(regb) > 0x21 else 6,
+                regb[0x22] & 0x0F if len(regb) > 0x22 else 0,
+                regb[0x23] & 0x0F if len(regb) > 0x23 else 0,
+                regb[0x24] & 0x0F if len(regb) > 0x24 else 0,
+            ]
+        else:
+            m = self.emulator.memory
+            bg_colors = [
+                m.read(0xD021) & 0x0F,
+                m.read(0xD022) & 0x0F,
+                m.read(0xD023) & 0x0F,
+                m.read(0xD024) & 0x0F,
+            ]
+
+        screen_left = self._screen_rect.left
+        screen_top = self._screen_rect.top
+        color_base = COLOR_MEM
+        cursor_color = mem[0x0286] & 0x0F
+        dest = self._frame_surface
+
+        for row in range(self.SCREEN_ROWS):
+            row_offset = row * self.SCREEN_COLS
+            y = screen_top + row * self.CHAR_HEIGHT
+            for col in range(self.SCREEN_COLS):
+                idx = row_offset + col
+                raw_code = mem[(screen_base + idx) & 0xFFFF]
+                color_code = mem[color_base + idx] & 0x0F
+                reverse = False
+                if raw_code & 0x80:
+                    reverse = True
+                    raw_code &= 0x7F
+                code = self._petscii_to_screen_code(raw_code) & 0xFF
+                x = screen_left + col * self.CHAR_WIDTH
+                if reverse:
+                    cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                    dest.fill(cursor_bg, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
+                    glyph = glyphs[code][bg_colors[0]]
+                else:
+                    glyph = glyphs[code][color_code]
+                dest.blit(glyph, (x, y))
+
     def _render_frame(self) -> None:
         """Render one frame of the C64 screen into the back buffer.
         
-        Supports both text and bitmap modes based on VIC-II registers.
+        Uses ``get_render_display_mode()`` (latched at emulated raster line 0) so we do
+        not race IRQ handlers that toggle $D011/$D016 during the frame.
         """
-        # Get display mode information
-        mode_info = self.emulator.memory.get_display_mode()
-        
-        # Read background and border colors
-        bg_code = self.emulator.memory.read(0xD021) & 0x0F
-        border_code = self.emulator.memory.read(0xD020) & 0x0F
+        mem = self.emulator.memory
+        if mem.vic_render_snapshots and not mem.vic_snapshot_each_emulated_frame:
+            mem.snapshot_vic_render_state()
+        mode_info = mem.get_render_display_mode()
+        snap = getattr(mem, "_vic_render_snapshot", None)
+        if snap:
+            regb, _ = snap
+            bg_code = regb[0x21] & 0x0F if len(regb) > 0x21 else 6
+            border_code = regb[0x20] & 0x0F if len(regb) > 0x20 else 0x0E
+        else:
+            bg_code = mem.read(0xD021) & 0x0F
+            border_code = mem.read(0xD020) & 0x0F
         bg_color = self._palette.get(bg_code, (0, 0, 0))
         border_color = self._palette.get(border_code, (0, 0, 0))
 
-        # Fill border and background
-        self._frame_surface.fill(border_color)
-        self._frame_surface.fill(bg_color, self._screen_rect)
-        
+        multicolor_text = mode_info.get('multicolor') and not mode_info.get('extended_color')
+        simple_hires_text = (
+            not mode_info['bitmap_mode']
+            and not mode_info.get('extended_color', False)
+            and not multicolor_text
+            and self._frame_surface is not None
+            and self._pygame is not None
+        )
+
+        if simple_hires_text:
+            # Fast path only when the visible charset bytes match char ROM (one-time glyph build).
+            # RAM-based cache on every byte change rebuilt ~262k set_at/frame and was slower than RGB glyphs.
+            cr = self.emulator.memory.char_rom
+            charset_ram_base = (
+                self.emulator.memory.get_render_vic_bank_base() + mode_info["char_base"]
+            ) & 0xFFFF
+            block = self._read_wrapped_charset_block(self.emulator.memory.ram, charset_ram_base)
+            rom_off = self._charset_matches_char_rom_slice(block, cr)
+            if rom_off is not None and cr is not None:
+                self._frame_surface.fill(border_color)
+                self._frame_surface.fill(bg_color, self._screen_rect)
+                self._ensure_rom_glyph_surfaces(cr, rom_off)
+                self._render_text_mode_blit_rom(mode_info, snap)
+                self._render_sprites(snap)
+                return
+
+        # Fill border and background (RGB buffer → shared pygame surface in _setup_surfaces)
+        self._rgb_frame.fill(border_color)
+        self._rgb_frame.fill_rect(
+            self._screen_rect.left,
+            self._screen_rect.top,
+            self._screen_rect.width,
+            self._screen_rect.height,
+            bg_color,
+        )
+
         # Render based on display mode
         if mode_info['bitmap_mode']:
-            self._render_bitmap_mode(mode_info)
+            self._render_bitmap_mode(mode_info, snap)
         else:
-            self._render_text_mode(mode_info)
-        
-        # Render sprites on top
-        self._render_sprites()
-    
-    def _render_text_mode(self, mode_info: dict) -> None:
-        """Render text mode display."""
-        if not self._glyph_surfaces:
-            self._build_glyph_surfaces()
-        if not self._glyph_surfaces:
-            return
+            self._render_text_mode(mode_info, snap)
 
+        # Render sprites on top
+        self._render_sprites(snap)
+    
+    def _render_text_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
+        """Render text mode; charset definitions are read from VIC bank RAM (as the VIC would)."""
         mem = self.emulator.memory.ram
-        screen_base = mode_info['screen_base']
+        vic_bank = self.emulator.memory.get_render_vic_bank_base()
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
+        charset_ram_base = (vic_bank + mode_info['char_base']) & 0xFFFF
+        multicolor_text = mode_info.get('multicolor') and not mode_info.get('extended_color')
+
         color_base = COLOR_MEM
         screen_left = self._screen_rect.left
         screen_top = self._screen_rect.top
-        charset_offset = self._get_charset_offset()
-        glyph_base = charset_offset >> 3
-        glyph_count = len(self._glyph_surfaces)
-        
-        # Get background colors for extended color mode
-        bg_colors = [
-            self.emulator.memory.read(0xD021) & 0x0F,
-            self.emulator.memory.read(0xD022) & 0x0F,
-            self.emulator.memory.read(0xD023) & 0x0F,
-            self.emulator.memory.read(0xD024) & 0x0F,
-        ]
+
+        if snap:
+            regb, _ = snap
+            bg_colors = [
+                regb[0x21] & 0x0F if len(regb) > 0x21 else 6,
+                regb[0x22] & 0x0F if len(regb) > 0x22 else 0,
+                regb[0x23] & 0x0F if len(regb) > 0x23 else 0,
+                regb[0x24] & 0x0F if len(regb) > 0x24 else 0,
+            ]
+        else:
+            m = self.emulator.memory
+            bg_colors = [
+                m.read(0xD021) & 0x0F,
+                m.read(0xD022) & 0x0F,
+                m.read(0xD023) & 0x0F,
+                m.read(0xD024) & 0x0F,
+            ]
 
         # Cursor color
         cursor_color = mem[0x0286] & 0x0F
@@ -393,42 +613,97 @@ class PygameInterface:
             y = screen_top + row * self.CHAR_HEIGHT
             for col in range(self.SCREEN_COLS):
                 idx = row_offset + col
-                raw_code = mem[screen_base + idx]
+                raw_code = mem[(screen_base + idx) & 0xFFFF]
                 color_code = mem[color_base + idx] & 0x0F
                 reverse = False
-                
+
                 # Handle reversed characters (cursor)
                 if raw_code & 0x80:
                     reverse = True
                     raw_code &= 0x7F
-                
+
                 code = self._petscii_to_screen_code(raw_code)
                 x = screen_left + col * self.CHAR_WIDTH
-                
-                # Handle extended color mode
+
                 if mode_info['extended_color']:
                     bg_index = (code >> 6) & 0x03
                     code &= 0x3F
                     char_bg_color = self._palette.get(bg_colors[bg_index], (0, 0, 0))
-                    self._frame_surface.fill(char_bg_color, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
-                
-                if reverse:
-                    # Reversed character (cursor)
-                    cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
-                    self._frame_surface.fill(cursor_bg, (x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT))
-                    glyph_index = (glyph_base + code) % glyph_count
-                    glyph = self._glyph_surfaces[glyph_index][bg_colors[0]]
+                    self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, char_bg_color)
+                    row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                    if reverse:
+                        cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                        self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)
+                        self._plot_hires_text_cell(x, y, row_bytes, bg_colors[0])
+                    else:
+                        self._plot_hires_text_cell(x, y, row_bytes, color_code)
+                elif multicolor_text:
+                    row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                    if reverse:
+                        row_bytes = bytes(b ^ 0xFF for b in row_bytes)
+                    if color_code & 0x08:
+                        self._plot_multicolor_text_cell(
+                            x,
+                            y,
+                            row_bytes,
+                            color_code & 0x07,
+                            bg_colors[0],
+                            bg_colors[1],
+                            bg_colors[2],
+                        )
+                    else:
+                        if reverse:
+                            cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                            self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)
+                            self._plot_hires_text_cell(x, y, row_bytes, bg_colors[0])
+                        else:
+                            self._plot_hires_text_cell(x, y, row_bytes, color_code & 0x07)
                 else:
-                    glyph_index = (glyph_base + code) % glyph_count
-                    glyph = self._glyph_surfaces[glyph_index][color_code]
-                
-                self._frame_surface.blit(glyph, (x, y))
-    
-    def _render_bitmap_mode(self, mode_info: dict) -> None:
+                    row_bytes = self._fetch_glyph_rows(charset_ram_base, code)
+                    if reverse:
+                        cursor_bg = self._palette.get(cursor_color, (255, 255, 255))
+                        self._rgb_frame.fill_rect(x, y, self.CHAR_WIDTH, self.CHAR_HEIGHT, cursor_bg)
+                        self._plot_hires_text_cell(x, y, row_bytes, bg_colors[0])
+                    else:
+                        self._plot_hires_text_cell(x, y, row_bytes, color_code)
+
+    def _plot_multicolor_text_cell(
+        self,
+        x: int,
+        y: int,
+        rows: bytes,
+        char_color_idx: int,
+        bg_i: int,
+        c1_i: int,
+        c2_i: int,
+    ) -> None:
+        """Draw one 8x8 multicolor text cell (6569 MCM + color bit 3 set)."""
+        p0 = self._palette.get(bg_i, (0, 0, 0))
+        p1 = self._palette.get(c1_i, (0, 0, 0))
+        p2 = self._palette.get(c2_i, (0, 0, 0))
+        p3 = self._palette.get(char_color_idx, (0, 0, 0))
+        for yy in range(8):
+            b = rows[yy]
+            py = y + yy
+            for pair in range(4):
+                bits = (b >> (6 - pair * 2)) & 0x03
+                if bits == 0:
+                    c = p0
+                elif bits == 1:
+                    c = p1
+                elif bits == 2:
+                    c = p2
+                else:
+                    c = p3
+                px = x + pair * 2
+                self._rgb_frame.fill_rect(px, py, 2, 1, c)
+
+    def _render_bitmap_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render bitmap mode display (standard or multicolor)."""
         mem = self.emulator.memory.ram
-        bitmap_base = mode_info['bitmap_base']
-        screen_base = mode_info['screen_base']
+        vic_bank = self.emulator.memory.get_render_vic_bank_base()
+        bitmap_base = (vic_bank + mode_info['bitmap_base']) & 0xFFFF
+        screen_base = (vic_bank + mode_info['screen_base']) & 0xFFFF
         screen_left = self._screen_rect.left
         screen_top = self._screen_rect.top
         
@@ -438,7 +713,7 @@ class PygameInterface:
                 char_index = char_row * 40 + char_col
                 
                 # Get color data from screen memory
-                color_data = mem[screen_base + char_index]
+                color_data = mem[(screen_base + char_index) & 0xFFFF]
                 color_mem = mem[COLOR_MEM + char_index] & 0x0F
                 
                 # Get bitmap data for this 8x8 block
@@ -452,13 +727,17 @@ class PygameInterface:
                     # 01 = upper nibble of screen RAM
                     # 10 = lower nibble of screen RAM  
                     # 11 = color RAM
-                    bg_color = self.emulator.memory.read(0xD021) & 0x0F
+                    if snap:
+                        regb, _ = snap
+                        bg_color = regb[0x21] & 0x0F if len(regb) > 0x21 else 6
+                    else:
+                        bg_color = self.emulator.memory.read(0xD021) & 0x0F
                     color1 = (color_data >> 4) & 0x0F
                     color2 = color_data & 0x0F
                     color3 = color_mem
                     
                     for row in range(8):
-                        byte = mem[bitmap_base + bitmap_offset + row]
+                        byte = mem[(bitmap_base + bitmap_offset + row) & 0xFFFF]
                         y = screen_top + char_row * 8 + row
                         
                         # Process 4 pixel pairs (8 pixels total, but 4 wide pixels)
@@ -477,7 +756,7 @@ class PygameInterface:
                             
                             # Draw double-wide pixel
                             x = screen_left + char_col * 8 + bit_pair * 2
-                            self._frame_surface.fill(pixel_color, (x, y, 2, 1))
+                            self._rgb_frame.fill_rect(x, y, 2, 1, pixel_color)
                 else:
                     # Standard hi-res bitmap mode: 320x200
                     # 1 = upper nibble of screen RAM
@@ -486,7 +765,7 @@ class PygameInterface:
                     color0 = color_data & 0x0F
                     
                     for row in range(8):
-                        byte = mem[bitmap_base + bitmap_offset + row]
+                        byte = mem[(bitmap_base + bitmap_offset + row) & 0xFFFF]
                         y = screen_top + char_row * 8 + row
                         
                         # Process 8 pixels
@@ -495,33 +774,35 @@ class PygameInterface:
                             pixel_color = self._palette.get(color1 if pixel_bit else color0, (0, 0, 0))
                             
                             x = screen_left + char_col * 8 + bit
-                            self._frame_surface.set_at((x, y), pixel_color)
+                            self._rgb_frame.put_pixel(x, y, pixel_color)
     
-    def _render_sprites(self) -> None:
+    def _render_sprites(self, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render sprites on top of the display."""
-        pygame = self._pygame
-        if not pygame:
+        if self._rgb_frame is None:
             return
-        
+
         mem = self.emulator.memory.ram
         screen_left = self._screen_rect.left
         screen_top = self._screen_rect.top
         
-        # Sprite multicolor shared colors
-        sprite_mc0 = self.emulator.memory.read(0xD025) & 0x0F
-        sprite_mc1 = self.emulator.memory.read(0xD026) & 0x0F
+        if snap:
+            regb, _ = snap
+            sprite_mc0 = regb[0x25] & 0x0F if len(regb) > 0x25 else 0
+            sprite_mc1 = regb[0x26] & 0x0F if len(regb) > 0x26 else 0
+        else:
+            sprite_mc0 = self.emulator.memory.read(0xD025) & 0x0F
+            sprite_mc1 = self.emulator.memory.read(0xD026) & 0x0F
         
         # Render sprites 0-7 (back to front)
         for sprite_num in range(8):
-            sprite_data = self.emulator.memory.get_sprite_data(sprite_num)
+            sprite_data = self.emulator.memory.get_sprite_data(sprite_num, for_render=True)
             
             if not sprite_data['enabled']:
                 continue
             
-            # Get sprite bitmap data (63 bytes per sprite)
-            sprite_ptr = sprite_data['pointer']
-            sprite_addr = sprite_ptr * 64
-            
+            # Get sprite bitmap data (63 bytes per sprite) in VIC bank RAM
+            sprite_addr = sprite_data['sprite_ram_base']
+
             # Sprites are 24x21 pixels
             # Offset sprite coordinates to screen space
             # VIC-II sprite coordinates are relative to the display area, not the border
@@ -536,11 +817,8 @@ class PygameInterface:
                 # Multicolor sprite: 12x21 (double-wide pixels)
                 for row in range(21):
                     # Each row is 3 bytes
-                    byte_offset = sprite_addr + row * 3
-                    if byte_offset + 2 >= len(mem):
-                        continue
-                    
-                    row_data = (mem[byte_offset] << 16) | (mem[byte_offset + 1] << 8) | mem[byte_offset + 2]
+                    byte_offset = (sprite_addr + row * 3) & 0xFFFF
+                    row_data = (mem[byte_offset] << 16) | (mem[(byte_offset + 1) & 0xFFFF] << 8) | mem[(byte_offset + 2) & 0xFFFF]
                     
                     for bit_pair in range(12):
                         pixel_bits = (row_data >> (22 - bit_pair * 2)) & 0x03
@@ -560,15 +838,12 @@ class PygameInterface:
                         # Check if pixel is within screen rect bounds
                         if (self._screen_rect.left <= px < self._screen_rect.right and 
                             self._screen_rect.top <= py < self._screen_rect.bottom):
-                            self._frame_surface.fill(color, (px, py, 2, 1))
+                            self._rgb_frame.fill_rect(px, py, 2, 1, color)
             else:
                 # Hi-res sprite: 24x21
                 for row in range(21):
-                    byte_offset = sprite_addr + row * 3
-                    if byte_offset + 2 >= len(mem):
-                        continue
-                    
-                    row_data = (mem[byte_offset] << 16) | (mem[byte_offset + 1] << 8) | mem[byte_offset + 2]
+                    byte_offset = (sprite_addr + row * 3) & 0xFFFF
+                    row_data = (mem[byte_offset] << 16) | (mem[(byte_offset + 1) & 0xFFFF] << 8) | mem[(byte_offset + 2) & 0xFFFF]
                     
                     for bit in range(24):
                         pixel_bit = (row_data >> (23 - bit)) & 0x01
@@ -579,7 +854,7 @@ class PygameInterface:
                             # Check if pixel is within screen rect bounds
                             if (self._screen_rect.left <= px < self._screen_rect.right and 
                                 self._screen_rect.top <= py < self._screen_rect.bottom):
-                                self._frame_surface.set_at((px, py), sprite_color)
+                                self._rgb_frame.put_pixel(px, py, sprite_color)
 
     def _ascii_to_petscii(self, char: str) -> int:
         if not char:

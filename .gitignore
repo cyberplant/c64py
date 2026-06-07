@@ -4,6 +4,10 @@ __pycache__/
 
 # C extensions
 *.so
+*.dylib
+
+# Local reSID source tree (nested clone / autotools build from setup_resid.sh; not part of this repo)
+src/resid_wrapper/resid/
 
 # Distribution / packaging
 build/
@@ -27,8 +31,19 @@ htmlcov/
 .tox/
 .nox/
 
+# Local logs and benchmark NDJSON (see scripts/run_benchmark.sh)
+logs/*
+*.log
+
+# C64 Copyrighted roms
+roms/
+
+# Compiled files
+*.prg
+*.d64
+
 # Editors / OS
 .DS_Store
 .idea/
 .vscode/
-
+.aider*

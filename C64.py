@@ -15,14 +15,18 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
+import json
 import os
 import sys
 import time
+from argparse import Namespace
+from pathlib import Path
 from typing import Optional
 
 # Handle both direct execution and module import
 try:
-    from .debug import UdpDebugLogger
+    from .debug import UdpDebugLogger, ViceTraceLogger
     from .emulator import C64
     from .server import EmulatorServer
     from .constants import (
@@ -39,7 +43,7 @@ try:
 except ImportError:
     # When run directly, add parent directory to path
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from c64py.debug import UdpDebugLogger
+    from c64py.debug import UdpDebugLogger, ViceTraceLogger
     from c64py.emulator import C64
     from c64py.server import EmulatorServer
     from c64py.constants import (
@@ -90,6 +94,76 @@ def _show_speed(
             print(f"Speed:  {mhz:.2f} MHz")
 
 
+def _print_benchmark_record(args: Namespace, emu: "C64", *, wall_start_fallback: float) -> None:
+    """Single-line JSON for scripts: grep '^C64PY_BENCHMARK '."""
+    cycles = emu.current_cycles
+    t0 = getattr(emu, "_speed_throttle_run_wall_start", None)
+    if t0 is not None and cycles > 0:
+        elapsed = time.perf_counter() - t0
+    else:
+        elapsed = time.perf_counter() - wall_start_fallback
+    mhz = (cycles / elapsed / 1e6) if elapsed > 0 and cycles > 0 else 0.0
+    prg = getattr(args, "prg_file", None)
+    rec = {
+        "C64PY_BENCHMARK": 1,
+        "accurate_vic": bool(args.accurate_vic),
+        "cycles": cycles,
+        "emulated_cpu_mhz": round(mhz, 4),
+        "enable_resid": bool(args.enable_resid),
+        "enable_sid": bool(args.enable_sid),
+        "max_cycles_arg": args.max_cycles,
+        "prg": os.path.basename(prg) if prg else None,
+        "schema": 1,
+        "target_hz": emu.target_cpu_hz,
+        "turbo": bool(args.turbo),
+        "video_standard": args.video_standard,
+        "wall_seconds": round(elapsed, 6),
+    }
+    print("C64PY_BENCHMARK " + json.dumps(rec, sort_keys=True))
+
+
+def _parse_debug_inject_pair(lhs_s: str, val_s: str, *, source: str) -> tuple[int | str, int]:
+    val = int(val_s.strip(), 16)
+    if lhs_s in ("a", "x", "y", "p", "flags"):
+        return (lhs_s if lhs_s != "flags" else "p", val)
+    return (int(lhs_s, 16), val)
+
+
+def _parse_debug_inject_map_string(map_str: str) -> list[tuple[int | str, int]]:
+    pairs: list[tuple[int | str, int]] = []
+    for part in map_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            print(
+                f"ERROR: bad --debug-inject-map fragment {part!r} (want addr=val)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        lhs, rhs = part.split("=", 1)
+        pairs.append(_parse_debug_inject_pair(lhs.strip().lower(), rhs, source="--debug-inject-map"))
+    return pairs
+
+
+def _parse_debug_inject_file(path: str) -> list[tuple[int | str, int]]:
+    p = Path(path)
+    if not p.is_file():
+        print(f"ERROR: --debug-inject-file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    pairs: list[tuple[int | str, int]] = []
+    for lineno, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "=" not in s:
+            print(f"ERROR: {path}:{lineno}: expected addr=value or reg=value", file=sys.stderr)
+            sys.exit(1)
+        lhs, rhs = s.split("=", 1)
+        pairs.append(_parse_debug_inject_pair(lhs.strip().lower(), rhs, source=f"{path}:{lineno}"))
+    return pairs
+
+
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -101,10 +175,20 @@ def main():
         default=None,
         help="Directory containing ROM files (default: auto-detect common locations)",
     )
+    ap.add_argument("--disk", type=str, help="D64 disk image to attach to drive 8")
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
     ap.add_argument("--dump-memory", help="Dump memory to file after execution")
+    ap.add_argument(
+        "--dump-hex-range",
+        metavar="START-END",
+        default=None,
+        help=(
+            "After run (non-graphics path), print hex dump of inclusive RAM [START,END] hex, "
+            "e.g. C200-C2FF, plus sha256 of that byte range (for compare vs VICE monitor m …)."
+        ),
+    )
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
     ap.add_argument("--udp-debug", action="store_true", help="Send debug events via UDP")
     ap.add_argument("--autoquit", action="store_true", help="Automatically quit when max cycles is reached")
@@ -116,7 +200,12 @@ def main():
     ap.add_argument("--fullscreen", action="store_true", help="Show only C64 screen output (no debug panel or status bar)")
     ap.add_argument("--graphics", action="store_true", help="Render output in a pygame graphics window")
     ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
-    ap.add_argument("--graphics-fps", type=int, default=30, help="Graphics target FPS (default: 30)")
+    ap.add_argument(
+        "--graphics-fps",
+        type=int,
+        default=30,
+        help="Graphics target FPS / max host present rate (default: 30)",
+    )
     ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
     ap.add_argument("--enable-sid", action="store_true", help="Enable SID audio output via pygame")
     ap.add_argument(
@@ -129,14 +218,78 @@ def main():
     )
     ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
+    ap.add_argument("--vice-trace", type=str, metavar="FILE", help="Write VICE-compatible CPU trace to FILE for comparison debugging")
+    ap.add_argument(
+        "--vice-trace-wall",
+        action="store_true",
+        help="With --vice-trace: record host seconds since previous line (monotonic) for profiling between instructions",
+    )
+    ap.add_argument(
+        "--vice-trace-inline-wall",
+        action="store_true",
+        help="With --vice-trace: same as wall time but append ' ; w <sec>' on the instruction line instead of a separate '; w' line",
+    )
+    ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
+    ap.add_argument(
+        "--accurate-vic",
+        action="store_true",
+        help="Enable cycle-accurate VIC/BA timing (slower, more accurate). Default is fast coarse VIC timing.",
+    )
+    ap.add_argument(
+        "--debug-inject-at-cycle",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "One-shot experiment: on the first instruction fetch with cumulative CPU cycles >= N, "
+            "poke addresses from --debug-inject-map (then continue normally). Printed on stderr."
+        ),
+    )
+    ap.add_argument(
+        "--debug-inject-map",
+        type=str,
+        default=None,
+        metavar="MAP",
+        help=(
+            "With --debug-inject-at-cycle: comma-separated pairs. RAM: hex addr=value (e.g. 2f=53,30=e7). "
+            "CPU regs: a=, x=, y=, p= (e.g. a=d6,x=da to match a VICE snapshot). "
+            "Optional if --debug-inject-file is set."
+        ),
+    )
+    ap.add_argument(
+        "--debug-inject-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "With --debug-inject-at-cycle: text file of addr=value lines (hex), # comments OK. "
+            "Useful for stack page from VICE (m 0100 01ff). Applied before --debug-inject-map (map overrides)."
+        ),
+    )
 
     args = ap.parse_args()
-    
+
+    has_inject_src = bool(args.debug_inject_map or args.debug_inject_file)
+    if args.debug_inject_at_cycle is not None and not has_inject_src:
+        print(
+            "ERROR: --debug-inject-map and/or --debug-inject-file is required with --debug-inject-at-cycle",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if has_inject_src and args.debug_inject_at_cycle is None:
+        print(
+            "ERROR: --debug-inject-at-cycle is required with --debug-inject-map / --debug-inject-file",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # --benchmark implies other flags and loads benchmark PRG
     if args.benchmark:
         args.turbo = True
         args.autoquit = True
         args.no_colors = True
+        if not args.graphics:
+            args.headless = True
         if args.max_cycles is None:
             args.max_cycles = 15_000_000  # Enough cycles for benchmark to complete
         # Auto-load benchmark PRG if no file specified
@@ -146,12 +299,14 @@ def main():
                 args.prg_file = benchmark_prg
             else:
                 print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
-                print("Run: compile.sh to build it")
+                print("Run: ./compile.sh to build it (needs VICE petcat).")
     
     # Track start time for speed calculation
     start_time = time.perf_counter()
 
     interface_factory = None
+    if args.headless:
+        interface_factory = lambda _emu: None
     if args.graphics:
         try:
             from .graphics import PygameInterface
@@ -165,45 +320,81 @@ def main():
             border_size=args.graphics_border,
         )
 
-    emu = C64(interface_factory=interface_factory, enable_sid=args.enable_sid, enable_resid=args.enable_resid)
+    emu = C64(
+        interface_factory=interface_factory,
+        enable_sid=args.enable_sid,
+        enable_resid=args.enable_resid,
+        accurate_vic=args.accurate_vic,
+    )
+    # Pygame needs latched VIC regs for rendering; headless skips copies for throughput.
+    emu.memory.vic_render_snapshots = bool(args.graphics)
+    # Fast VIC: latch when pygame presents (~Hz), not every emulated PAL frame (turbo regression).
+    # Accurate VIC: keep CPU-thread snapshot at each emulated frame for cycle-stable sampling.
+    emu.memory.vic_snapshot_each_emulated_frame = bool(args.graphics) and bool(args.accurate_vic)
+    if args.debug_inject_at_cycle is not None:
+        inject_pairs: list[tuple[int | str, int]] = []
+        if args.debug_inject_file:
+            inject_pairs.extend(_parse_debug_inject_file(args.debug_inject_file))
+        if args.debug_inject_map:
+            inject_pairs.extend(_parse_debug_inject_map_string(args.debug_inject_map))
+        if not inject_pairs:
+            print("ERROR: no inject entries after parsing file/map", file=sys.stderr)
+            sys.exit(1)
+        emu.cpu.debug_inject_at_cycle = args.debug_inject_at_cycle
+        emu.cpu.debug_inject_writes = inject_pairs
     emu.debug = args.debug
     emu.autoquit = args.autoquit
     emu.turbo = args.turbo
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
+    vic_mode_name = "accurate" if args.accurate_vic else "fast"
+    print(f"VIC mode: {vic_mode_name}")
     if args.debug:
         emu.cpu.enable_trace(1024)
-    supports_ui_logs = hasattr(emu.interface, "fullscreen")
+    supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")
     if supports_ui_logs:
         emu.interface.fullscreen = args.fullscreen
-    show_ui_logs = (not args.fullscreen) if supports_ui_logs else True
-    if args.debug and show_ui_logs:
+    show_ui_logs = (not args.fullscreen) if supports_ui_logs else False
+    if args.debug and show_ui_logs and emu.interface is not None:
         emu.interface.add_debug_log("🐛 Debug mode enabled")
 
     # Setup UDP debug logging if requested
     if args.udp_debug:
         emu.udp_debug = UdpDebugLogger(port=args.udp_debug_port, host=args.udp_debug_host)
         emu.udp_debug.enable()
-        if show_ui_logs:
+        if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📡 UDP debug logging enabled: {args.udp_debug_host}:{args.udp_debug_port}")
         # Test UDP connection
         try:
             test_msg = {'type': 'test', 'message': 'UDP debug initialized'}
             emu.udp_debug.send('test', test_msg)
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("✅ UDP test message sent successfully")
         except Exception as e:
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"❌ UDP test failed: {e}")
 
     # Pass UDP debug logger to memory
     if emu.udp_debug:
         emu.memory.udp_debug = emu.udp_debug
 
+    # Setup VICE-compatible trace logging if requested
+    vice_trace = None
+    if args.vice_trace:
+        vice_trace = ViceTraceLogger(
+            filename=args.vice_trace,
+            wall_time=args.vice_trace_wall or args.vice_trace_inline_wall,
+            wall_inline=args.vice_trace_inline_wall,
+        )
+        vice_trace.enable()
+        emu.vice_trace = vice_trace
+        if show_ui_logs and emu.interface is not None:
+            emu.interface.add_debug_log(f"📝 VICE trace logging to: {args.vice_trace}")
+
     try:
         # Video standard (memory + SID/reSID clock when audio is enabled)
         emu.set_video_standard(args.video_standard)
-        if show_ui_logs:
+        if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"📺 Video standard: {args.video_standard.upper()}")
 
         # Load ROMs (auto-detect common locations if not provided).
@@ -216,10 +407,8 @@ def main():
         try:
             explicit_rom_dir = args.rom_dir
             if explicit_rom_dir and not os.path.isabs(explicit_rom_dir):
-                # Backward-compatible: interpret relative paths relative to the repo root
-                # (this script lives in c64py/, so parent is project root).
-                parent_dir = os.path.dirname(script_dir)
-                explicit_rom_dir = os.path.normpath(os.path.join(parent_dir, explicit_rom_dir))
+                # Relative to the directory containing this script (repo root when C64.py is there).
+                explicit_rom_dir = os.path.normpath(os.path.join(script_dir, explicit_rom_dir))
 
             rom_dir_path = ensure_roms_available(
                 explicit_rom_dir,
@@ -227,7 +416,7 @@ def main():
                 require_char_rom=args.graphics,
             )
             emu.load_roms(str(rom_dir_path), require_char_rom=args.graphics)
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"💾 ROM directory: {rom_dir_path}")
         except Exception as e:
             # Ensure UI is not left running, then show a clear error.
@@ -242,15 +431,37 @@ def main():
         # Store PRG file path for loading after boot (BASIC boot clears $0801-$0802)
         if args.prg_file:
             emu.prg_file_path = args.prg_file
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {args.prg_file}")
+
+        # Store D64 disk image path for attaching after boot
+        if args.disk:
+            emu.disk_image_path = args.disk
+            if show_ui_logs and emu.interface is not None:
+                emu.interface.add_debug_log(f"💾 D64 disk will be attached after BASIC boot: {args.disk}")
+
+        # Initialize CPU (use _read_word to ensure correct byte order and ROM mapping)
+        reset_vector = emu.cpu._read_word(0xFFFC)
+        emu.cpu.state.pc = reset_vector
+        if show_ui_logs and emu.interface is not None:
+            emu.interface.add_debug_log(f"🔄 Reset vector: ${reset_vector:04X}")
+
+        if args.debug and show_ui_logs and emu.interface is not None:
+            emu.interface.add_debug_log(
+                f"🖥️ Initial CPU state: PC=${emu.cpu.state.pc:04X}, A=${emu.cpu.state.a:02X}, "
+                f"X=${emu.cpu.state.x:02X}, Y=${emu.cpu.state.y:02X}"
+            )
+            emu.interface.add_debug_log(f"💾 Memory config ($01): ${emu.memory.ram[0x01]:02X}")
+            emu.interface.add_debug_log(
+                f"📺 Screen memory sample ($0400-$040F): {[hex(emu.memory.ram[0x0400 + i]) for i in range(16)]}"
+            )
 
         # Start server if requested (runs in parallel with UI)
         server = None
         if args.tcp_port or args.udp_port:
             server = EmulatorServer(emu, tcp_port=args.tcp_port, udp_port=args.udp_port)
             server.start()
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("📡 TCP/UDP server started")
                 emu.interface.add_debug_log("📡 Server commands: STATUS, STEP, RUN, MEMORY, DUMP, SCREEN, LOAD")
             print("Server started on port(s): ", end="")
@@ -263,9 +474,9 @@ def main():
             print()
 
         # Start graphics interface if requested
-        if args.graphics:
+        if args.graphics and emu.interface is not None:
             emu.interface.max_cycles = args.max_cycles
-            if show_ui_logs:
+            if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("🎨 Graphics interface active")
             try:
                 emu.interface.run()
@@ -280,10 +491,12 @@ def main():
                 server.running = False
             # Show emulation speed
             _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
+            if args.benchmark:
+                _print_benchmark_record(args, emu, wall_start_fallback=start_time)
             return
 
         # Start Textual interface (unless explicitly disabled with --no-colors)
-        if not args.no_colors:
+        if (not args.no_colors) and (emu.interface is not None):
             emu.interface.max_cycles = args.max_cycles
             # fullscreen flag already set earlier
             if show_ui_logs:
@@ -304,6 +517,8 @@ def main():
                 server.running = False
             # Show emulation speed
             _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
+            if args.benchmark:
+                _print_benchmark_record(args, emu, wall_start_fallback=start_time)
             return  # Exit after Textual interface closes
 
         # This code should never be reached since Textual blocks
@@ -365,6 +580,27 @@ def main():
                         f"SP=${entry['sp']:02X} P=${entry['p']:02X}"
                     )
 
+        if args.dump_hex_range:
+            rng = args.dump_hex_range.replace(" ", "").lower()
+            if "-" not in rng:
+                print("ERROR: --dump-hex-range wants START-END (hex), e.g. C200-C2FF", file=sys.stderr)
+                sys.exit(1)
+            lo_s, hi_s = rng.split("-", 1)
+            lo, hi = int(lo_s, 16) & 0xFFFF, int(hi_s, 16) & 0xFFFF
+            if lo > hi:
+                lo, hi = hi, lo
+            blob = bytes(emu.memory.ram[lo : hi + 1])
+            digest = hashlib.sha256(blob).hexdigest()
+            print(
+                f"\n=== dump-hex-range ${lo:04X}-${hi:04X} "
+                f"cpu_cycles={emu.current_cycles} sha256={digest} ==="
+            )
+            for base in range(lo, hi + 1, 16):
+                chunk_end = min(base + 16, hi + 1)
+                chunk = emu.memory.ram[base:chunk_end]
+                hexb = " ".join(f"{b:02X}" for b in chunk)
+                print(f"${base:04X}: {hexb}")
+
         # Dump memory if requested
         if args.dump_memory:
             memory_dump = emu.dump_memory()
@@ -390,10 +626,17 @@ def main():
 
         # Show emulation speed
         _show_speed(emu, emu.current_cycles, wall_start_fallback=start_time, target_hz=emu.target_cpu_hz)
+        if args.benchmark:
+            _print_benchmark_record(args, emu, wall_start_fallback=start_time)
 
         # Close UDP debug logger (flush all pending messages)
         if emu.udp_debug:
             emu.udp_debug.close()
+        
+        # Close VICE trace logger
+        if vice_trace:
+            vice_trace.close()
+            print(f"VICE trace written to: {args.vice_trace}")
     finally:
         emu.shutdown()
 

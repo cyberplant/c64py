@@ -1,12 +1,17 @@
 name: CI
 
+# Run on main pushes and on PRs targeting main — not on every feature-branch push (avoids
+# duplicate runs with pull_request). Draft PRs are skipped until marked ready for review.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
