@@ -545,20 +545,11 @@ impl ViciiEngine {
     pub fn step(&mut self, mem: &mut C64MemoryMap<'_>) -> (bool, bool) {
         self.sync_shadow_from_mem(mem);
 
-        let mut line_advanced = false;
-        self.raster_cycle += 1;
-        if self.raster_cycle >= self.cycles_per_line {
-            self.raster_cycle = 0;
-            self.raster_line = (self.raster_line + 1) % self.num_raster_lines;
-            line_advanced = true;
-            self.cycle_start_of_line();
-            // Detect sprite collisions at the start of each new scanline
-            self.detect_collisions(mem);
-        }
+        let rc = self.raster_cycle;
 
         // VICE sprite DMA state machine (vicii-cycle.c) at PAL cycles 16/55/56
         // (0-based indices 15/54/55). Must run BEFORE BA computation below.
-        match self.raster_cycle {
+        match rc {
             15 => self.sprite_mcbase_update(),
             54 => self.check_sprite_dma(),
             55 => {
@@ -579,14 +570,7 @@ impl ViciiEngine {
             }
         }
 
-        let irq_edge = if self.raster_line == self.raster_irq_line && line_advanced {
-            // Trigger IRQ when raster line advances to the IRQ line
-            true
-        } else {
-            false
-        };
-
-        let idx = self.raster_cycle as usize;
+        let idx = rc as usize;
         let (sprite_ba_mask, fetch_ba, _phi2, _vis) = if mem.video_standard == 0 {
             PAL_6569R3_CYCLE_TABLE[idx]
         } else {
@@ -612,6 +596,19 @@ impl ViciiEngine {
 
         // ba_blocks_cpu: matches Python ViciiCycleEngine — stall only after prefetch drained.
         let ba_blocks_cpu = ba_low && (self.prefetch_cycles == 0);
+
+        let mut line_advanced = false;
+        self.raster_cycle += 1;
+        if self.raster_cycle >= self.cycles_per_line {
+            self.raster_cycle = 0;
+            self.raster_line = (self.raster_line + 1) % self.num_raster_lines;
+            line_advanced = true;
+            self.cycle_start_of_line();
+            // Detect sprite collisions at the start of each new scanline
+            self.detect_collisions(mem);
+        }
+
+        let irq_edge = self.raster_line == self.raster_irq_line && line_advanced;
 
         mem.raster_line = self.raster_line;
         mem.raster_cycles = self.raster_cycle;
