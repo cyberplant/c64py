@@ -29,8 +29,16 @@ Omit both to run **without** an inserted image (TCP `attach_disk` / fast RPC onl
 
 ## C64 with ``--tcp-drive``: KERNAL vs IEC JSON
 
-- **`LOAD` / `SAVE`** (devices 8–11) normally use the host KERNAL shortcuts and the TCP **`fast_load`** / **`fast_save`** JSON messages. You should see ``SAVE`` / ``fast_load`` lines in the drive log.
-- **`OPEN` / `PRINT#` / `INPUT#` / `CLOSE`** go through the KERNAL’s **CIA2 bit-level IEC** implementation. c64py applies those lines to the bus, but **does not yet** decode them into the logical ``IECBus.send_command`` / ``send_byte`` stream that ``TcpDriveClient`` forwards as JSON. So **BASIC sequential file I/O over ``--tcp-drive`` does not work** today (the guest can sit in the OPEN routine until ``--max-cycles``). Use a **local** auto-spawned drive (pass a ``.d64`` without ``--tcp-drive``) for ``OPEN``/SEQ, or keep remote workflows to **LOAD/SAVE** only until the bridge is finished (roadmap: ``docs/plans/release_blockers_iec_percycle_vic.md``). **Phase 0** in the tree records line transitions in ``iec_kernal_bridge.KernalIecTap`` when TCP drives are attached—foundation for the decoder, not user-visible yet.
+- **`LOAD` / `SAVE`** (devices 8–11) use the host KERNAL shortcuts and TCP
+  **`fast_load`** / **`fast_save`** JSON when `kernal_load_shortcut_enabled` is
+  on (default for all TCP clients, including auto-spawn).
+- **`OPEN` / `PRINT#` / `INPUT#` / `CLOSE`** can work over TCP via
+  [`kernal_tcp_iec_hooks.py`](../kernal_tcp_iec_hooks.py) (same shortcut gate).
+  For CIA2 bit-bang paths without those hooks, set **`C64PY_IEC_WIRE_DECODE=1`**
+  so [`KernalIecTap`](../iec_kernal_bridge.py) decodes wire transitions into
+  logical `IECBus` commands forwarded as JSON
+  (`test/test_iec_tcp_wire_integration.py`). Coverage is still partial — treat
+  complex BASIC disk I/O as a regression target (`test/fixtures/README_disk_bas.md`).
 
 The ``test/fixtures/disk_host_*.bas`` listings intentionally include **``OPEN`` / ``PRINT#``** (and **``SAVE``**) so they remain **regression targets** once the KERNAL→logical bridge lands; see ``test/fixtures/README_disk_bas.md``.
 
@@ -63,7 +71,7 @@ Line booleans follow the ``IECBus`` convention: ``true`` means released/high, ``
 
 ## `--emulation`
 
-Same tier names as `[emulation] disk_emulation` in `c64py.toml` (used when the C64 auto-spawns a headless drive). See `docs/disk_support.md`.
+Same tier names as `[emulation] disk_emulation` in `c64py.toml` (used when the C64 auto-spawns a headless drive). See [disk_support.md](disk_support.md) for architecture and tier details.
 
 | Value | Behavior |
 |---|---|

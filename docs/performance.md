@@ -18,7 +18,7 @@ This document summarizes **where time is spent** today and reasonable **directio
 | VIC | `vicii_cycle.py` + integration in `cpu.py` (`_vic_tick_one` vs `_advance_raster`). |
 | Host video | `graphics.py`: pygame presenter; pixels built in `presenter.RgbFrameBuffer` then uploaded (see `presenter.py`). Moderate cost vs core except at high scale / per-pixel paths. |
 | Audio | `resid.py` / SID; can compete with CPU depending on buffer and host. |
-| Disk / IEC | `drive1541.py`, `iec_bus.py` when the disk is active. |
+| Disk / IEC | `drives/c1541_emulator.py`, `drives/drive.py`, `iec_bus.py` when the disk is active. |
 
 ## Graphics + ReSID + turbo regression canary
 
@@ -68,7 +68,7 @@ Mitigations and tooling live in-tree: **`C64PY_PROFILE_CPU_THREAD`**, **`scripts
 ### Closing the gap
 
 - **Python:** Batching presenter updates (fewer tiny `fill_rect` / pixel calls) is the most realistic win for **`--graphics`** without dropping features.
-- **Native core:** An **optional** Rust extension (`c64py_rust_core` / `CPU6502.step_fast_batch`) exists for the fast-VIC path; see [rust_core.md](rust_core.md).
+- **Native core:** An **optional** Rust extension (`c64py_rust_core` / `CPU6502.step_fast_batch`) drives the **`fast`** and **`accurate-rust`** CPU paths when built; see [rust_core.md](rust_core.md).
 
 Merging **`main`** with the current branch is **compatible** with accepting this throughput trade-off while accuracy and presenter behavior are locked; treat **`faf640f`** as the **performance regression anchor** for future native-core or batching work.
 

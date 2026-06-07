@@ -6,7 +6,7 @@ c64py selects **VIC timing** via **`--vic-emulation`** and ties **ReSID** lockst
 
 | Mode | Meaning |
 |------|---------|
-| **`accurate-rust`** | **Default for `C64.py`.** Cycle-accurate CPU stepping with VIC raster advanced in the optional **Rust** batch using the **PAL 6569** or **NTSC 6567R8** cycle table (VICE `cycle_tab_*`; hybrid, no BA CPU stalls in Rust). |
+| **`accurate-rust`** | **Default for `C64.py`.** Cycle-accurate CPU stepping with VIC raster advanced in the optional **Rust** batch using the **PAL 6569** or **NTSC 6567R8** cycle table (VICE `cycle_tab_*`; hybrid, with BA CPU stalls on READ bus phases). |
 | **`accurate-python`** | Full Python path: one **`ViciiCycleEngine.tick()`** per **CPU cycle** (BA stalls included). Same as deprecated **`--accurate-vic`**. |
 | **`fast`** | Coarse raster: **`_advance_raster` once per completed instruction** — highest throughput; less exact VIC IRQ/badline behavior. |
 
@@ -29,9 +29,9 @@ Programmatic **`C64(..., vic_emulation=...)`** defaults to **`fast`** so tests a
 
 ## Accurate Rust (`--vic-emulation accurate-rust`, default)
 
-- **Behavior:** Same CPU instruction semantics as accurate modes; on **PAL** with **`c64py_rust_core`** installed, the inner batch advances VIC via the Rust hybrid engine (see [rust_core.md](rust_core.md)). **Known gap:** no BA/CPU stall arbitration in Rust vs full Python accurate path.
+- **Behavior:** Same CPU instruction semantics as accurate modes; with **`c64py_rust_core`** installed (PAL or NTSC), the inner batch advances VIC via the Rust hybrid engine including BA/CPU stall arbitration on READ phases (see [rust_core.md](rust_core.md)). Residual edge-case parity vs **`accurate-python`** is tracked in [rust_core.md](rust_core.md) remaining work.
 - **ReSID:** With **`--enable-resid`**, Rust can drive **`resid_c`** during batches when the shared library is found; PCM is queued for pygame as today.
-- **Graphics + PAL:** Frame snapshots after Rust batches match the Python accurate path so pygame sees stable latched regs.
+- **Graphics:** Frame snapshots after Rust batches match the Python accurate path so pygame sees stable latched regs.
 
 ## Choosing a mode
 
@@ -39,7 +39,7 @@ Programmatic **`C64(..., vic_emulation=...)`** defaults to **`fast`** so tests a
 |------|------------|
 | Normal `C64.py` use (default) | **`accurate-rust`** (build Rust core for full speed) |
 | Maximum headless throughput | **`--vic-emulation fast`** |
-| VICE parity / BA stalls | **`accurate-python`** or **`--accurate-vic`** |
+| VICE parity / hardest VIC timing | **`accurate-python`** or **`--accurate-vic`** (authoritative regression path; **`accurate-rust`** includes BA stalls but may still differ on edge cases) |
 
 ## Related code
 

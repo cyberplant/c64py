@@ -534,18 +534,6 @@ def main():
             "``python -m c64py.drives.c1541_emulator --disk game.d64 --device 8 --port 6408``"
         ),
     )
-    ap.add_argument(
-        "--disk2",
-        metavar="PATH",
-        default=None,
-        help="With a D64 in media_file: auto-spawn drive 9 (headless TCP) for this image.",
-    )
-    ap.add_argument(
-        "--disk3",
-        metavar="PATH",
-        default=None,
-        help="With a D64 in media_file: auto-spawn drive 10 (headless TCP) for this image.",
-    )
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument(
@@ -711,8 +699,8 @@ def main():
         default=cfg_emulation.get("vic_emulation", "fast"),
         help=(
             "VIC timing: fast (coarse raster); accurate-python (per-cycle Python VIC+BA stalls); "
-            "accurate-rust (PAL hybrid VIC in optional Rust core when built — default). "
-            "NTSC accurate-rust falls back to Python accurate path."
+            "accurate-rust (PAL/NTSC hybrid VIC in optional Rust core when built — default for "
+            "C64.py; requires the extension)."
         ),
     )
     ap.add_argument(
@@ -973,8 +961,7 @@ def main():
     vice_trace = None
     try:
         print(
-            f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}  "
-            f"|  drive tier (config): {drive_tier}"
+            f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}"
         )
         _check_rust_core_available(
             vic_emulation,
@@ -1115,7 +1102,7 @@ def main():
                     emu._auto_spawned_drive = True
                     if show_ui_logs and emu.interface is not None:
                         emu.interface.add_debug_log(
-                            f"💾 Auto-spawned drive 8 (headless, tier={drive_tier})"
+                            "💾 Auto-spawned drive 8 (headless)"
                         )
                 except Exception as exc:
                     print(f"ERROR: could not auto-spawn drive: {exc}", file=sys.stderr)
@@ -1149,15 +1136,6 @@ def main():
                 print(msg, file=sys.stderr)
                 if show_ui_logs and emu.interface is not None:
                     emu.interface.add_debug_log(f"ℹ {msg}")
-            if show_ui_logs and emu.interface is not None:
-                labels = {
-                    "fast": "fast (real 1541 DOS ROM + job-queue trap + KERNAL LOAD shortcut)",
-                    "accurate-python": "accurate-python (real KERNAL ↔ DOS over IEC, job-queue trap for sectors)",
-                    "accurate-rust": "accurate-rust (drive port WIP → falls back to accurate-python)",
-                }
-                emu.interface.add_debug_log(
-                    f"📀 Drive tier: {labels.get(drive_tier, drive_tier)}"
-                )
 
             if args.video_rendering == "per-raster":
                 emu.memory.beam_render_enabled = True

@@ -2,7 +2,7 @@
 
 The C64 side speaks to a **remote drive** over TCP using the same **newline-delimited JSON** protocol as [`c1541_emulator.py`](../drives/c1541_emulator.py) (`_run_server`). Any device that implements that protocol can sit in place of the Python drive process — for example firmware on an **ESP32** that bridges Wi‑Fi/Ethernet to a **real Commodore 1541-compatible** mechanism.
 
-See also: [`drive_emulator.md`](drive_emulator.md), [`1541_status_and_plan.md`](1541_status_and_plan.md).
+See also: [`drive_emulator.md`](drive_emulator.md), [`disk_support.md`](disk_support.md).
 
 ## Transport
 
