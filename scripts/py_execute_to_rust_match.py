@@ -241,6 +241,28 @@ def main() -> None:
         "let base = mr(mem, cpu, u16::from(zp_addr)) | (mr(mem, cpu, zp_addr.wrapping_add(1) as u16) << 8);",
         "let base: u16 = u16::from(mr(mem, cpu, u16::from(zp_addr))) | (u16::from(mr(mem, cpu, zp_addr.wrapping_add(1) as u16)) << 8);",
     )
+    # Avoid debug-overflow panics in generated inline arithmetic.
+    body = body.replace(
+        "let zp_addr = (mr(mem, cpu, cpu.pc.wrapping_add(1)) + cpu.x) & 0xFF;",
+        "let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1)).wrapping_add(cpu.x);",
+    )
+    body = body.replace(
+        "let result = (cpu.a - value) & 0xFF;",
+        "let result = cpu.a.wrapping_sub(value);",
+    )
+    body = body.replace(
+        "let value = (old - 1) & 0xFF;",
+        "let value = old.wrapping_sub(1);",
+    )
+    body = body.replace(
+        "let value = (old + 1) & 0xFF;",
+        "let value = old.wrapping_add(1);",
+    )
+    # DEC zp,X: zp_addr is u8 from (operand + X) & 0xFF; rmw_dummy_6510 expects u16.
+    body = body.replace(
+        "rmw_dummy_6510(mem, cpu, zp_addr, old);",
+        "rmw_dummy_6510(mem, cpu, u16::from(zp_addr), old);",
+    )
     OUT.write_text("match opcode {\n" + body + "}\n")
     print("wrote", OUT)
 

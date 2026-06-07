@@ -54,9 +54,15 @@ pip install -r requirements.txt
 
 ### Basic Usage
 
-Run the emulator with a PRG file (auto-runs the program):
+Run the emulator with a media file (extension selects behavior):
+
+- `.prg` — load and auto-run
+- `.d64` — attach as drive 8 (same as the former `--disk` behavior)
+- `.bas` — convert with VICE `petcat` to a temporary PRG, then load (requires `petcat` on `PATH`)
+
 ```bash
 c64py program.prg
+c64py disk.d64
 ```
 
 Run the emulator without a program (starts at BASIC prompt):
@@ -66,7 +72,7 @@ c64py
 
 ### Command Line Options
 
-- `prg_file`: Optional PRG file to load and run
+- `FILE` (positional): Optional PRG, D64, or BAS file (see above)
 - `--rom-dir DIR`: Directory containing ROM files (default: auto-detect common locations)
 - `--tcp-port PORT`: Enable TCP server on specified port
 - `--udp-port PORT`: Enable UDP server on specified port

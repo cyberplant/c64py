@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import Optional, TYPE_CHECKING
 
 from .cpu import CPU6502
-from .cpu_state import CPUState
+from .cpu_state import CIATimer, CPUState
 
 if TYPE_CHECKING:
     from .iec_bus import IECBus
@@ -41,6 +41,37 @@ class Drive1541Memory:
         # VIA chip registers (simplified)
         self.via1_registers = bytearray(16)  # $1800-$180F
         self.via2_registers = bytearray(16)  # $1C00-$1C0F
+
+        # --- Fields expected by :class:`CPU6502` (C64 host uses :class:`memory.MemoryMap`) ---
+        self.sid = None
+        self.kernal_rom = b"\x00"  # non-None: skip C64 CINT/CHRIN Python shortcuts
+        self.kernal_shortcuts_enabled = False  # do not hijack $FFD2 CHROUT for 1541 code at that PC
+        self.video_standard = "pal"
+        self.raster_line = 0
+        self.raster_cycles = 0
+        self.badline_cycles = 0
+        self.vic_interrupt_state = 0
+        self.vic_snapshot_each_emulated_frame = False
+        self.cia1_timer_a = CIATimer()
+        self.cia1_timer_b = CIATimer()
+        self.cia1_icr = 0
+        self.pending_irq = False
+        
+    def sid_tick_cpu_cycles(self, n: int) -> None:
+        """No SID in the drive; :class:`CPU6502` always calls this after each instruction."""
+        pass
+
+    def recompute_pending_irq(self) -> None:
+        """IRQ line from CIA only (no VIC in this stub)."""
+        self.pending_irq = bool(self.cia1_icr & 0x80)
+
+    def beam_capture_raster_line(self, line: int) -> None:
+        """Raster bookkeeping for C64 VIC; unused on the drive."""
+        pass
+
+    def snapshot_vic_render_state(self) -> None:
+        """Frame latch for C64 display; unused on the drive."""
+        pass
         
     def load_rom(self, dos_rom: bytes, serial_rom: Optional[bytes] = None) -> None:
         """Load ROM images.

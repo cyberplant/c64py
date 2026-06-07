@@ -10,6 +10,7 @@ pub fn advance_raster(mem: &mut C64MemoryMap<'_>, cycles: u32) {
     while mem.raster_cycles >= cycles_per_line {
         mem.raster_cycles -= cycles_per_line;
         mem.raster_line = (mem.raster_line + 1) % raster_max;
+        mem.beam_capture_current_line();
     }
 }
 

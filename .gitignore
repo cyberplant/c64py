@@ -34,6 +34,9 @@ htmlcov/
 .tox/
 .nox/
 
+# Accidental root-level ReSID/debug captures (not part of the repo).
+/test.wav
+
 # Local logs and benchmark NDJSON (see scripts/run_benchmark.sh)
 logs/*
 *.log

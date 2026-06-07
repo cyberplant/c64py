@@ -21,7 +21,7 @@ def test_kernal_load_directory():
     
     # Create emulator
     emu = C64(interface_factory=lambda e: None)
-    emu.interface = type('obj', (object,), {'add_debug_log': lambda *args: None})()
+    emu.interface = type('obj', (object,), {'add_debug_log': lambda *a, **k: None})()
     emu._initialize_c64()
     
     # Attach disk
@@ -99,7 +99,7 @@ def test_kernal_load_nonexistent():
     
     # Create emulator
     emu = C64(interface_factory=lambda e: None)
-    emu.interface = type('obj', (object,), {'add_debug_log': lambda *args: None})()
+    emu.interface = type('obj', (object,), {'add_debug_log': lambda *a, **k: None})()
     emu._initialize_c64()
     
     # Attach disk
@@ -155,7 +155,7 @@ def test_kernal_load_with_address():
     
     # Create emulator
     emu = C64(interface_factory=lambda e: None)
-    emu.interface = type('obj', (object,), {'add_debug_log': lambda *args: None})()
+    emu.interface = type('obj', (object,), {'add_debug_log': lambda *a, **k: None})()
     emu._initialize_c64()
     
     # Attach disk

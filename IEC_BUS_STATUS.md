@@ -170,8 +170,18 @@ Commands are sent with ATN asserted (low):
 - **Filenames:**
   - `d1541II` (VICE default)
   - `901229-06.bin`
+  - `901229-05.bin`
   - `serial-1541.bin`
 - **Contents:** IEC protocol, GCR encoding/decoding
+
+### VICE ``dos1541-…+….bin`` naming (typical when copying from VICE ``DRIVES/``)
+- **Most common size:** **16384 bytes** — one file is the **full 16 KiB DOS** ROM ($C000–$FFFF). The ``+`` in the name pairs chip part numbers (e.g. 325302-01 and 901229-05); it does **not** mean a second ROM is appended in that file.
+- **Examples:** `dos1541-325302-01+901229-05.bin`, `dos1541-325302-01+901229-06.bin`, or any `dos1541*+*.bin` of length 16384.
+- **Serial ROM:** still load separately (e.g. `901229-05.bin`, `d1541II`) unless you use the rare **24 KiB** single file below.
+
+### Rare single-file DOS + serial (24 KiB)
+- **Size:** 24576 bytes = 16384 (DOS) + 8192 (serial), in that order.
+- **Same glob:** `dos1541*+*.bin` with length exactly 24576 — c64py splits it for both DOS and serial.
 
 ## ROM Search Paths
 

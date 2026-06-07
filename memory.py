@@ -3,7 +3,7 @@ C64 Memory Map
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING, Union
+from typing import List, Optional, TYPE_CHECKING, Union
 
 from .constants import (
     ROM_BASIC_START, ROM_BASIC_END,
@@ -29,6 +29,8 @@ class MemoryMap:
     ram: bytearray = field(default_factory=lambda: bytearray(0x10000))
     basic_rom: Optional[bytes] = None
     kernal_rom: Optional[bytes] = None
+    # When True, :class:`cpu.CPU6502` may shortcut $FFD2 CHROUT (C64 screen). Off for 1541 RAM.
+    kernal_shortcuts_enabled: bool = True
     char_rom: Optional[bytes] = None
     udp_debug: Optional['UdpDebugLogger'] = None
     sid: Optional[Union['SidEmulator', 'ReSIDEmulator']] = None
@@ -48,6 +50,8 @@ class MemoryMap:
     _vic_regs: bytearray = field(default_factory=lambda: bytearray(0x40))
     # IEC serial bus (optional, for 1541 drive emulation)
     iec_bus: Optional['IECBus'] = None
+    # When True, Rust fast batch may run real KERNAL LOAD/SAVE (no $FFD5/$FFD8 delegate stops).
+    iec_disk_full_impl: bool = False
     # CIA2 Port A state (for IEC bus control)
     cia2_pra: int = 0xFF  # Port A data register
     cia2_ddra: int = 0xFF  # Port A data direction (0=input, 1=output)
@@ -68,6 +72,15 @@ class MemoryMap:
     # When False (fast VIC + --graphics), pygame latches once per host present instead — matches
     # pre-snapshot throughput while keeping stable regs for the drawn frame.
     vic_snapshot_each_emulated_frame: bool = True
+    # Per-raster-line VIC snapshots for accurate video rendering (see docs/DEBUGGING.md).
+    beam_render_enabled: bool = False
+    beam_vic_lines: Optional[List[bytes]] = None
+    beam_cia2_lines: Optional[List[int]] = None
+    # Flat buffers written in-place by the Rust fast batch (zero-copy beam path).
+    beam_vic_flat: Optional[bytearray] = None
+    beam_cia2_flat: Optional[bytearray] = None
+    # True after buffers are filled from current VIC shadow (avoids an all-black first frame).
+    beam_snapshots_primed: bool = False
     # Cached 6510 $01 effective value for MemoryMap.read() hot path (invalidated on $00/$01 writes).
     _port01_read_cache_valid: bool = field(default=False, init=False, repr=False)
     _port01_read_cache_value: int = field(default=0, init=False, repr=False)
@@ -200,6 +213,42 @@ class MemoryMap:
 
         # RAM
         return self.ram[addr]
+
+    @staticmethod
+    def vic_fetches_charset_rom(vic_bank_base: int, rel_within_bank: int) -> bool:
+        """True when VIC-II reads character shapes from ROM for *rel_within_bank* in the 16K bank.
+
+        In banks ``$0000`` and ``$8000``, offsets ``$1000``–``$1FFF`` map to the 4K character ROM
+        for VIC fetches; the CPU still sees RAM there. Other banks use RAM for those offsets.
+        """
+        rel = rel_within_bank & 0x3FFF
+        if rel < 0x1000 or rel >= 0x2000:
+            return False
+        return vic_bank_base in (0x0000, 0x8000)
+
+    def read_vic_charset_glyph_rows(self, vic_bank_base: int, char_base: int, screen_code: int) -> bytes:
+        """Eight dot rows for *screen_code* as the VIC-II would fetch (ROM at $1000–$1FFF in bank)."""
+        cr = self.char_rom
+        rows = bytearray(8)
+        for r in range(8):
+            rel = (char_base + screen_code * 8 + r) & 0x3FFF
+            if cr and self.vic_fetches_charset_rom(vic_bank_base, rel):
+                rows[r] = cr[rel - 0x1000]
+            else:
+                rows[r] = self.read((vic_bank_base + rel) & 0xFFFF) & 0xFF
+        return bytes(rows)
+
+    def read_vic_charset_block_2k(self, vic_bank_base: int, char_base: int) -> bytes:
+        """Contiguous 2048 bytes of charset data as the VIC-II would see them."""
+        out = bytearray(2048)
+        cr = self.char_rom
+        for i in range(2048):
+            rel = (char_base + i) & 0x3FFF
+            if cr and self.vic_fetches_charset_rom(vic_bank_base, rel):
+                out[i] = cr[rel - 0x1000]
+            else:
+                out[i] = self.read((vic_bank_base + rel) & 0xFFFF) & 0xFF
+        return bytes(out)
 
     def write(self, addr: int, value: int) -> None:
         """Write to memory (only RAM, ROM writes are ignored)"""
@@ -500,6 +549,69 @@ class MemoryMap:
             # Bits 5-6: Input mode
             self.cia1_timer_b.input_mode = (value >> 5) & 0x03
 
+    def apply_cia2_port_a_to_iec_bus(self) -> None:
+        """Apply current ``cia2_pra`` to the IEC bus (same as a write to CIA2 port A)."""
+        if self.iec_bus is None:
+            return
+        v = self.cia2_pra & 0xFF
+        atn_state = (v & 0x08) != 0
+        self.iec_bus.set_atn(atn_state)
+        self.iec_bus.set_clk("c64", (v & 0x10) != 0)
+        self.iec_bus.set_data("c64", (v & 0x20) != 0)
+
+    def ensure_beam_buffers(self) -> None:
+        """Allocate per-line VIC/CIA2 snapshot arrays for the current video standard."""
+        n = 312 if self.video_standard == "pal" else 263
+        need = (
+            self.beam_vic_lines is None
+            or len(self.beam_vic_lines) != n
+            or self.beam_vic_flat is None
+            or len(self.beam_vic_flat) != n * 64
+            or self.beam_cia2_flat is None
+            or len(self.beam_cia2_flat) != n
+        )
+        if need:
+            self.beam_vic_lines = [bytes(64) for _ in range(n)]
+            self.beam_cia2_lines = [0] * n
+            self.beam_vic_flat = bytearray(n * 64)
+            self.beam_cia2_flat = bytearray(n)
+            self.beam_snapshots_primed = False
+
+    def prime_beam_snapshots_from_current_vic(self) -> None:
+        """Copy current VIC/CIA2 PA into every raster line (baseline before per-line capture)."""
+        if not self.beam_render_enabled:
+            return
+        self.ensure_beam_buffers()
+        assert self.beam_vic_lines is not None and self.beam_cia2_lines is not None
+        assert self.beam_vic_flat is not None and self.beam_cia2_flat is not None
+        snap = bytes(self._vic_regs[:0x40])
+        pra = self.cia2_pra & 0xFF
+        for i in range(len(self.beam_vic_lines)):
+            self.beam_vic_lines[i] = snap
+            self.beam_cia2_lines[i] = pra
+            o = i * 64
+            self.beam_vic_flat[o : o + 64] = snap
+            self.beam_cia2_flat[i] = pra
+        self.beam_snapshots_primed = True
+
+    def beam_capture_raster_line(self, line: int) -> None:
+        """Record VIC + CIA2 PA for *line* (used by beam-accurate rendering)."""
+        if not self.beam_render_enabled:
+            return
+        self.ensure_beam_buffers()
+        assert self.beam_vic_lines is not None and self.beam_cia2_lines is not None
+        assert self.beam_vic_flat is not None and self.beam_cia2_flat is not None
+        n = len(self.beam_vic_lines)
+        line %= n
+        b = bytes(self._vic_regs[:0x40])
+        pr = self.cia2_pra & 0xFF
+        self.beam_vic_lines[line] = b
+        self.beam_cia2_lines[line] = pr
+        o = line * 64
+        self.beam_vic_flat[o : o + 64] = b
+        self.beam_cia2_flat[line] = pr
+        self.beam_snapshots_primed = True
+
     def _read_cia2(self, reg: int) -> int:
         """Read CIA2 register.
         
@@ -538,19 +650,8 @@ class MemoryMap:
         """
         if reg == 0x00:  # Port A (IEC bus control)
             self.cia2_pra = value
-            # If IEC bus is attached, update bus state
             if self.iec_bus is not None:
-                # ATN is controlled by bit 3 (inverted: 0=asserted, 1=released)
-                atn_state = (value & 0x08) != 0
-                self.iec_bus.set_atn(atn_state)
-                
-                # CLK OUT is controlled by bit 4 (inverted: 0=asserted, 1=released)
-                clk_state = (value & 0x10) != 0
-                self.iec_bus.set_clk("c64", clk_state)
-                
-                # DATA OUT is controlled by bit 5 (inverted: 0=asserted, 1=released)
-                data_state = (value & 0x20) != 0
-                self.iec_bus.set_data("c64", data_state)
+                self.apply_cia2_port_a_to_iec_bus()
         elif reg == 0x02:  # Data direction register A
             self.cia2_ddra = value
 

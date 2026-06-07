@@ -85,7 +85,7 @@ def test_emulator_integration():
     
     # Create emulator (no UI)
     emu = C64(interface_factory=lambda e: None)
-    emu.interface = type('obj', (object,), {'add_debug_log': lambda *args: None})()
+    emu.interface = type('obj', (object,), {'add_debug_log': lambda *a, **k: None})()
     print("✅ Created emulator")
     
     # Attach disk
@@ -122,7 +122,7 @@ def test_server_commands():
     
     # Create emulator
     emu = C64(interface_factory=lambda e: None)
-    emu.interface = type('obj', (object,), {'add_debug_log': lambda *args: None})()
+    emu.interface = type('obj', (object,), {'add_debug_log': lambda *a, **k: None})()
     
     # Create server
     server = EmulatorServer(emu, tcp_port=None, udp_port=None)

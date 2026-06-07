@@ -5,6 +5,7 @@ C64 Emulator Main Class
 from __future__ import annotations
 
 import os
+import queue
 import struct
 import sys
 import threading
@@ -36,6 +37,7 @@ from .constants import (
     CURSOR_ROW_ADDR,
     KEYBOARD_BUFFER_BASE,
     KEYBOARD_BUFFER_LEN_ADDR,
+    KEYBOARD_BUFFER_SIZE,
     ROM_KERNAL_START,
     ROM_KERNAL_END,
     SCREEN_MEM,
@@ -81,12 +83,19 @@ class C64:
         enable_sid: bool = False,
         enable_resid: bool = False,
         vic_emulation: str = "fast",
+        disk_emulation: str = "fast",
     ):
         allowed_vic = frozenset({"fast", "accurate-python", "accurate-rust"})
         if vic_emulation not in allowed_vic:
             raise ValueError(
                 f"vic_emulation must be one of {sorted(allowed_vic)}, got {vic_emulation!r}"
             )
+        allowed_disk = frozenset({"fast", "accurate"})
+        if disk_emulation not in allowed_disk:
+            raise ValueError(
+                f"disk_emulation must be one of {sorted(allowed_disk)}, got {disk_emulation!r}"
+            )
+        self.disk_emulation = disk_emulation
         self.vic_emulation = vic_emulation
         accurate_vic = vic_emulation != "fast"
         rust_hybrid_vic = vic_emulation == "accurate-rust"
@@ -134,10 +143,21 @@ class C64:
         self.drives: Dict[int, DiskDrive] = {}
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
 
+        self.monitor_server = None  # type: ignore[var-annotated]
+        self.monitor_breakpoints: set[int] = set()
+        self._monitor_cmd_queue: Optional[queue.Queue] = None
+        self._monitor_reply_queue: Optional[queue.Queue] = None
+        self._monitor_pending_step_ack = False
+
         # IEC serial bus for 1541 drive emulation (optional, created when needed)
         self.iec_bus: Optional[IECBus] = None
         self.iec_drives: Dict[int, Drive1541] = {}  # 1541 drives with ROM
         self.use_iec_bus = False  # Enable when 1541 ROMs are available
+        # True when full IEC byte protocol + 1541 VIA/IEC is implemented (LOAD works like hardware).
+        self._iec_disk_full_impl: bool = False
+        # Thread-safe queue: UI/server threads must not write $C6/$0277 directly (races KERNAL
+        # CHRIN on the CPU thread). Producers call send_petscii; CPU thread drains in sync_keyboard_host_queue.
+        self._keyboard_incoming: queue.Queue[int] = queue.Queue(maxsize=64)
 
         # Dirty-checking for screen updates - use bytes for fast comparison
         self._prev_screen_data = b''
@@ -753,6 +773,9 @@ class C64:
         
         # Attach disk
         self.drives[device].attach_disk(d64, disk_path)
+        iec = self.iec_drives.get(device)
+        if iec is not None:
+            iec.attach_disk(d64, disk_path)
         
         if self.interface:
             disk_name, disk_id = d64.read_bam()
@@ -796,6 +819,9 @@ class C64:
         Returns:
             True if IEC bus was successfully initialized
         """
+        if self.iec_bus is not None:
+            return self.use_iec_bus
+
         # Try to load 1541 DOS ROM
         dos_rom = find_drive_rom("dos1541", rom_dir)
         if dos_rom is None:
@@ -822,6 +848,8 @@ class C64:
             self.iec_drives[device] = drive
         
         self.use_iec_bus = True
+        self.cpu.kernal_disk_hook_vectors = False
+        self.memory.iec_disk_full_impl = getattr(self, "_iec_disk_full_impl", False)
         if self.interface:
             self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
         return True
@@ -835,10 +863,45 @@ class C64:
         self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
         self.cpu.state.sp = (sp + 2) & 0xFF
 
+    def _handle_kernal_load_iec_stub(self) -> bool:
+        """Until full IEC/1541 is implemented, complete LOAD with a visible error (no hang)."""
+        device = self.memory.read(0xBA)
+        drive = self.get_drive(device)
+        if not drive or not drive.has_disk():
+            return False
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        filename_bytes = []
+        for i in range(filename_len):
+            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename = "".join(chr(b) if 32 <= b < 127 else "?" for b in filename_bytes)
+
+        # KERNAL-style order: newline after the LOAD line, then SEARCHING FOR <name>, then error.
+        # Status byte $90 is set after messages (same idea as real I/O completion).
+        self.cpu.apply_chrout_petscii(0x0D)
+        for ch in f"SEARCHING FOR {filename}":
+            self.cpu.apply_chrout_petscii(ord(ch))
+        self.cpu.apply_chrout_petscii(0x0D)
+        for ch in "ERROR: NOT IMPLEMENTED YET":
+            self.cpu.apply_chrout_petscii(ord(ch))
+        self.cpu.apply_chrout_petscii(0x0D)
+
+        if self.interface:
+            self.interface.add_debug_log(
+                f"IEC disk LOAD not implemented yet (device={device} file={filename!r}) — stub error"
+            )
+
+        self.memory.write(0x90, 0x40)
+        self.cpu.state.p |= 0x01
+        self._kernal_hook_rts_return()
+        return True
+
     def _handle_kernal_load(self) -> bool:
         """Handle KERNAL LOAD operation for virtual disk drives.
         
         This intercepts LOAD calls when PC is at $FFD5 and device is 8-11.
+        When :attr:`use_iec_bus` is True and full IEC disk I/O is not implemented yet,
+        :meth:`_handle_kernal_load_iec_stub` prints a stub message and returns with error.
         Returns True if LOAD was handled, False otherwise.
         
         KERNAL LOAD calling convention:
@@ -850,6 +913,15 @@ class C64:
         - $BA: Device number
         - $B9: Secondary address (0 = use address in X/Y, 1 = use address from file)
         """
+        if self.use_iec_bus:
+            if self.cpu.state.pc != 0xFFD5:
+                return False
+            if getattr(self, "_iec_disk_full_impl", False):
+                return False
+            device = self.memory.read(0xBA)
+            if device < 8 or device > 11:
+                return False
+            return self._handle_kernal_load_iec_stub()
         # Check if we're at the LOAD entry point
         if self.cpu.state.pc != 0xFFD5:
             return False
@@ -956,6 +1028,7 @@ class C64:
         """Handle KERNAL SAVE operation for virtual disk drives.
         
         This intercepts SAVE calls when PC is at $FFD8 and device is 8-11.
+        Skipped when :attr:`use_iec_bus` is True.
         Returns True if SAVE was handled, False otherwise.
         
         KERNAL SAVE calling convention:
@@ -967,6 +1040,8 @@ class C64:
         - $BA: Device number
         - $AE-$AF: End address + 1
         """
+        if self.use_iec_bus:
+            return False
         # Check if we're at the SAVE entry point
         if self.cpu.state.pc != 0xFFD8:
             return False
@@ -1051,6 +1126,22 @@ class C64:
         self._kernal_hook_rts_return()
         return True
 
+    def _step_iec_drives(self, host_cycles: int) -> None:
+        """Advance 1541 CPUs in lockstep with C64 CPU cycles (IEC accurate mode).
+
+        The previous cap (128) starved the drive when the Rust batch reported thousands
+        of cycles per quantum, which broke KERNAL serial I/O (e.g. stuck on SEARCHING).
+        """
+        if not self.use_iec_bus:
+            return
+        # Current accurate-disk mode is a KERNAL LOAD/SAVE stub unless full IEC is enabled.
+        # In stub mode, stepping four Python 1541 CPUs every host quantum destroys throughput.
+        if not getattr(self, "_iec_disk_full_impl", False):
+            return
+        n = max(1, int(host_cycles))
+        for d in self.iec_drives.values():
+            d.step(n)
+
     def run_cpu_instruction_quantum(self, cycles_before: int) -> int:
         """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
         if self._handle_kernal_load():
@@ -1107,6 +1198,8 @@ class C64:
         inject_wall_t0 = time.perf_counter()
 
         while self.running:
+            # Drain host key queue on the CPU thread only (avoids races with KERNAL CHRIN).
+            self.sync_keyboard_host_queue()
             pc = self.cpu.state.pc
 
             # Load program if pending (after BASIC boot completes)
@@ -1145,12 +1238,38 @@ class C64:
                             self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
                         self.disk_image_path = None  # Clear path even on error
 
+            cmd_queue = self._monitor_cmd_queue
+            if cmd_queue is not None:
+                try:
+                    while True:
+                        item = cmd_queue.get_nowait()
+                        if not item:
+                            continue
+                        if item[0] == "STEP":
+                            self.cpu._monitor_force_single = True
+                            self._monitor_pending_step_ack = True
+                        elif item[0] == "GO":
+                            self.cpu._monitor_force_single = False
+                except queue.Empty:
+                    pass
+
             step_cycles = self.run_cpu_instruction_quantum(cycles)
+            reply_queue = self._monitor_reply_queue
+            if reply_queue is not None and self._monitor_pending_step_ack:
+                self._monitor_pending_step_ack = False
+                st = self.cpu.state
+                reply_queue.put(
+                    f"PC=${st.pc:04X} A=${st.a:02X} X=${st.x:02X} Y=${st.y:02X} "
+                    f"SP=${st.sp:02X} P=${st.p:02X} CYCLES={cycles} STEP_CYCLES={step_cycles}\r\n"
+                )
             if step_cycles == 0:
                 continue
 
             cycles += step_cycles
             self.current_cycles = cycles
+            self._step_iec_drives(step_cycles)
+            if self.cpu.state.pc in self.monitor_breakpoints:
+                self.cpu._monitor_force_single = True
             self.memory.sync_joystick_inject(cycles)
             self._process_scheduled_inject_keys(
                 cycles, time.perf_counter() - inject_wall_t0
@@ -1668,16 +1787,26 @@ class C64:
         return row, col, line_codes
 
     def _enqueue_keyboard_buffer(self, petscii_code: int) -> bool:
-        """Enqueue a PETSCII code into the KERNAL keyboard buffer."""
-        kb_buf_base = KEYBOARD_BUFFER_BASE
-        kb_buf_len = self.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
-        if kb_buf_len >= 10:
+        """Queue a key for the CPU thread to place in the KERNAL buffer (thread-safe)."""
+        code = petscii_code & 0xFF
+        try:
+            self._keyboard_incoming.put_nowait(code)
+        except queue.Full:
             return False
-
-        self.memory.write(kb_buf_base + kb_buf_len, petscii_code & 0xFF)
-        kb_buf_len += 1
-        self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len)
         return True
+
+    def sync_keyboard_host_queue(self) -> None:
+        """CPU-thread only: move queued keys into the 10-byte KERNAL buffer when space exists."""
+        while True:
+            kb_buf_len = self.memory.read(KEYBOARD_BUFFER_LEN_ADDR)
+            if kb_buf_len >= KEYBOARD_BUFFER_SIZE:
+                break
+            try:
+                code = self._keyboard_incoming.get_nowait()
+            except queue.Empty:
+                break
+            self.memory.write(KEYBOARD_BUFFER_BASE + kb_buf_len, code)
+            self.memory.write(KEYBOARD_BUFFER_LEN_ADDR, kb_buf_len + 1)
 
     def send_petscii(self, petscii_code: int) -> bool:
         """Send a PETSCII key to the KERNAL keyboard queue."""

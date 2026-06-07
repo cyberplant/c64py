@@ -77,10 +77,20 @@ pub struct C64MemoryMap<'a> {
     pub cia1_icr: u8,
     pub cia2_pra: u8,
     pub cia2_ddra: u8,
+    /// When true, CIA2 port A reads merge peer IEC CLK/DATA like Python ``MemoryMap._read_cia2``.
+    pub iec_merge_cia2: bool,
+    /// Non-C64 devices release CLK (high) when true; snapshot at batch start from Python.
+    pub iec_peer_clk_high: bool,
+    pub iec_peer_data_high: bool,
     port01_cache_valid: bool,
     port01_cache_value: u8,
     /// Set during ``run_fast_batch`` when Rust drives reSID; must be null otherwise.
     pub resid: *mut ResidSession,
+    /// Optional per-raster VIC snapshot buffer (``nlines * 64`` bytes) for pygame beam rendering.
+    pub beam_vic_ptr: *mut u8,
+    pub beam_cia2_ptr: *mut u8,
+    pub beam_nlines: u16,
+    pub beam_enabled: bool,
 }
 
 impl<'a> C64MemoryMap<'a> {
@@ -101,9 +111,36 @@ impl<'a> C64MemoryMap<'a> {
             cia1_icr: 0,
             cia2_pra: 0xFF,
             cia2_ddra: 0xFF,
+            iec_merge_cia2: false,
+            iec_peer_clk_high: true,
+            iec_peer_data_high: true,
             port01_cache_valid: false,
             port01_cache_value: 0,
             resid: std::ptr::null_mut(),
+            beam_vic_ptr: std::ptr::null_mut(),
+            beam_cia2_ptr: std::ptr::null_mut(),
+            beam_nlines: 0,
+            beam_enabled: false,
+        }
+    }
+
+    /// Copy current VIC regs + CIA2 PA into beam buffers at ``raster_line`` (matches Python hook).
+    pub fn beam_capture_current_line(&mut self) {
+        if !self.beam_enabled || self.beam_nlines == 0 {
+            return;
+        }
+        if self.beam_vic_ptr.is_null() || self.beam_cia2_ptr.is_null() {
+            return;
+        }
+        let n = self.beam_nlines as usize;
+        let line = (self.raster_line as usize) % n;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.vic_regs.as_ptr(),
+                self.beam_vic_ptr.add(line * 64),
+                64,
+            );
+            *self.beam_cia2_ptr.add(line) = self.cia2_pra;
         }
     }
 
@@ -306,7 +343,16 @@ impl<'a> C64MemoryMap<'a> {
 
     fn read_cia2(&self, reg: u8) -> u8 {
         match reg {
-            0x00 => self.cia2_pra,
+            0x00 => {
+                if !self.iec_merge_cia2 {
+                    return self.cia2_pra;
+                }
+                let c64_clk_rel = (self.cia2_pra & 0x10) != 0;
+                let c64_data_rel = (self.cia2_pra & 0x20) != 0;
+                let clk_hi = self.iec_peer_clk_high && c64_clk_rel;
+                let data_hi = self.iec_peer_data_high && c64_data_rel;
+                (self.cia2_pra & 0x3F) | (u8::from(clk_hi) << 6) | (u8::from(data_hi) << 7)
+            }
             0x02 => self.cia2_ddra,
             _ => 0,
         }
