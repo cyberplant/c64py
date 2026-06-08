@@ -1,0 +1,3 @@
+# Minimal deps for headless PyPy Docker smoke tests (no pygame/SDL compile).
+rich>=13.0.0
+tomli>=2.0.0; python_version<"3.11"
