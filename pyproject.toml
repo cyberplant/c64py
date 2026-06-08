@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "c64py"
-version = "0.1.0"
+version = "1.0.1"
 description = "A Commodore 64 emulator implemented in Python with a text-based interface."
 readme = "README.md"
 requires-python = ">=3.9"
