@@ -15,6 +15,7 @@ from .constants import (
     VIC_D011_BMM, VIC_D011_ECM, VIC_D016_MCM
 )
 from .cpu_state import CIATimer
+from .video_beam import per_cycle_geometry
 
 if TYPE_CHECKING:
     from .debug import UdpDebugLogger
@@ -92,6 +93,15 @@ class MemoryMap:
     beam_cia2_flat: Optional[bytearray] = None
     # True after buffers are filled from current VIC shadow (avoids an all-black first frame).
     beam_snapshots_primed: bool = False
+    # Future per-cycle video tier: one VIC/CIA2 snapshot per visible character cycle.
+    # Authoritative storage is the flat bytearrays below (renderers and Rust read those).
+    per_cycle_render_enabled: bool = False
+    per_cycle_vic_flat: Optional[bytearray] = None
+    per_cycle_cia2_flat: Optional[bytearray] = None
+    per_cycle_snapshots_primed: bool = False
+    # Lazily rebuilt when ``video_standard`` changes (``per_cycle_geometry``).
+    _per_cycle_geom_vs: Optional[str] = field(default=None, init=False, repr=False)
+    _per_cycle_geom_obj: Optional[object] = field(default=None, init=False, repr=False)
     # Optional :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives need KERNAL line tracing.
     iec_kernal_tap: Optional[object] = field(default=None, repr=False)
     # Cached 6510 $01 effective value for MemoryMap.read() hot path (invalidated on $00/$01 writes).
@@ -743,6 +753,43 @@ class MemoryMap:
             self.beam_cia2_flat = bytearray(n)
             self.beam_snapshots_primed = False
 
+    def _per_cycle_geom_cached(self):
+        """Return :class:`~c64py.video_beam.VicPerCycleGeometry` for ``video_standard`` (cached)."""
+        vs = self.video_standard
+        if self._per_cycle_geom_vs != vs or self._per_cycle_geom_obj is None:
+            self._per_cycle_geom_vs = vs
+            self._per_cycle_geom_obj = per_cycle_geometry(vs)
+        return self._per_cycle_geom_obj
+
+    def ensure_per_cycle_buffers(self) -> None:
+        """Allocate per-cycle VIC/CIA2 snapshot arrays for the visible content window."""
+        geom = self._per_cycle_geom_cached()
+        n = geom.visible_sample_count
+        need = (
+            self.per_cycle_vic_flat is None
+            or len(self.per_cycle_vic_flat) != n * 64
+            or self.per_cycle_cia2_flat is None
+            or len(self.per_cycle_cia2_flat) != n
+        )
+        if need:
+            self.per_cycle_vic_flat = bytearray(n * 64)
+            self.per_cycle_cia2_flat = bytearray(n)
+            self.per_cycle_snapshots_primed = False
+
+    def prime_per_cycle_snapshots_from_current_vic(self) -> None:
+        """Copy current VIC/CIA2 PA into every per-cycle sample slot."""
+        if not self.per_cycle_render_enabled:
+            return
+        self.ensure_per_cycle_buffers()
+        assert self.per_cycle_vic_flat is not None and self.per_cycle_cia2_flat is not None
+        snap = bytes(self._vic_regs[:0x40])
+        pra = self.cia2_pra & 0xFF
+        n = len(self.per_cycle_cia2_flat)
+        # One bulk write avoids 8000 tight Python loops at startup.
+        self.per_cycle_vic_flat[:] = snap * n
+        self.per_cycle_cia2_flat[:] = bytes((pra & 0xFF,) * n)
+        self.per_cycle_snapshots_primed = True
+
     def prime_beam_snapshots_from_current_vic(self) -> None:
         """Copy current VIC/CIA2 PA into every raster line (baseline before per-line capture)."""
         if not self.beam_render_enabled:
@@ -777,6 +824,27 @@ class MemoryMap:
         self.beam_vic_flat[o : o + 64] = b
         self.beam_cia2_flat[line] = pr
         self.beam_snapshots_primed = True
+
+    def per_cycle_capture_vic_sample(self) -> None:
+        """Record VIC + CIA2 PA at the current raster line/cycle when inside the visible window.
+
+        Intended to run once per emulated VIC cycle from :meth:`cpu.CPU6502._vic_tick_one`
+        after ``raster_line`` / ``raster_cycles`` are updated. When ``per_cycle_render_enabled``
+        is false, this is a no-op. Fast VIC (coarse raster) mode never calls this.
+        """
+        if not self.per_cycle_render_enabled:
+            return
+        geom = self._per_cycle_geom_cached()
+        idx = geom.sample_index(self.raster_line, self.raster_cycles)
+        if idx is None:
+            return
+        self.ensure_per_cycle_buffers()
+        assert self.per_cycle_vic_flat is not None and self.per_cycle_cia2_flat is not None
+        vic_slice = self._vic_regs[:0x40]
+        pr = self.cia2_pra & 0xFF
+        o = idx * 64
+        self.per_cycle_vic_flat[o : o + 64] = vic_slice
+        self.per_cycle_cia2_flat[idx] = pr
 
     def _read_cia2(self, reg: int) -> int:
         """Read CIA2 register.

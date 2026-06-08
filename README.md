@@ -124,6 +124,8 @@ Run with graphics window:
 c64py program.prg --interface graphics --graphics-scale 3
 ```
 
+Per-scanline effects (FLI, sub-row splits): use `--video-rendering per-raster` or `--video-rendering per-cycle` with `--vic-emulation accurate-python` (forced automatically when needed; text + bitmap + sprites from the sample grid — sprites per 8-pixel column, not full DMA timing; see `docs/per_cycle_vic.md`).
+
 ## Configuration
 
 c64py reads an optional TOML config file so you don't have to retype CLI

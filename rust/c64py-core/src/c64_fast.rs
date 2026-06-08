@@ -120,7 +120,7 @@ fn dispatch_irq_hybrid(
     cpu: &mut CpuState,
     mem: &mut C64MemoryMap<'_>,
     eng: &mut ViciiEngine,
-    _resid: Option<&mut ResidSession>,
+    resid: &mut Option<&mut ResidSession>,
     total_cyc: &mut u64,
 ) {
     mem.pending_irq = false;
@@ -129,17 +129,16 @@ fn dispatch_irq_hybrid(
     let pcl = pc as u8;
     let status = (cpu.p | 0x20) & !0x10; // B clear, bit 5 set
 
-    // Per-phase tick: advance VIC, stall on READ if ba_blocks_cpu.
-    // resid is passed as None here — 7-cycle drift is negligible for reSID sync.
+    // Per-phase tick: advance VIC + reSID (same as Python ``_handle_irq`` / ``_irq_cycle``).
     macro_rules! tick_phase {
         (READ) => {
             loop {
-                let (_, ba_blocks_cpu) = tick_one_cycle(eng, mem, cpu, None, total_cyc);
+                let (_, ba_blocks_cpu) = tick_one_cycle(eng, mem, cpu, resid, total_cyc);
                 if !ba_blocks_cpu { break; }
             }
         };
         (WRITE) => {
-            tick_one_cycle(eng, mem, cpu, None, total_cyc);
+            tick_one_cycle(eng, mem, cpu, resid, total_cyc);
         };
     }
 
@@ -171,12 +170,12 @@ fn coarse_cycles(
     cpu: &mut CpuState,
     mem: &mut C64MemoryMap<'_>,
     c: u32,
-    resid: Option<&mut ResidSession>,
+    resid: &mut Option<&mut ResidSession>,
 ) {
     advance_raster(mem, c);
     cpu.cycles = cpu.cycles.wrapping_add(u64::from(c));
     update_cia_timers(mem, c, false);
-    if let Some(r) = resid {
+    if let Some(r) = resid.as_mut() {
         r.clock_cycles(c as i32);
     }
     service_irq_if_any(cpu, mem);
@@ -343,16 +342,17 @@ fn tick_one_cycle(
     eng: &mut ViciiEngine,
     mem: &mut C64MemoryMap<'_>,
     cpu: &mut CpuState,
-    resid: Option<&mut ResidSession>,
+    resid: &mut Option<&mut ResidSession>,
     total_cyc: &mut u64,
 ) -> (bool, bool) {
     let (irq_edge, ba_blocks_cpu) = eng.step(mem);
+    mem.per_cycle_capture_at_cursor();
     if irq_edge {
         mem.trigger_vic_irq(0x01);
     }
     cpu.cycles = cpu.cycles.wrapping_add(1);
     update_cia_timers(mem, 1, false);
-    if let Some(r) = resid {
+    if let Some(r) = resid.as_mut() {
         r.clock_cycles(1);
     }
     *total_cyc += 1;
@@ -413,7 +413,8 @@ pub fn run_fast_batch(
                 for i in 0..c {
                     let bus_phase = phases[i as usize];
                     loop {
-                        let (_, ba_blocks_cpu) = tick_one_cycle(eng, mem, cpu, resid.as_deref_mut(), &mut total_cyc);
+                        let (_, ba_blocks_cpu) =
+                            tick_one_cycle(eng, mem, cpu, &mut resid, &mut total_cyc);
                         // Only stall on READ cycles — WRITE/INTERNAL proceed regardless.
                         if !(ba_blocks_cpu && bus_phase == BusPhase::Read) {
                             break;
@@ -424,14 +425,14 @@ pub fn run_fast_batch(
                 // dispatch cycles in the cycle count, matching Python's _handle_irq.
                 mem.recompute_pending_irq();
                 if irq_should_dispatch(cpu, mem.pending_irq) {
-                    dispatch_irq_hybrid(cpu, mem, eng, resid.as_deref_mut(), &mut total_cyc);
+                    dispatch_irq_hybrid(cpu, mem, eng, &mut resid, &mut total_cyc);
                 }
             } else {
-                coarse_cycles(cpu, mem, c, resid.as_deref_mut());
+                coarse_cycles(cpu, mem, c, &mut resid);
                 total_cyc += u64::from(c);
             }
         } else {
-            coarse_cycles(cpu, mem, c, resid.as_deref_mut());
+            coarse_cycles(cpu, mem, c, &mut resid);
             total_cyc += u64::from(c);
         }
         ins += 1;

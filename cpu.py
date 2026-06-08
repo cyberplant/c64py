@@ -184,6 +184,8 @@ class CPU6502:
             if self.memory.vic_snapshot_each_emulated_frame:
                 self.memory.snapshot_vic_render_state()
 
+        self.memory.per_cycle_capture_vic_sample()
+
         return ba_low, ba_blocks_cpu, irq_edge
 
     @staticmethod

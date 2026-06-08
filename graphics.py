@@ -4,6 +4,8 @@ Pygame graphics interface for the C64 emulator.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import os
 import re
 import sys
@@ -121,6 +123,10 @@ class PygameInterface:
         # Standard hires text when RAM charset matches char ROM: pygame blit (built once per ROM+offset).
         self._rom_glyph_key: Optional[Tuple[int, int]] = None  # (id(char_rom), rom_offset)
         self._rom_glyph_surfaces: Optional[list] = None
+        # Charset row cache (vic bank, char base, screen code) → 8 glyph bytes; bounded LRU.
+        # Speeds per-cycle compositing (8000 cells/frame) when the same codes repeat (e.g. BASIC boot).
+        self._glyph_rows_cache: OrderedDict[tuple[int, int, int], bytes] = OrderedDict()
+        self._glyph_rows_cache_max: int = 8192
 
         self._palette = {
             0: (0, 0, 0),
@@ -863,14 +869,82 @@ class PygameInterface:
 
     def _fetch_glyph_rows(self, vic_bank_base: int, char_base: int, screen_code: int) -> bytes:
         """Read 8 bytes of charset definition as the VIC-II fetches (incl. ROM mirror at bank+$1000)."""
-        return self.emulator.memory.read_vic_charset_glyph_rows(
-            vic_bank_base, char_base, screen_code & 0xFF
-        )
+        code = screen_code & 0xFF
+        mem = self.emulator.memory
+        cacheable = mem.char_rom is not None
+        if cacheable:
+            for r in range(8):
+                rel = (char_base + code * 8 + r) & 0x3FFF
+                if not mem.vic_fetches_charset_rom(vic_bank_base, rel):
+                    cacheable = False
+                    break
+        if cacheable:
+            key = (vic_bank_base, char_base, code)
+            cache = self._glyph_rows_cache
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                return hit
+        row = mem.read_vic_charset_glyph_rows(vic_bank_base, char_base, code)
+        if cacheable:
+            cache[key] = row
+            if len(cache) > self._glyph_rows_cache_max:
+                cache.popitem(last=False)
+        return row
 
     def _plot_hires_text_cell(self, x: int, y: int, rows: bytes, fg_idx: int) -> None:
         """Draw an 8×8 hires glyph; unset bits leave the existing background."""
         fg = self._palette.get(fg_idx, (255, 255, 255))
         self._rgb_frame.plot_hires_glyph(x, y, rows, fg)
+
+    def _plot_hires_text_scanline(self, x: int, y: int, row_byte: int, fg_idx: int) -> None:
+        """Draw one hires text raster (8×1); unset bits leave the existing background."""
+        fg = self._palette.get(fg_idx, (255, 255, 255))
+        fr, fg_g, fb = fg
+        buf = self._rgb_frame._buf
+        w = self._rgb_frame.width
+        h = self._rgb_frame.height
+        if not (0 <= y < h):
+            return
+        base_row = y * w * 3
+        for xx in range(8):
+            if not (row_byte & (1 << (7 - xx))):
+                continue
+            px = x + xx
+            if not (0 <= px < w):
+                continue
+            i = base_row + px * 3
+            buf[i] = fr
+            buf[i + 1] = fg_g
+            buf[i + 2] = fb
+
+    def _plot_mcm_text_scanline(
+        self,
+        x: int,
+        y: int,
+        row_byte: int,
+        char_color_idx: int,
+        bg_i: int,
+        c1_i: int,
+        c2_i: int,
+    ) -> None:
+        """One multicolor text raster line (8×1): four 2-bit wide pixels."""
+        p0 = self._palette.get(bg_i, (0, 0, 0))
+        p1 = self._palette.get(c1_i, (0, 0, 0))
+        p2 = self._palette.get(c2_i, (0, 0, 0))
+        p3 = self._palette.get(char_color_idx, (0, 0, 0))
+        for pair in range(4):
+            bits = (row_byte >> (6 - pair * 2)) & 0x03
+            if bits == 0:
+                c = p0
+            elif bits == 1:
+                c = p1
+            elif bits == 2:
+                c = p2
+            else:
+                c = p3
+            px = x + pair * 2
+            self._rgb_frame.fill_rect(px, y, 2, 1, c)
 
     def _petscii_to_screen_code(self, petscii_char: int) -> int:
         return self.emulator._petscii_to_screen_code(petscii_char)
@@ -1001,10 +1075,10 @@ class PygameInterface:
 
         Background (text/bitmap) uses one VIC/CIA2 sample per 8-line content row.
         Sprites are composited **once** after all rows using the same frame latch
-        as :meth:`_render_frame_latched` (see :meth:`_render_sprites`). Per-row
-        sprite DMA (raster multiplex within a band) needs the future per-cycle
-        tier; sampling sprite regs only at each band start mis-draws games such
-        as Arkanoid.
+        as :meth:`_render_frame_latched` (see :meth:`_render_sprites`). Raster
+        multiplex that changes sprite registers between character columns is better
+        reproduced with **`--video-rendering per-cycle`**, which samples sprite regs
+        per column; the beam path still latches sprites once per frame.
 
         Per-line data comes from :meth:`MemoryMap.beam_capture_raster_line`
         during Python CPU steps and from the Rust fast batch when beam
@@ -1142,6 +1216,397 @@ class PygameInterface:
                 if screen_right < native_w:
                     self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
 
+    @staticmethod
+    def _vic_fg_opaque_hires_row(row_byte: int) -> Tuple[bool, ...]:
+        """Foreground bits for VIC-II sprite/background priority ($D01B), hires glyph row."""
+        return tuple(bool((row_byte >> (7 - dx)) & 1) for dx in range(8))
+
+    @staticmethod
+    def _vic_fg_opaque_mcm_row(row_byte: int) -> Tuple[bool, ...]:
+        """Opaque (non-transparent 00) pairs for multicolor text/bitmap rows."""
+        o = [False] * 8
+        for pair in range(4):
+            bits = (row_byte >> (6 - pair * 2)) & 0x03
+            op = bits != 0
+            o[pair * 2] = op
+            o[pair * 2 + 1] = op
+        return tuple(o)
+
+    def _per_cycle_overlay_sprites_eight_pixels(
+        self,
+        mem: "MemoryMap",
+        regb: memoryview,
+        regb_line: memoryview,
+        pra: int,
+        y_win: int,
+        col: int,
+        py: int,
+        fg_opaque: Tuple[bool, ...],
+    ) -> None:
+        """Draw sprite pixels for one 8-pixel content strip using this column's VIC/CIA2 sample.
+
+        Uses the same screen-space mapping as :meth:`_render_sprites` (``y - 50`` / ``x - 24``)
+        so sprites line up with the latched path; register values come from the per-cycle grid
+        so mid-raster sprite register changes affect the correct column.
+
+        ``regb_line`` is the VIC snapshot for **column 0** of this raster line (cycle 14). Sprite
+        attributes that games typically hold stable for the line—$D017/$D01D expansion, $D01C
+        multicolor, $D01B priority, $D025–$D026 and $D027–$D02E colors—are read from
+        ``regb_line`` so IRQs that rewrite them between character cycles do not tear one sprite
+        into mixed graphics. Sprite X, MSBs, $D015 enable, and $D011/$D016/$D018 mode (for pointer
+        matrix) still use the per-column ``regb`` sample.
+
+        Sprites are composited **7 → 0** (VIC-II: lower index in front). ``fg_opaque`` marks which
+        of the eight column pixels count as opaque foreground for ``$D01B`` sprite-behind-gfx.
+        """
+        if self._rgb_frame is None:
+            return
+
+        def rb_col(i: int) -> int:
+            return int(regb[i]) if i < len(regb) else 0
+
+        def rb_line(i: int) -> int:
+            return int(regb_line[i]) if i < len(regb_line) else 0
+
+        def rb_spr(i: int) -> int:
+            if i in (0x17, 0x1D, 0x1C, 0x1B) or (0x25 <= i <= 0x2E):
+                return rb_line(i)
+            return rb_col(i)
+
+        ram = mem.ram
+        vic_bank = (3 - (int(pra) & 0x03)) * 0x4000
+        mode_info = mem._display_mode_from_vic_bytes(regb)
+        screen_base = int(mode_info["screen_base"])
+        matrix = (vic_bank + screen_base) & 0xFFFF
+
+        buf = self._rgb_frame._buf
+        w = self._rgb_frame.width
+        screen_left = int(self._screen_rect.left)
+        sl = int(self._screen_rect.left)
+        sr = int(self._screen_rect.right)
+        st = int(self._screen_rect.top)
+        sb = int(self._screen_rect.bottom)
+
+        mc0 = self._palette.get(rb_spr(0x25) & 0x0F, (0, 0, 0))
+        mc1 = self._palette.get(rb_spr(0x26) & 0x0F, (0, 0, 0))
+        mcr0, mcg0, mcb0 = mc0
+        mcr1, mcg1, mcb1 = mc1
+
+        x0 = col * self.CHAR_WIDTH
+
+        sprite_pri = rb_spr(0x1B)
+        fo = fg_opaque if len(fg_opaque) == 8 else ((False,) * 8)
+
+        y_exp_mask = rb_spr(0x17)
+        x_exp_mask = rb_spr(0x1D)
+
+        for sprite_num in range(7, -1, -1):
+            if not (rb_col(0x15) & (1 << sprite_num)):
+                continue
+            behind_gfx = (sprite_pri >> sprite_num) & 1
+            y_vic = rb_col(sprite_num * 2 + 1)
+            # Same as _render_sprites: py = screen_top + (y_vic - 50) + row  →  row = y_win - y_vic + 50
+            row_disp = y_win - y_vic + 50
+            y_exp = (y_exp_mask >> sprite_num) & 1
+            if y_exp:
+                if row_disp < 0 or row_disp >= 42:
+                    continue
+                row = row_disp // 2
+            else:
+                if row_disp < 0 or row_disp >= 21:
+                    continue
+                row = row_disp
+
+            x_vic = rb_col(sprite_num * 2) + (256 if (rb_col(0x10) & (1 << sprite_num)) else 0)
+            sprite_x = x_vic - 24
+            x_exp = (x_exp_mask >> sprite_num) & 1
+            max_rel = 48 if x_exp else 24
+            multicolor = (rb_spr(0x1C) & (1 << sprite_num)) != 0
+            sp_idx = rb_spr(0x27 + sprite_num) & 0x0F
+            sp = self._palette.get(sp_idx, (255, 255, 255))
+            spr, spg, spb = sp
+
+            ptr = ram[(matrix + 0x3F8 + sprite_num) & 0xFFFF]
+            sprite_addr = (vic_bank + ((ptr & 0xFF) << 6)) & 0xFFFF
+            bo = (sprite_addr + row * 3) & 0xFFFF
+            row_data = (ram[bo] << 16) | (ram[(bo + 1) & 0xFFFF] << 8) | ram[(bo + 2) & 0xFFFF]
+
+            if multicolor:
+                for dx in range(8):
+                    if behind_gfx and fo[dx]:
+                        continue
+                    cx = x0 + dx
+                    rel_x = cx - sprite_x
+                    if rel_x < 0 or rel_x >= max_rel:
+                        continue
+                    bp = rel_x // 4 if x_exp else rel_x // 2
+                    bits = (row_data >> (22 - bp * 2)) & 0x03
+                    if bits == 0:
+                        continue
+                    if bits == 1:
+                        r, g, b = mcr0, mcg0, mcb0
+                    elif bits == 2:
+                        r, g, b = spr, spg, spb
+                    else:
+                        r, g, b = mcr1, mcg1, mcb1
+                    px = screen_left + cx
+                    if sl <= px < sr and st <= py < sb:
+                        i = (py * w + px) * 3
+                        buf[i] = r
+                        buf[i + 1] = g
+                        buf[i + 2] = b
+            else:
+                for dx in range(8):
+                    if behind_gfx and fo[dx]:
+                        continue
+                    cx = x0 + dx
+                    rel_x = cx - sprite_x
+                    if rel_x < 0 or rel_x >= max_rel:
+                        continue
+                    bi = rel_x // 2 if x_exp else rel_x
+                    if not ((row_data >> (23 - bi)) & 0x01):
+                        continue
+                    px = screen_left + cx
+                    if sl <= px < sr and st <= py < sb:
+                        i = (py * w + px) * 3
+                        buf[i] = spr
+                        buf[i + 1] = spg
+                        buf[i + 2] = spb
+
+    def _render_frame_per_cycle(self) -> None:
+        """Per-cycle video: VIC/CIA2 samples on a 40×200 grid (see ``video_beam.per_cycle_geometry``).
+
+        Text modes (hires, multicolor, ECM) and **bitmap** (hires / multicolor) use the sampled
+        registers per character column and scanline. **Sprites** use the same per-column samples
+        (mid-raster moves and multiplexing) instead of the end-of-frame latch.
+        """
+        from .video_beam import content_row_to_raster_line, per_cycle_geometry
+
+        mem = self.emulator.memory
+        flat = mem.per_cycle_vic_flat
+        cia = mem.per_cycle_cia2_flat
+        if (
+            not getattr(mem, "per_cycle_render_enabled", False)
+            or flat is None
+            or cia is None
+            or not getattr(mem, "per_cycle_snapshots_primed", False)
+        ):
+            self._render_frame_latched()
+            return
+
+        vs = mem.video_standard
+        geom = per_cycle_geometry(vs)
+        flat_mv = memoryview(flat)
+        skip_sprites = _env_truthy("C64PY_PER_CYCLE_NO_SPRITES")
+
+        nlines = geom.raster_lines
+        total_lines = nlines
+        content_first = content_row_to_raster_line(0, vs)
+        content_h = geom.content_height
+        top_lines = max(0, min(total_lines, content_first))
+        bottom_lines = max(0, total_lines - (content_first + content_h))
+        border_px = int(self.border_size)
+        native_h = int(self._rgb_frame.height)
+        native_w = int(self._rgb_frame.width)
+        screen_left = int(self._screen_rect.left)
+        screen_top = int(self._screen_rect.top)
+        screen_w = int(self._screen_rect.width)
+        screen_h = int(self._screen_rect.height)
+        screen_right = screen_left + screen_w
+
+        use_rust_draw = (
+            os.environ.get("C64PY_RUST_COMPOSITE", "1").strip().lower()
+            not in ("0", "no", "false", "off")
+        )
+        if use_rust_draw:
+            try:
+                from . import _core
+                if _core.is_available:
+                    pal48 = bytearray(48)
+                    for i in range(16):
+                        r, g, b = self._palette.get(i, (0, 0, 0))
+                        pal48[i * 3] = r
+                        pal48[i * 3 + 1] = g
+                        pal48[i * 3 + 2] = b
+                    _core.composite_per_cycle_frame(
+                        mem,
+                        bytes(pal48),
+                        self._rgb_frame._buf,
+                        video_standard=str(vs),
+                        native_width=native_w,
+                        native_height=native_h,
+                        screen_left=screen_left,
+                        screen_top=screen_top,
+                        screen_width=screen_w,
+                        screen_height=screen_h,
+                        border_px=border_px,
+                        skip_sprites=skip_sprites,
+                    )
+                    return
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                pass
+
+        def _border_regb_for_rl(rl: int) -> memoryview:
+            rl %= nlines
+            y_win = rl - geom.content_first_raster
+            if 0 <= y_win < geom.content_height and len(flat_mv) >= (y_win * geom.content_cycles + 1) * 64:
+                o = (y_win * geom.content_cycles) * 64
+                return flat_mv[o : o + 64]
+            return memoryview(mem._vic_regs)[:64]
+
+        for y in range(native_h):
+            if border_px > 0 and y < border_px:
+                rl = int((y * top_lines) / border_px) if top_lines > 0 else 0
+            elif y < border_px + content_h:
+                rl = content_first + (y - border_px)
+            else:
+                yy = y - (border_px + content_h)
+                rl = (content_first + content_h) + (
+                    int((yy * bottom_lines) / border_px) if border_px > 0 else 0
+                )
+            rl %= nlines
+            regb = _border_regb_for_rl(rl)
+            border_code = regb[0x20] & 0x0F if len(regb) > 0x20 else 0x0E
+            if border_code == 0 and not any(regb):
+                border_code = 0x0E
+            c = self._palette.get(border_code, (0, 0, 0))
+            if y < screen_top or y >= screen_top + screen_h:
+                self._rgb_frame.fill_rect(0, y, native_w, 1, c)
+            else:
+                if screen_left > 0:
+                    self._rgb_frame.fill_rect(0, y, screen_left, 1, c)
+                if screen_right < native_w:
+                    self._rgb_frame.fill_rect(screen_right, y, native_w - screen_right, 1, c)
+
+        ram = mem.ram
+        content_px_w = geom.content_cycles * self.CHAR_WIDTH
+        for y_win in range(geom.content_height):
+            idx_bg = y_win * geom.content_cycles
+            o_bg = idx_bg * 64
+            regb_bg = flat_mv[o_bg : o_bg + 64]
+            if not any(regb_bg):
+                regb_bg = memoryview(mem._vic_regs)[:64]
+            bg_scan = self._palette.get(regb_bg[0x21] & 0x0F, (0, 0, 0))
+            py = screen_top + y_win
+            self._rgb_frame.fill_rect(screen_left, py, content_px_w, 1, bg_scan)
+
+            o_line = idx_bg * 64
+            regb_line = flat_mv[o_line : o_line + 64]
+            if not any(regb_line):
+                regb_line = memoryview(mem._vic_regs)[:64]
+
+            text_row = y_win // self.CHAR_HEIGHT
+            scan = y_win % self.CHAR_HEIGHT
+            for col in range(geom.content_cycles):
+                idx = y_win * geom.content_cycles + col
+                o = idx * 64
+                regb = flat_mv[o : o + 64]
+                pra = int(cia[idx]) & 0xFF
+                if not any(regb):
+                    regb = memoryview(mem._vic_regs)[:64]
+                    pra = mem.cia2_pra & 0xFF
+                mode_info = mem._display_mode_from_vic_bytes(regb)
+                vic_bank = (3 - (pra & 0x03)) * 0x4000
+                bg_colors = [
+                    regb[0x21] & 0x0F,
+                    regb[0x22] & 0x0F,
+                    regb[0x23] & 0x0F,
+                    regb[0x24] & 0x0F,
+                ]
+                screen_base = (vic_bank + mode_info["screen_base"]) & 0xFFFF
+                bitmap_base = (vic_bank + mode_info["bitmap_base"]) & 0xFFFF
+                x = screen_left + col * self.CHAR_WIDTH
+                char_index = text_row * self.SCREEN_COLS + col
+
+                if mode_info["bitmap_mode"]:
+                    color_data = ram[(screen_base + char_index) & 0xFFFF]
+                    color_mem = ram[COLOR_MEM + char_index] & 0x0F
+                    bitmap_offset = char_index * 8
+                    byte = ram[(bitmap_base + bitmap_offset + scan) & 0xFFFF]
+                    self._plot_bitmap_scanline(
+                        x,
+                        py,
+                        byte,
+                        bool(mode_info.get("multicolor")),
+                        bg_colors[0],
+                        color_data,
+                        color_mem,
+                    )
+                    if not skip_sprites:
+                        if mode_info.get("multicolor"):
+                            fg_op = self._vic_fg_opaque_mcm_row(byte)
+                        else:
+                            fg_op = self._vic_fg_opaque_hires_row(byte)
+                        self._per_cycle_overlay_sprites_eight_pixels(
+                            mem, regb, regb_line, pra, y_win, col, py, fg_op
+                        )
+                    continue
+
+                char_base = mode_info["char_base"]
+                raw_code = ram[(screen_base + char_index) & 0xFFFF]
+                color_code = ram[COLOR_MEM + char_index] & 0x0F
+
+                extended_color = bool(mode_info.get("extended_color", False))
+                multicolor_text = bool(mode_info.get("multicolor")) and not extended_color
+
+                if extended_color:
+                    bg_index = (raw_code >> 6) & 0x03
+                    code_ecm = raw_code & 0x3F
+                    char_bg = self._palette.get(bg_colors[bg_index], (0, 0, 0))
+                    self._rgb_frame.fill_rect(x, py, self.CHAR_WIDTH, 1, char_bg)
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, code_ecm)
+                    row_byte_text = row_bytes[scan]
+                    self._plot_hires_text_scanline(x, py, row_byte_text, color_code)
+                else:
+                    row_bytes = self._fetch_glyph_rows(vic_bank, char_base, raw_code)
+                    row_byte_text = row_bytes[scan]
+                    if multicolor_text and (color_code & 0x08):
+                        self._plot_mcm_text_scanline(
+                            x,
+                            py,
+                            row_byte_text,
+                            color_code & 0x07,
+                            bg_colors[0],
+                            bg_colors[1],
+                            bg_colors[2],
+                        )
+                    else:
+                        fg = (color_code & 0x07) if multicolor_text else color_code
+                        self._plot_hires_text_scanline(x, py, row_byte_text, fg)
+
+                if not skip_sprites:
+                    if extended_color:
+                        fg_op = self._vic_fg_opaque_hires_row(row_byte_text)
+                    elif multicolor_text and (color_code & 0x08):
+                        fg_op = self._vic_fg_opaque_mcm_row(row_byte_text)
+                    else:
+                        fg_op = self._vic_fg_opaque_hires_row(row_byte_text)
+                    self._per_cycle_overlay_sprites_eight_pixels(
+                        mem, regb, regb_line, pra, y_win, col, py, fg_op
+                    )
+
+        if mem.vic_render_snapshots:
+            mem.snapshot_vic_render_state()
+
+    def _render_frame(self) -> None:
+        """Render one frame into the back buffer (per-cycle, beam, or latched)."""
+        mem = self.emulator.memory
+        if (
+            getattr(mem, "per_cycle_render_enabled", False)
+            and mem.per_cycle_vic_flat is not None
+            and getattr(mem, "per_cycle_snapshots_primed", False)
+        ):
+            self._render_frame_per_cycle()
+            return
+        if (
+            getattr(mem, "beam_render_enabled", False)
+            and mem.beam_vic_lines
+            and getattr(mem, "beam_snapshots_primed", False)
+        ):
+            self._render_frame_beam()
+            return
+        self._render_frame_latched()
+
     def _render_frame_latched(self) -> None:
         """Render one frame using the per-frame VIC latch (non-beam path).
 
@@ -1210,19 +1675,7 @@ class PygameInterface:
 
         # Render sprites on top
         self._render_sprites(snap)
-        
-    def _render_frame(self) -> None:
-        """Render one frame into the back buffer (beam or latched)."""
-        mem = self.emulator.memory
-        if (
-            getattr(mem, "beam_render_enabled", False)
-            and mem.beam_vic_lines
-            and getattr(mem, "beam_snapshots_primed", False)
-        ):
-            self._render_frame_beam()
-            return
-        self._render_frame_latched()
-    
+
     def _render_text_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render text mode; charset definitions are read from VIC bank RAM (as the VIC would).
 
@@ -1391,34 +1844,66 @@ class PygameInterface:
             color_mem = mem[COLOR_MEM + char_index] & 0x0F
             bitmap_offset = char_index * 8
             base_x = screen_left + col * 8
-            if multicolor:
-                color1 = (color_data >> 4) & 0x0F
-                color2 = color_data & 0x0F
-                color3 = color_mem
-                for r in range(8):
-                    byte = mem[(bitmap_base + bitmap_offset + r) & 0xFFFF]
-                    yy = y + r
-                    for bit_pair in range(4):
-                        pixel_bits = (byte >> (6 - bit_pair * 2)) & 0x03
-                        if pixel_bits == 0:
-                            c = self._palette.get(bg0_color_idx, (0, 0, 0))
-                        elif pixel_bits == 1:
-                            c = self._palette.get(color1, (0, 0, 0))
-                        elif pixel_bits == 2:
-                            c = self._palette.get(color2, (0, 0, 0))
-                        else:
-                            c = self._palette.get(color3, (0, 0, 0))
-                        self._rgb_frame.fill_rect(base_x + bit_pair * 2, yy, 2, 1, c)
-            else:
-                color1 = (color_data >> 4) & 0x0F
-                color0 = color_data & 0x0F
-                for r in range(8):
-                    byte = mem[(bitmap_base + bitmap_offset + r) & 0xFFFF]
-                    yy = y + r
-                    for bit in range(8):
-                        pixel_bit = (byte >> (7 - bit)) & 0x01
-                        c = self._palette.get(color1 if pixel_bit else color0, (0, 0, 0))
-                        self._rgb_frame.put_pixel(base_x + bit, yy, c)
+            for r in range(8):
+                byte = mem[(bitmap_base + bitmap_offset + r) & 0xFFFF]
+                yy = y + r
+                self._plot_bitmap_scanline(
+                    base_x, yy, byte, multicolor, bg0_color_idx, color_data, color_mem
+                )
+
+    def _plot_bitmap_scanline(
+        self,
+        base_x: int,
+        yy: int,
+        byte: int,
+        multicolor: bool,
+        bg0_color_idx: int,
+        color_data: int,
+        color_mem: int,
+    ) -> None:
+        """Draw one 8-pixel row of a bitmap 8×8 cell (hi-res or multicolor)."""
+        if multicolor:
+            color1 = (color_data >> 4) & 0x0F
+            color2 = color_data & 0x0F
+            color3 = color_mem
+            for bit_pair in range(4):
+                pixel_bits = (byte >> (6 - bit_pair * 2)) & 0x03
+                if pixel_bits == 0:
+                    c = self._palette.get(bg0_color_idx, (0, 0, 0))
+                elif pixel_bits == 1:
+                    c = self._palette.get(color1, (0, 0, 0))
+                elif pixel_bits == 2:
+                    c = self._palette.get(color2, (0, 0, 0))
+                else:
+                    c = self._palette.get(color3, (0, 0, 0))
+                self._rgb_frame.fill_rect(base_x + bit_pair * 2, yy, 2, 1, c)
+        else:
+            color1 = (color_data >> 4) & 0x0F
+            color0 = color_data & 0x0F
+            c0 = self._palette.get(color0, (0, 0, 0))
+            c1 = self._palette.get(color1, (0, 0, 0))
+            buf = self._rgb_frame._buf
+            w = self._rgb_frame.width
+            h = self._rgb_frame.height
+            if not (0 <= yy < h):
+                return
+            r0, g0, b0 = c0
+            r1, g1, b1 = c1
+            base_row = yy * w * 3
+            for bit in range(8):
+                px = base_x + bit
+                if not (0 <= px < w):
+                    continue
+                if (byte >> (7 - bit)) & 0x01:
+                    i = base_row + px * 3
+                    buf[i] = r1
+                    buf[i + 1] = g1
+                    buf[i + 2] = b1
+                else:
+                    i = base_row + px * 3
+                    buf[i] = r0
+                    buf[i + 1] = g0
+                    buf[i + 2] = b0
 
     def _render_bitmap_mode(self, mode_info: dict, snap: Optional[Tuple[bytes, int]] = None) -> None:
         """Render bitmap mode (standard or multicolor); wrapper over per-row helper."""
@@ -1451,12 +1936,16 @@ class PygameInterface:
             regb, _ = snap
             sprite_mc0 = regb[0x25] & 0x0F if len(regb) > 0x25 else 0
             sprite_mc1 = regb[0x26] & 0x0F if len(regb) > 0x26 else 0
+            y_exp_mask = regb[0x17] & 0xFF if len(regb) > 0x17 else 0
+            x_exp_mask = regb[0x1D] & 0xFF if len(regb) > 0x1D else 0
         else:
             sprite_mc0 = self.emulator.memory.read(0xD025) & 0x0F
             sprite_mc1 = self.emulator.memory.read(0xD026) & 0x0F
+            y_exp_mask = self.emulator.memory.read(0xD017) & 0xFF
+            x_exp_mask = self.emulator.memory.read(0xD01D) & 0xFF
         
-        # Render sprites 0-7 (back to front)
-        for sprite_num in range(8):
+        # Render sprites 7→0 so lower-numbered sprites appear in front (VIC-II order).
+        for sprite_num in range(7, -1, -1):
             sprite_data = self.emulator.memory.get_sprite_data(sprite_num, for_render=True)
             
             if not sprite_data['enabled']:
@@ -1465,7 +1954,7 @@ class PygameInterface:
             # Get sprite bitmap data (63 bytes per sprite) in VIC bank RAM
             sprite_addr = sprite_data['sprite_ram_base']
 
-            # Sprites are 24x21 pixels
+            # Sprites are 24x21 pixels of data; X/Y expansion stretches to 48x42 on screen.
             # Offset sprite coordinates to screen space
             # VIC-II sprite coordinates are relative to the display area, not the border
             # Subtract 24 pixels for X to align with display area (standard C64 offset)
@@ -1473,47 +1962,57 @@ class PygameInterface:
             sprite_x = sprite_data['x'] - 24
             sprite_y = sprite_data['y'] - 50
             sprite_color = self._palette.get(sprite_data['color'], (255, 255, 255))
+            y_exp = (y_exp_mask >> sprite_num) & 1
+            x_exp = (x_exp_mask >> sprite_num) & 1
             
             # Render sprite pixels
             if sprite_data['multicolor']:
-                # Multicolor sprite: 12x21 (double-wide pixels)
+                # Multicolor sprite: 12x21 data pairs; each pair is 2 or 4 screen pixels wide.
                 for row in range(21):
                     # Each row is 3 bytes
                     byte_offset = (sprite_addr + row * 3) & 0xFFFF
                     row_data = (mem[byte_offset] << 16) | (mem[(byte_offset + 1) & 0xFFFF] << 8) | mem[(byte_offset + 2) & 0xFFFF]
-                    
-                    for bit_pair in range(12):
-                        pixel_bits = (row_data >> (22 - bit_pair * 2)) & 0x03
-                        
-                        if pixel_bits == 0:
-                            continue  # Transparent
-                        elif pixel_bits == 1:
-                            color = self._palette.get(sprite_mc0, (0, 0, 0))
-                        elif pixel_bits == 2:
-                            color = sprite_color
-                        else:  # pixel_bits == 3
-                            color = self._palette.get(sprite_mc1, (0, 0, 0))
-                        
-                        # Draw double-wide pixel
-                        px = screen_left + sprite_x + bit_pair * 2
-                        py = screen_top + sprite_y + row
-                        # Check if pixel is within screen rect bounds
-                        if (self._screen_rect.left <= px < self._screen_rect.right and 
-                            self._screen_rect.top <= py < self._screen_rect.bottom):
-                            self._rgb_frame.fill_rect(px, py, 2, 1, color)
+                    y_steps = (0, 1) if y_exp else (0,)
+                    for ydup in y_steps:
+                        py = screen_top + sprite_y + row * (2 if y_exp else 1) + ydup
+                        for bit_pair in range(12):
+                            pixel_bits = (row_data >> (22 - bit_pair * 2)) & 0x03
+                            
+                            if pixel_bits == 0:
+                                continue  # Transparent
+                            elif pixel_bits == 1:
+                                color = self._palette.get(sprite_mc0, (0, 0, 0))
+                            elif pixel_bits == 2:
+                                color = sprite_color
+                            else:  # pixel_bits == 3
+                                color = self._palette.get(sprite_mc1, (0, 0, 0))
+                            
+                            px = screen_left + sprite_x + bit_pair * (4 if x_exp else 2)
+                            w = 4 if x_exp else 2
+                            if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                self._screen_rect.top <= py < self._screen_rect.bottom):
+                                self._rgb_frame.fill_rect(px, py, w, 1, color)
             else:
-                # Hi-res sprite: 24x21
+                # Hi-res sprite: 24x21 data bits
                 for row in range(21):
                     byte_offset = (sprite_addr + row * 3) & 0xFFFF
                     row_data = (mem[byte_offset] << 16) | (mem[(byte_offset + 1) & 0xFFFF] << 8) | mem[(byte_offset + 2) & 0xFFFF]
-                    
-                    for bit in range(24):
-                        pixel_bit = (row_data >> (23 - bit)) & 0x01
-                        
-                        if pixel_bit:
-                            px = screen_left + sprite_x + bit
-                            py = screen_top + sprite_y + row
-                            # Check if pixel is within screen rect bounds
-                            if (self._screen_rect.left <= px < self._screen_rect.right and 
-                                self._screen_rect.top <= py < self._screen_rect.bottom):
-                                self._rgb_frame.put_pixel(px, py, sprite_color)
+                    y_steps = (0, 1) if y_exp else (0,)
+                    for ydup in y_steps:
+                        py = screen_top + sprite_y + row * (2 if y_exp else 1) + ydup
+                        for bit in range(24):
+                            pixel_bit = (row_data >> (23 - bit)) & 0x01
+                            
+                            if pixel_bit:
+                                px0 = screen_left + sprite_x + bit * (2 if x_exp else 1)
+                                if x_exp:
+                                    for xd in range(2):
+                                        px = px0 + xd
+                                        if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                            self._screen_rect.top <= py < self._screen_rect.bottom):
+                                            self._rgb_frame.put_pixel(px, py, sprite_color)
+                                else:
+                                    px = px0
+                                    if (self._screen_rect.left <= px < self._screen_rect.right and 
+                                        self._screen_rect.top <= py < self._screen_rect.bottom):
+                                        self._rgb_frame.put_pixel(px, py, sprite_color)

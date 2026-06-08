@@ -274,6 +274,38 @@ class C64:
             ema = max(-mx, ema - self._SPEED_THROTTLE_HZ_NUDGE_FAST)
         self._speed_sleep_overshoot_ema = max(-mx, min(mx, ema))
 
+    def _resid_audio_backpressure_if_needed(self) -> None:
+        """If the lockstep reSID queue is far ahead of pygame playback, sleep briefly.
+
+        Wall-clock CPU throttling targets ~985/1022 kHz but host timer jitter (and bursty
+        Rust batches) can leave the PCM queue growing to multiple seconds — heard as
+        increasing A/V lag. Cap effective backlog with a short sleep when pending bytes
+        exceed ``C64PY_RESID_MAX_PENDING_SEC`` × sample_rate (default ~0.35 s).
+        """
+        sid = getattr(self, "sid", None)
+        if sid is None or not hasattr(sid, "get_resid_audio_stats"):
+            return
+        if not getattr(sid, "_cpu_lockstep", True) and not getattr(sid, "_rust_pcm_mode", False):
+            return
+        try:
+            st = sid.get_resid_audio_stats()
+            pending = int(st.get("pending_bytes_now", 0))
+        except Exception:
+            return
+        try:
+            max_sec = float(os.environ.get("C64PY_RESID_MAX_PENDING_SEC", "0.35").strip())
+        except ValueError:
+            max_sec = 0.35
+        max_sec = max(0.08, min(max_sec, 3.0))
+        sr = float(getattr(sid, "_sample_rate", 44100) or 44100)
+        cap = int(max_sec * sr * 2.0)
+        excess = pending - cap
+        if excess <= 0:
+            return
+        nap = min(0.25, excess / (sr * 2.0))
+        if nap >= self._SPEED_THROTTLE_MIN_SLEEP_SEC:
+            time.sleep(nap)
+
     def throttle_emulation_if_needed(self, cycles: int) -> None:
         """Sleep if we're ahead of real time for the configured CPU clock (no-op if turbo).
 
@@ -286,9 +318,14 @@ class C64:
         and IRQ phase; that still requires advancing the chip model each emulated cycle
         (or a proven fast-forward with equivalent state).
 
+        When reSID lockstep (or Rust-fed PCM) is enabled, :meth:`_resid_audio_backpressure_if_needed`
+        runs first so the pending PCM queue cannot drift many seconds ahead of SDL playback
+        (tunable via ``C64PY_RESID_MAX_PENDING_SEC``).
+
         """
         if getattr(self, "turbo", False):
             return
+        self._resid_audio_backpressure_if_needed()
         if not hasattr(self, "_speed_throttle_deadline"):
             self.reset_speed_throttle()
         self._speed_throttle_per_second_log_and_tune(cycles)

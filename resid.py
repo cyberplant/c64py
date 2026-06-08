@@ -32,6 +32,10 @@ controls the minimum gap between lines. A final summary line is printed on ``clo
 when tracing is enabled. Use ``ReSIDEmulator.get_resid_audio_stats()`` for live totals
 without stderr noise.
 
+Optional ``C64PY_RESID_MAX_PENDING_SEC`` (default ``0.35``): when the lockstep PCM queue
+exceeds this many seconds of mono int16 audio, the emulator CPU thread sleeps briefly so
+playback does not drift seconds behind the game (see ``C64Emulator._resid_audio_backpressure_if_needed``).
+
 WAV capture (same PCM as pygame)
 ----------------------------------
 Set ``C64PY_RESID_WAV`` to a filesystem path (e.g. ``/tmp/c64_resid.wav``). Every mixer

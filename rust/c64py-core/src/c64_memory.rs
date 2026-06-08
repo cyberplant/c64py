@@ -1,5 +1,6 @@
 //! C64 memory decode (6510 banking + I/O). Mirrors [memory.py](memory.py) read/write fast path.
 
+use crate::per_cycle_composite::per_cycle_flat_index;
 use crate::resid_session::ResidSession;
 
 pub const ROM_BASIC_START: u16 = 0xA000;
@@ -105,6 +106,10 @@ pub struct C64MemoryMap<'a> {
     pub beam_cia2_ptr: *mut u8,
     pub beam_nlines: u16,
     pub beam_enabled: bool,
+    /// Optional per-cycle VIC grid (``8000 * 64`` + ``8000`` bytes) for pygame ``per-cycle`` tier.
+    pub per_cycle_vic_ptr: *mut u8,
+    pub per_cycle_cia2_ptr: *mut u8,
+    pub per_cycle_capture_enabled: bool,
 }
 
 impl<'a> C64MemoryMap<'a> {
@@ -144,6 +149,34 @@ impl<'a> C64MemoryMap<'a> {
             beam_cia2_ptr: std::ptr::null_mut(),
             beam_nlines: 0,
             beam_enabled: false,
+            per_cycle_vic_ptr: std::ptr::null_mut(),
+            per_cycle_cia2_ptr: std::ptr::null_mut(),
+            per_cycle_capture_enabled: false,
+        }
+    }
+
+    /// Copy VIC + CIA2 PA into per-cycle flat buffers when the cursor is inside the 320×200 window.
+    pub fn per_cycle_capture_at_cursor(&mut self) {
+        if !self.per_cycle_capture_enabled {
+            return;
+        }
+        if self.per_cycle_vic_ptr.is_null() || self.per_cycle_cia2_ptr.is_null() {
+            return;
+        }
+        let Some(idx) = per_cycle_flat_index(self.video_standard, self.raster_line, self.raster_cycles)
+        else {
+            return;
+        };
+        if idx >= crate::per_cycle_composite::PC_SAMPLES {
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.vic_regs.as_ptr(),
+                self.per_cycle_vic_ptr.add(idx * 64),
+                64,
+            );
+            *self.per_cycle_cia2_ptr.add(idx) = self.cia2_pra;
         }
     }
 
