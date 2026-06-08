@@ -123,12 +123,12 @@ match opcode {
             },
             0xc7 => {
             let zp_addr = mr(mem, cpu, cpu.pc.wrapping_add(1));
-            let value = (mr(mem, cpu, u16::from(zp_addr)) - 1) & 0xFF;
+            let value = mr(mem, cpu, u16::from(zp_addr)).wrapping_sub(1);
             mw(mem, cpu, zp_addr as u16, value);
-            let result = cpu.a - value;
-            set_flag(cpu, 0x01, result >= 0);
-            set_flag(cpu, 0x02, result == 0);
-            set_flag(cpu, 0x80, (result & 0x80) != 0);
+            set_flag(cpu, 0x01, cpu.a >= value);
+            let diff = cpu.a.wrapping_sub(value);
+            set_flag(cpu, 0x02, diff == 0);
+            set_flag(cpu, 0x80, (diff & 0x80) != 0);
             cpu.pc = (cpu.pc.wrapping_add(2)) & 0xFFFF;
             return 5;
             },
@@ -553,7 +553,7 @@ match opcode {
             return plp(cpu, mem);
             },
             0x7a => {
-            cpu.sp = (cpu.sp + 1) & 0xFF;
+            cpu.sp = cpu.sp.wrapping_add(1);
             cpu.y = mr(mem, cpu, 0x0100u16.wrapping_add(cpu.sp as u16));
             update_nz(cpu, cpu.y);
             cpu.pc = (cpu.pc.wrapping_add(1)) & 0xFFFF;
