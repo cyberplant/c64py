@@ -3,6 +3,21 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
+# Native build deps: Rust extension (maturin/PyO3) + VICE-style reSID (built from source)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    build-essential \
+    pkg-config \
+    git \
+    autoconf \
+    automake \
+    libtool \
+    && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt numpy
@@ -10,11 +25,27 @@ RUN pip install --no-cache-dir -r requirements.txt numpy
 # Copy the rest of the application
 COPY . .
 
-# Install the package in development mode
+# VICE-style reSID + ctypes wrapper (Debian libresid-builder-dev is sidplay, not reSID)
+RUN git clone --depth 1 https://github.com/cyberplant/resid.git /tmp/resid \
+    && cd /tmp/resid \
+    && autoreconf -i \
+    && ./configure CXXFLAGS="-fPIC -g -Wall -O3 -fno-exceptions" \
+    && make -j"$(nproc)" \
+    && make -C /app/src/resid_wrapper RESID_SRCDIR=/tmp/resid install \
+    && rm -rf /tmp/resid
+
+# Optional PyO3 fast-path core (required for --vic-emulation accurate-rust)
+RUN maturin build --release --manifest-path rust/c64py-core/Cargo.toml -o /tmp/wheels \
+    && pip install /tmp/wheels/*.whl
+
+# Install the Python package
 RUN pip install -e .
+
+# Smoke-check native pieces expected by benchmark / accurate-rust defaults
+RUN python -c "import c64py_rust_core; import pathlib; assert pathlib.Path('resid_c.so').is_file()"
 
 # ROMs must be mounted at /roms or set via C64PY_ROM_DIR
 ENV C64PY_ROM_DIR=/roms
 
 ENTRYPOINT ["python", "C64.py"]
-CMD ["--benchmark"]
+CMD ["--benchmark", "--no-config", "--vic-emulation", "accurate-rust"]

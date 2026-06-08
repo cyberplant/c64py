@@ -22,7 +22,7 @@ jobs:
       - name: Build ROMs from source
         run: |
           git clone --depth 1 https://github.com/mist64/c64rom.git /tmp/c64rom
-          cd /tmp/c64rom && make
+          cd /tmp/c64rom && SHELL=/bin/bash make
           mkdir -p $HOME/roms
           cp /tmp/c64rom/basic.bin $HOME/roms/basic.901226-01.bin
           cp /tmp/c64rom/kernal.bin $HOME/roms/kernal.901227-03.bin
@@ -46,7 +46,7 @@ jobs:
       - name: Build ROMs from source
         run: |
           git clone --depth 1 https://github.com/mist64/c64rom.git /tmp/c64rom
-          cd /tmp/c64rom && make
+          cd /tmp/c64rom && SHELL=/bin/bash make
           mkdir -p $HOME/roms
           cp /tmp/c64rom/basic.bin $HOME/roms/basic.901226-01.bin
           cp /tmp/c64rom/kernal.bin $HOME/roms/kernal.901227-03.bin
