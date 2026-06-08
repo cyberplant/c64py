@@ -121,7 +121,11 @@ def tcp_drive_with_hello_prg(tmp_path):
     finally:
         client.disconnect()
         proc.terminate()
-        proc.wait(timeout=3)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
 
 
 def test_wire_decode_open_prg_emits_json_to_tcp_server(tcp_drive_with_hello_prg):

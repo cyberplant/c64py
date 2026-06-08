@@ -227,6 +227,9 @@ class HostCommandChannel:
 
         text_command = ' '.join([cmd] + flat_args)
         reply = dispatch_text_command(self.emu, text_command)
+        if reply.startswith("ERROR:"):
+            err = reply[6:].lstrip() or reply
+            return self._encode_json_reply({"ok": False, "error": err})
         return self._encode_json_reply({"ok": True, "result": reply})
 
     # ------------------------------------------------------- reply encoding

@@ -257,6 +257,15 @@ class TestHostCommandChannelJson:
         assert obj["ok"] is False
         assert "args" in obj["error"].lower()
 
+    def test_json_dispatcher_error(self):
+        emu, chan = _make_channel()
+        _post_request(emu, 0xC000, b'{"cmd":"NO_SUCH_COMMAND"}')
+        chan.poll()
+        obj = json.loads(_read_reply(emu, 0xC100).decode("ascii"))
+        assert obj["ok"] is False
+        assert "unknown command" in obj["error"].lower()
+        assert "result" not in obj
+
 
 class TestHostCommandChannelConstruction:
     def test_overlap_rejected(self):
