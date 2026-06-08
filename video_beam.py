@@ -74,14 +74,23 @@ NTSC_PER_CYCLE_GEOMETRY = VicPerCycleGeometry(
 )
 
 
+def _normalize_video_standard(video_standard: str) -> str:
+    v = (video_standard or "pal").strip().lower()
+    return "ntsc" if v == "ntsc" else "pal"
+
+
 def per_cycle_geometry(video_standard: str) -> VicPerCycleGeometry:
     """Return per-cycle sampler dimensions for ``video_standard``."""
-    return NTSC_PER_CYCLE_GEOMETRY if video_standard == "ntsc" else PAL_PER_CYCLE_GEOMETRY
+    return (
+        NTSC_PER_CYCLE_GEOMETRY
+        if _normalize_video_standard(video_standard) == "ntsc"
+        else PAL_PER_CYCLE_GEOMETRY
+    )
 
 
 def content_row_to_raster_line(row: int, video_standard: str) -> int:
     """Map a row index 0..199 inside the 320x200 content area to a raster line index."""
-    if video_standard == "ntsc":
+    if _normalize_video_standard(video_standard) == "ntsc":
         base = NTSC_CONTENT_FIRST_RASTER
         h = NTSC_CONTENT_HEIGHT
     else:

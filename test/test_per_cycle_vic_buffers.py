@@ -18,6 +18,11 @@ def test_per_cycle_geometry_pal_visible_window() -> None:
     assert geom.sample_index(251, 14) is None
 
 
+def test_per_cycle_geometry_normalizes_video_standard() -> None:
+    assert per_cycle_geometry("PAL").visible_sample_count == per_cycle_geometry("pal").visible_sample_count
+    assert per_cycle_geometry("Ntsc").raster_lines == 263
+
+
 def test_per_cycle_geometry_ntsc_frame_budget() -> None:
     geom = per_cycle_geometry("ntsc")
     assert geom.raster_lines == 263

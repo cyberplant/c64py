@@ -870,16 +870,26 @@ class PygameInterface:
     def _fetch_glyph_rows(self, vic_bank_base: int, char_base: int, screen_code: int) -> bytes:
         """Read 8 bytes of charset definition as the VIC-II fetches (incl. ROM mirror at bank+$1000)."""
         code = screen_code & 0xFF
-        key = (vic_bank_base, char_base, code)
-        cache = self._glyph_rows_cache
-        hit = cache.get(key)
-        if hit is not None:
-            cache.move_to_end(key)
-            return hit
-        row = self.emulator.memory.read_vic_charset_glyph_rows(vic_bank_base, char_base, code)
-        cache[key] = row
-        if len(cache) > self._glyph_rows_cache_max:
-            cache.popitem(last=False)
+        mem = self.emulator.memory
+        cacheable = mem.char_rom is not None
+        if cacheable:
+            for r in range(8):
+                rel = (char_base + code * 8 + r) & 0x3FFF
+                if not mem.vic_fetches_charset_rom(vic_bank_base, rel):
+                    cacheable = False
+                    break
+        if cacheable:
+            key = (vic_bank_base, char_base, code)
+            cache = self._glyph_rows_cache
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                return hit
+        row = mem.read_vic_charset_glyph_rows(vic_bank_base, char_base, code)
+        if cacheable:
+            cache[key] = row
+            if len(cache) > self._glyph_rows_cache_max:
+                cache.popitem(last=False)
         return row
 
     def _plot_hires_text_cell(self, x: int, y: int, rows: bytes, fg_idx: int) -> None:
