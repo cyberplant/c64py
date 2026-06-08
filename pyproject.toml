@@ -18,7 +18,7 @@ dependencies = [
   "tomli>=2.0.0; python_version<\"3.11\"",
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/luar/c64py"
+Homepage = "https://github.com/cyberplant/c64py"
 
 [project.scripts]
 c64py = "c64py.C64:main"
