@@ -534,20 +534,20 @@ def main():
             "``python -m c64py.drives.c1541_emulator --disk game.d64 --device 8 --port 6408``"
         ),
     )
-    ap.add_argument(
-        "--disk2",
-        metavar="PATH",
-        default=None,
-        help="With a D64 in media_file: auto-spawn drive 9 (headless TCP) for this image.",
-    )
-    ap.add_argument(
-        "--disk3",
-        metavar="PATH",
-        default=None,
-        help="With a D64 in media_file: auto-spawn drive 10 (headless TCP) for this image.",
-    )
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
+    ap.add_argument(
+        "--host-command-ctrl",
+        metavar="TX=ADDR,RX=ADDR",
+        default=None,
+        help=(
+            "Enable the host memory command channel: the guest pokes a request "
+            "into the TX mailbox and reads the reply from RX. Each mailbox is "
+            "256 bytes (1 size byte + up to 255 payload bytes). Off by default; "
+            "see docs/host_memory_command_channel.md. Example: "
+            "--host-command-ctrl TX=0xC000,RX=0xC100"
+        ),
+    )
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
     ap.add_argument("--dump-memory", help="Dump memory to file after execution")
     ap.add_argument(
@@ -699,8 +699,8 @@ def main():
         default=cfg_emulation.get("vic_emulation", "fast"),
         help=(
             "VIC timing: fast (coarse raster); accurate-python (per-cycle Python VIC+BA stalls); "
-            "accurate-rust (PAL hybrid VIC in optional Rust core when built — default). "
-            "NTSC accurate-rust falls back to Python accurate path."
+            "accurate-rust (PAL/NTSC hybrid VIC in optional Rust core when built — default for "
+            "C64.py; requires the extension)."
         ),
     )
     ap.add_argument(
@@ -961,8 +961,7 @@ def main():
     vice_trace = None
     try:
         print(
-            f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}  "
-            f"|  drive tier (config): {drive_tier}"
+            f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}"
         )
         _check_rust_core_available(
             vic_emulation,
@@ -1103,7 +1102,7 @@ def main():
                     emu._auto_spawned_drive = True
                     if show_ui_logs and emu.interface is not None:
                         emu.interface.add_debug_log(
-                            f"💾 Auto-spawned drive 8 (headless, tier={drive_tier})"
+                            "💾 Auto-spawned drive 8 (headless)"
                         )
                 except Exception as exc:
                     print(f"ERROR: could not auto-spawn drive: {exc}", file=sys.stderr)
@@ -1137,15 +1136,6 @@ def main():
                 print(msg, file=sys.stderr)
                 if show_ui_logs and emu.interface is not None:
                     emu.interface.add_debug_log(f"ℹ {msg}")
-            if show_ui_logs and emu.interface is not None:
-                labels = {
-                    "fast": "fast (real 1541 DOS ROM + job-queue trap + KERNAL LOAD shortcut)",
-                    "accurate-python": "accurate-python (real KERNAL ↔ DOS over IEC, job-queue trap for sectors)",
-                    "accurate-rust": "accurate-rust (drive port WIP → falls back to accurate-python)",
-                }
-                emu.interface.add_debug_log(
-                    f"📀 Drive tier: {labels.get(drive_tier, drive_tier)}"
-                )
 
             if args.video_rendering == "per-raster":
                 emu.memory.beam_render_enabled = True
@@ -1233,6 +1223,28 @@ def main():
             emu.monitor_server = C64MonitorTcpServer(emu, int(args.monitor_port))
             emu.monitor_server.start()
             print(f"Monitor TCP on 127.0.0.1:{int(args.monitor_port)} (see docs/DEBUGGING.md)")
+
+        if args.host_command_ctrl:
+            try:
+                from .host_command_channel import (
+                    HostCommandChannel,
+                    parse_host_command_ctrl,
+                )
+            except ImportError:
+                from c64py.host_command_channel import (  # type: ignore[no-redef]
+                    HostCommandChannel,
+                    parse_host_command_ctrl,
+                )
+            try:
+                tx_base, rx_base = parse_host_command_ctrl(args.host_command_ctrl)
+            except ValueError as e:
+                print(f"ERROR: --host-command-ctrl: {e}", file=sys.stderr)
+                sys.exit(2)
+            emu._host_cmd_channel = HostCommandChannel(emu, tx_base, rx_base)
+            print(
+                f"Host command channel: TX=${tx_base:04X} RX=${rx_base:04X} "
+                f"(see docs/host_memory_command_channel.md)"
+            )
 
         # Start server if requested (runs in parallel with UI)
         server = None

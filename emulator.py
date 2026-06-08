@@ -53,6 +53,25 @@ from .iec_bus import IECBus
 from .drives.tcp_drive_client import TcpDriveClient
 from .drives.iec_backend import IECDriveBackend
 
+
+def _map_dos1541_to_kernal_basic_err(dos_code: int) -> int:
+    """Map 1541 ``DiskDrive.last_error`` codes to BASIC/KERNAL I/O error numbers.
+
+    BASIC V2 has no dedicated message for DOS ``63`` (``FILE EXISTS``); mapping
+    it to ``4`` (``FILE NOT FOUND``) misleads users. We use ``2`` (``FILE OPEN``)
+    as the closest stock wording. ``64`` maps to ``22`` (``TYPE MISMATCH``).
+    """
+    if dos_code == 62:
+        return 4  # FILE NOT FOUND
+    if dos_code == 63:
+        return 2  # FILE OPEN — closest stock BASIC string to "cannot create"
+    if dos_code == 64:
+        return 22  # TYPE MISMATCH (FILE TYPE MISMATCH on disk)
+    if dos_code == 34:
+        return 11  # SYNTAX ERROR
+    return 5  # DEVICE NOT PRESENT / generic I/O failure bucket
+
+
 class C64:
     """Main C64 emulator"""
 
@@ -143,6 +162,8 @@ class C64:
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
         self.turbo = False  # When True, no wall-clock throttling (see --turbo)
         self.inject_key_rules: List[InjectKeyRule] = []
+        # Matrix-key injections awaiting timed auto-release: (row, col) -> until_cycle.
+        self._matrix_inject_until: dict[tuple[int, int], int] = {}
 
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
 
@@ -150,6 +171,10 @@ class C64:
         self.monitor_breakpoints: set[int] = set()
         self._monitor_cmd_queue: Optional[queue.Queue] = None
         self._monitor_reply_queue: Optional[queue.Queue] = None
+        # Optional :class:`~c64py.host_command_channel.HostCommandChannel`,
+        # polled at the end of each :meth:`run_cpu_instruction_quantum` (including
+        # graphics/Textual CPU threads — not only :meth:`run`).
+        self._host_cmd_channel = None  # type: ignore[var-annotated]
         self._monitor_pending_step_ack = False
 
         # IEC serial bus for 1541 drive emulation (optional, created when needed)
@@ -794,30 +819,110 @@ class C64:
         if self.interface:
             self.interface.add_debug_log("🏃 Injected 'RUN' command into keyboard buffer")
 
-    def _fire_inject_key_rule(self, rule: InjectKeyRule, cpu_cycles: int) -> None:
-        """Apply one ``--inject-keys`` rule (keyboard + optional joystick hold)."""
+    def _matrix_hold_cycles(self, ms: float = 80.0) -> int:
+        """Default matrix key hold in CPU cycles for the current video standard."""
+        standard = str(getattr(self.memory, "video_standard", "pal")).lower()
+        clock_hz = 1_022_727 if standard == "ntsc" else 985_248
+        return max(1, int(round(ms / 1000.0 * clock_hz)))
+
+    def _inject_matrix_stroke(self, stroke, hold_cycles: int) -> None:
+        """Press one matrix keystroke now; schedule release after *hold_cycles*."""
+        until = int(self.current_cycles) + max(1, int(hold_cycles))
+        for cell in stroke.cells:
+            self.memory.press_matrix_key(cell[0], cell[1])
+            prev = self._matrix_inject_until.get(cell, 0)
+            self._matrix_inject_until[cell] = max(prev, until)
+
+    def inject_keys(self, payload: str, mode: str = "auto",
+                    hold_cycles: Optional[int] = None) -> str:
+        """Inject a key payload via the matrix (real press) or KERNAL buffer.
+
+        ``mode``: ``"auto"`` (single keystroke → matrix, multi → buffer),
+        ``"matrix"``, or ``"buffer"``. Returns a human-readable status string.
+        """
+        from .keyboard_matrix import parse_matrix_strokes
         from .keyboard_inject import expand_inject_payload
 
+        try:
+            strokes, unknown = parse_matrix_strokes(payload)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        resolved = mode
+        if resolved == "auto":
+            resolved = "matrix" if len(strokes) == 1 else "buffer"
+
+        if resolved == "matrix":
+            if len(strokes) != 1:
+                return (
+                    f"ERROR: matrix inject needs exactly one keystroke "
+                    f"(got {len(strokes)}); use BUFFER for strings"
+                )
+            hold = hold_cycles if hold_cycles is not None else self._matrix_hold_cycles()
+            self._inject_matrix_stroke(strokes[0], hold)
+            note = f" (skipped {unknown})" if unknown else ""
+            return f"OK matrix key {strokes[0].label} held {hold} cyc{note}"
+
+        kb, _j1, _j2, _hold = expand_inject_payload(payload)
+        dropped = sum(0 if self.send_petscii(int(b)) else 1 for b in kb)
+        msg = f"OK buffer {len(kb)} byte(s)"
+        if dropped:
+            msg += f", {dropped} dropped (buffer full)"
+        return msg
+
+    def inject_joystick(self, port: int, mask: int, hold_cycles: int) -> str:
+        """Hold a joystick direction/button mask on *port* for *hold_cycles*."""
+        if port not in (1, 2):
+            return f"ERROR: joystick port must be 1 or 2 (got {port})"
+        until = int(self.current_cycles) + max(1, int(hold_cycles))
+        self.memory.arm_joystick_inject(port, mask, until)
+        return f"OK joystick {port} mask=0x{mask:02X} held {hold_cycles} cyc"
+
+    def _fire_inject_key_rule(self, rule: InjectKeyRule, cpu_cycles: int) -> None:
+        """Apply one ``--inject-keys`` rule (keyboard + optional joystick hold).
+
+        Keyboard payloads that resolve to a single keystroke (e.g. ``{F1}``, a
+        letter, SPACE) are pressed in the CIA1 matrix so games that scan the
+        keyboard directly see them; multi-key strings still use the KERNAL buffer.
+        """
+        from .keyboard_inject import expand_inject_payload
+        from .keyboard_matrix import parse_matrix_strokes
+
         kb, j1, j2, hold = expand_inject_payload(rule.payload_raw)
-        dropped = 0
-        for b in kb:
-            if not self.send_petscii(int(b)):
-                dropped += 1
-        if dropped and self.interface:
-            self.interface.add_debug_log(
-                f"⌨️ inject-keys: {dropped} byte(s) dropped (keyboard buffer full)"
-            )
         until = cpu_cycles + max(hold, 0)
         if j1:
             self.memory.arm_joystick_inject(1, j1, until)
         if j2:
             self.memory.arm_joystick_inject(2, j2, until)
+
+        if kb:
+            try:
+                strokes, _unknown = parse_matrix_strokes(rule.payload_raw)
+            except ValueError:
+                strokes = []
+            if len(strokes) == 1:
+                self._inject_matrix_stroke(strokes[0], self._matrix_hold_cycles())
+            else:
+                dropped = 0
+                for b in kb:
+                    if not self.send_petscii(int(b)):
+                        dropped += 1
+                if dropped and self.interface:
+                    self.interface.add_debug_log(
+                        f"⌨️ inject-keys: {dropped} byte(s) dropped (keyboard buffer full)"
+                    )
         if self.interface:
             self.interface.add_debug_log(
                 f"⌨️ inject-keys fired at cycle {cpu_cycles}: {rule.payload_raw!r}"
             )
 
     def _process_scheduled_inject_keys(self, cpu_cycles: int, wall_seconds: float) -> None:
+        # Release any matrix-injected keys whose hold window has elapsed.
+        if self._matrix_inject_until:
+            expired = [c for c, u in self._matrix_inject_until.items() if cpu_cycles >= u]
+            for cell in expired:
+                self.memory.release_matrix_key(cell[0], cell[1])
+                del self._matrix_inject_until[cell]
         for rule in self.inject_key_rules:
             if rule.fired:
                 continue
@@ -945,6 +1050,9 @@ class C64:
         """Install :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives are attached."""
         m = self.memory
         if not getattr(self, "use_iec_bus", False) or self.iec_bus is None:
+            tap = m.iec_kernal_tap
+            if tap is not None:
+                tap.detach_line_receiver()
             m.iec_kernal_tap = None
             return
         has_tcp = any(isinstance(d, TcpDriveClient) for d in self.iec_drives.values())
@@ -952,8 +1060,21 @@ class C64:
             if m.iec_kernal_tap is None:
                 from .iec_kernal_bridge import KernalIecTap
 
-                m.iec_kernal_tap = KernalIecTap()
+                wire = os.environ.get("C64PY_IEC_WIRE_DECODE", "").strip().lower() in (
+                    "1",
+                    "yes",
+                    "true",
+                    "on",
+                )
+                tap = KernalIecTap(
+                    wire_decode_bus=m.iec_bus if wire else None,
+                )
+                m.iec_kernal_tap = tap
+                tap.attach_line_receiver(m.iec_bus)
         else:
+            tap = m.iec_kernal_tap
+            if tap is not None:
+                tap.detach_line_receiver()
             m.iec_kernal_tap = None
 
     def attach_tcp_drive(self, device: int, addr: str) -> bool:
@@ -1129,12 +1250,7 @@ class C64:
                 self.interface.add_debug_log(
                     f"❌ LOAD '{filename}' failed: {drive_code},{drive_msg}"
                 )
-            # Map 1541 DOS error codes to BASIC/KERNAL error codes:
-            #   BASIC 4 = FILE NOT FOUND
-            #   BASIC 5 = DEVICE NOT PRESENT
-            # (BASIC 8 = MISSING FILE NAME — do NOT use for disk errors)
-            kernal_err = 4 if drive_code in (62, 63, 64) else 5
-            self.cpu.state.a = kernal_err
+            self.cpu.state.a = _map_dos1541_to_kernal_basic_err(drive_code)
             self.memory.write(0x90, 0x00)  # clear ST — error is in A/carry
             self.cpu.state.p |= 0x01       # carry set = error
             self._kernal_hook_rts_return()
@@ -1209,17 +1325,14 @@ class C64:
         """Handle KERNAL SAVE operation for virtual disk drives.
         
         This intercepts SAVE calls when PC is at $FFD8 and device is 8-11.
-        Skipped when :attr:`use_iec_bus` is True.
         Returns True if SAVE was handled, False otherwise.
         
-        KERNAL SAVE calling convention:
-        - A: Zero page pointer to start address (low byte)
-        - X: Start address low byte  
-        - Y: Start address high byte
-        - $B7: Filename length
-        - $BB-$BC: Filename pointer
-        - $BA: Device number
-        - $AE-$AF: End address + 1
+        KERNAL SAVE calling convention (matches ``$F5DD`` / sk6502):
+        - **A**: Zero-page index such that ``(A)`` / ``(A+1)`` hold the **start**
+          address low/high (BASIC typically passes ``$2B`` so ``$2B/$2C`` = start).
+        - **X**, **Y**: **End** address low/high (exclusive end of the byte range;
+          same convention as ``range(start, end)``).
+        - ``$B7``: Filename length; ``$BB``-``$BC``: Filename pointer; ``$BA``: device.
         """
         if not self.kernal_load_shortcut_enabled:
             return False
@@ -1245,13 +1358,27 @@ class C64:
             self._kernal_hook_rts_return()
             return True
 
-        start_addr = self.cpu.state.x | (self.cpu.state.y << 8)
-        end_addr = self.memory.read(0xAE) | (self.memory.read(0xAF) << 8)
+        zp_idx = self.cpu.state.a & 0xFF
+        start_addr = self.memory.read(zp_idx & 0xFFFF) | (
+            self.memory.read((zp_idx + 1) & 0xFFFF) << 8
+        )
+        end_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+
+        if end_addr < start_addr:
+            if self.interface:
+                self.interface.add_debug_log(
+                    f"❌ KERNAL SAVE: invalid range ${start_addr:04X}-${end_addr:04X}"
+                )
+            self.cpu.state.a = 5
+            self.memory.write(0x90, 0x00)
+            self.cpu.state.p |= 0x01
+            self._kernal_hook_rts_return()
+            return True
 
         if self.interface:
             self.interface.add_debug_log(
                 f"🔧 KERNAL SAVE: device={device}, file='{filename}', "
-                f"${start_addr:04X}-${end_addr:04X}"
+                f"${start_addr:04X}-${end_addr:04X} ({end_addr - start_addr} bytes)"
             )
 
         file_data = bytearray([start_addr & 0xFF, (start_addr >> 8) & 0xFF])
@@ -1273,11 +1400,7 @@ class C64:
                 self.interface.add_debug_log(
                     f"❌ SAVE '{filename}' failed: {drive_code},{drive_msg}"
                 )
-            # Map 1541 DOS error codes to BASIC/KERNAL error codes:
-            #   BASIC 4 = FILE NOT FOUND   (62 FILE NOT FOUND)
-            #   BASIC 5 = DEVICE NOT PRESENT (74 DRIVE NOT READY, 72 DISK FULL, etc.)
-            kernal_err = 4 if drive_code in (62, 63) else 5
-            self.cpu.state.a = kernal_err
+            self.cpu.state.a = _map_dos1541_to_kernal_basic_err(drive_code)
             self.memory.write(0x90, 0x00)  # clear ST — error is in A/carry
             self.cpu.state.p |= 0x01       # carry set = error
 
@@ -1296,17 +1419,36 @@ class C64:
         for d in self.iec_drives.values():
             d.step(n)
 
+    def _poll_host_cmd_channel(self) -> None:
+        """If ``--host-command-ctrl`` is active, service the TX mailbox once."""
+        if self._host_cmd_channel is not None:
+            self._host_cmd_channel.poll()
+
     def run_cpu_instruction_quantum(
         self, cycles_before: int, max_cycles: Optional[int] = None
     ) -> int:
-        """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
-        if self._handle_kernal_load():
-            return 0
-        if self._handle_kernal_save():
-            return 0
-        return self.cpu.cpu_step_quantum(
-            self.udp_debug, self.vice_trace, cycles_before, max_cycles
+        """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`.
+
+        Always ends with :meth:`_poll_host_cmd_channel` so Pygame/Textual loops
+        (which call this directly instead of :meth:`run`) still see guest mailboxes.
+        """
+        self.memory.kernal_tcp_iec_vectors = bool(
+            self.kernal_load_shortcut_enabled and self.use_iec_bus
         )
+        try:
+            if self._handle_kernal_load():
+                return 0
+            if self._handle_kernal_save():
+                return 0
+            from .kernal_tcp_iec_hooks import handle_kernal_tcp_iec
+
+            if handle_kernal_tcp_iec(self):
+                return 0
+            return self.cpu.cpu_step_quantum(
+                self.udp_debug, self.vice_trace, cycles_before, max_cycles
+            )
+        finally:
+            self._poll_host_cmd_channel()
 
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
@@ -1758,8 +1900,7 @@ class C64:
         # Fast dirty-check using bytes comparison
         current_screen_bytes = bytes(self.memory.ram[(screen_base + i) & 0xFFFF] for i in range(1000))
         current_color_bytes = bytes(self.memory.ram[color_base:color_base + 1000])
-        cursor_color = self.memory.ram[0x0286] & 0x0F
-        
+
         # Fast comparison using bytes
         if (current_screen_bytes == self._prev_screen_data and 
             current_color_bytes == self._prev_color_data and
@@ -1784,7 +1925,6 @@ class C64:
                 self.text_reversed[:] = (screen_2d & 0x80) != 0
                 char_codes = screen_2d & 0x7F
                 self.text_colors[:] = color_2d & 0x0F
-                self.text_colors[self.text_reversed] = cursor_color
                 
                 for row in range(25):
                     for col in range(40):
@@ -1801,7 +1941,7 @@ class C64:
                         char_code = raw_code & 0x7F
                         
                         self.text_reversed[row][col] = reversed_char
-                        self.text_colors[row][col] = cursor_color if reversed_char else color_code
+                        self.text_colors[row][col] = color_code
                         self.text_screen[row][col] = lookup[char_code]
         
         return True  # Screen was updated

@@ -29,8 +29,34 @@ from .constants import (
     CURSOR_ROW_ADDR,
     CURSOR_COL_ADDR,
 )
+from .config import _petscii_to_screen_code_chrout
 from .cpu_state import CPUState
 from .memory import MemoryMap
+
+# PETSCII color controls → VIC text color ($0286 low nybble).
+# CHR$ values from https://www.c64-wiki.com/wiki/Color (BSOUT / PRINT CHR$).
+_CHROUT_PETSCII_COLORS: dict[int, int] = {
+    0x90: 0,  # CHR$(144) black
+    0x05: 1,  # CHR$(5) white
+    0x1C: 2,  # CHR$(28) red
+    0x9F: 3,  # CHR$(159) cyan
+    0x9C: 4,  # CHR$(156) violet
+    0x1E: 5,  # CHR$(30) green
+    0x1F: 6,  # CHR$(31) blue
+    0x9E: 7,  # CHR$(158) yellow
+    0x81: 8,  # CHR$(129) orange
+    0x95: 9,  # CHR$(149) brown
+    0x96: 10,  # CHR$(150) light red
+    0x97: 11,  # CHR$(151) dark grey
+    0x98: 12,  # CHR$(152) grey
+    0x99: 13,  # CHR$(153) light green
+    0x9A: 14,  # CHR$(154) light blue
+    0x9B: 15,  # CHR$(155) light grey
+}
+
+TAB_STOP_BASE = 0x02B0
+# KERNAL screen editor: print reverse when nonzero (LIST / directory header).
+_CHROUT_RVS_FLAG_ADDR = 0xC7
 
 # Per 6502 instruction cycle: bus activity for BA vs CPU (VICE-style: stall only on reads).
 _BUS_INTERNAL = 0
@@ -73,6 +99,7 @@ class CPU6502:
         # Don't read it here as ROMs might not be loaded yet
         self.state.pc = 0x0000
         self.chrout_count = 0
+        self._chrout_rvs_on = False
         self.trace_enabled = False
         self.trace_size = 0
         self.trace_buffer = []
@@ -394,6 +421,22 @@ class CPU6502:
         high = self._mr((addr + 1) & 0xFFFF)
         return low | (high << 8)
 
+    def trigger_nmi_coarse(self) -> None:
+        """Service NMI via vector ``$FFFA`` (C64 RESTORE key). Coarse 6502 entry.
+
+        Matches the simplified IRQ entry path used in fast VIC mode: three-byte
+        return address push, clear B on pushed P, SEI, then jump to ``($FFFA)``.
+        """
+        pc = self.state.pc
+        self.memory.write(0x100 + self.state.sp, (pc >> 8) & 0xFF)
+        self.state.sp = (self.state.sp - 1) & 0xFF
+        self.memory.write(0x100 + self.state.sp, pc & 0xFF)
+        self.state.sp = (self.state.sp - 1) & 0xFF
+        self.memory.write(0x100 + self.state.sp, (self.state.p | 0x20) & ~0x10)
+        self.state.sp = (self.state.sp - 1) & 0xFF
+        self._set_flag(0x04, True)
+        self.state.pc = self._read_word(0xFFFA) & 0xFFFF
+
     def _get_flag(self, flag: int) -> bool:
         """Get processor flag"""
         return (self.state.p & flag) != 0
@@ -524,32 +567,131 @@ class CPU6502:
         )
         print(msg, file=sys.stderr)
 
+    def _chrout_write_cursor(self, cursor_addr: int) -> None:
+        self.memory.write(0xD1, cursor_addr & 0xFF)
+        self.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        self.memory.write(CURSOR_ROW_ADDR, row)
+        self.memory.write(CURSOR_COL_ADDR, col)
+
+    def _chrout_tab_forward(self, cursor_addr: int) -> int:
+        col = (cursor_addr - SCREEN_MEM) % 40
+        row_base = cursor_addr - col
+        next_col: Optional[int] = None
+        for i in range(16):
+            stop = self.memory.read(TAB_STOP_BASE + i) & 0xFF
+            if stop == 0 or stop > 39:
+                continue
+            if stop > col and (next_col is None or stop < next_col):
+                next_col = stop
+        if next_col is None:
+            next_col = ((col // 10) + 1) * 10
+            if next_col <= col:
+                next_col = min(col + 10, 39)
+        if next_col >= 40:
+            row = (cursor_addr - SCREEN_MEM) // 40
+            if row < 24:
+                return SCREEN_MEM + (row + 1) * 40
+            return SCREEN_MEM + 24 * 40
+        return row_base + next_col
+
+    def _chrout_cursor_right(self, cursor_addr: int) -> int:
+        col = (cursor_addr - SCREEN_MEM) % 40
+        row = (cursor_addr - SCREEN_MEM) // 40
+        if col < 39:
+            return cursor_addr + 1
+        if row < 24:
+            return SCREEN_MEM + (row + 1) * 40
+        return cursor_addr
+
+    def _chrout_cursor_left(self, cursor_addr: int) -> int:
+        if cursor_addr <= SCREEN_MEM:
+            return cursor_addr
+        col = (cursor_addr - SCREEN_MEM) % 40
+        if col > 0:
+            return cursor_addr - 1
+        row = (cursor_addr - SCREEN_MEM) // 40
+        if row > 0:
+            return SCREEN_MEM + (row - 1) * 40 + 39
+        return cursor_addr
+
+    def _chrout_cursor_down(self, cursor_addr: int) -> int:
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        if row < 24:
+            return SCREEN_MEM + (row + 1) * 40 + col
+        return cursor_addr
+
+    def _chrout_cursor_up(self, cursor_addr: int) -> int:
+        row = (cursor_addr - SCREEN_MEM) // 40
+        col = (cursor_addr - SCREEN_MEM) % 40
+        if row > 0:
+            return SCREEN_MEM + (row - 1) * 40 + col
+        return cursor_addr
+
+    def _chrout_apply_control(self, c: int, cursor_addr: int) -> tuple[int, bool]:
+        """Handle PETSCII controls. Returns (cursor_addr, True) if consumed."""
+        color = _CHROUT_PETSCII_COLORS.get(c)
+        if color is not None:
+            self.memory.write(0x0286, color)
+            return cursor_addr, True
+        if c == 0x12:
+            self._chrout_rvs_on = True
+            self.memory.write(_CHROUT_RVS_FLAG_ADDR, 1)
+            return cursor_addr, True
+        if c == 0x92:
+            self._chrout_rvs_on = False
+            self.memory.write(_CHROUT_RVS_FLAG_ADDR, 0)
+            return cursor_addr, True
+        if c == 0x13:
+            return SCREEN_MEM, True
+        if c == 0x09:
+            return self._chrout_tab_forward(cursor_addr), True
+        if c == 0x1D:
+            return self._chrout_cursor_right(cursor_addr), True
+        if c == 0x9D:
+            return self._chrout_cursor_left(cursor_addr), True
+        if c == 0x11:
+            return self._chrout_cursor_down(cursor_addr), True
+        if c == 0x91:
+            return self._chrout_cursor_up(cursor_addr), True
+        if c < 0x20 or 0x80 <= c <= 0x9F:
+            return cursor_addr, True
+        return cursor_addr, False
+
+    def _chrout_rvs_active(self) -> bool:
+        return self._chrout_rvs_on or bool(self.memory.read(_CHROUT_RVS_FLAG_ADDR))
+
     def _chrout_petscii_screen_effect(self, char: int) -> None:
         """Update screen/cursor for one PETSCII character (CHROUT semantics, no RTS)."""
-        self.memory.write(0xD0, 0)
         cursor_low = self.memory.read(0xD1)
         cursor_high = self.memory.read(0xD2)
         cursor_addr = cursor_low | (cursor_high << 8)
         if cursor_addr < SCREEN_MEM or cursor_addr >= SCREEN_MEM + 1000:
             cursor_addr = SCREEN_MEM
         self.last_chrout_char = char
-        if char == 0x0D:
+        c = char & 0xFF
+        if c == 0x0D:
+            # KERNAL clears reverse at end of each printed line (directory LIST).
+            self._chrout_rvs_on = False
+            self.memory.write(_CHROUT_RVS_FLAG_ADDR, 0)
             row = (cursor_addr - SCREEN_MEM) // 40
             if row < 24:
                 cursor_addr = SCREEN_MEM + (row + 1) * 40
             else:
                 self.memory._scroll_screen_up()
                 cursor_addr = SCREEN_MEM + 24 * 40
-        elif char == 0x0A:
+        elif c == 0x0A:
             pass
-        elif char == 0x14:
+        elif c == 0x14:
             if cursor_addr > SCREEN_MEM:
                 cursor_addr -= 1
                 if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
                     self.memory.write(cursor_addr, 0x20)
                     current_color = self.memory.read(0x0286) & 0x0F
                     self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
-        elif char == 0x93:
+        elif c == 0x93:
             for addr in range(SCREEN_MEM, SCREEN_MEM + 1000):
                 self.memory.write(addr, 0x20)
             current_color = self.memory.read(0x0286) & 0x0F
@@ -557,28 +699,11 @@ class CPU6502:
                 self.memory.write(addr, current_color)
             cursor_addr = SCREEN_MEM
         else:
-            if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-                # Convert PETSCII to C64 screen code before storing in screen RAM.
-                # Standard mapping (matches KERNAL BSOUT at $E716):
-                #   $20-$3F → $20-$3F  (space, punctuation, digits — identity)
-                #   $40-$5F → $00-$1F  (@, A-Z, [\]↑← — subtract $40)
-                #   $60-$7F → $40-$5F  (subtract $20)
-                #   $A0-$BF → $60-$7F  (subtract $40)
-                #   $C0-$FE → $80-$BE  (subtract $40)
-                #   $FF     → $5E
-                c = char & 0xFF
-                if 0x40 <= c <= 0x5F:
-                    screen_code = c - 0x40
-                elif 0x60 <= c <= 0x7F:
-                    screen_code = c - 0x20
-                elif 0xA0 <= c <= 0xBF:
-                    screen_code = c - 0x40
-                elif 0xC0 <= c <= 0xFE:
-                    screen_code = c - 0x40
-                elif c == 0xFF:
-                    screen_code = 0x5E
-                else:
-                    screen_code = c
+            cursor_addr, handled = self._chrout_apply_control(c, cursor_addr)
+            if not handled and SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
+                screen_code = _petscii_to_screen_code_chrout(c)
+                if self._chrout_rvs_active():
+                    screen_code |= 0x80
                 self.memory.write(cursor_addr, screen_code)
                 current_color = self.memory.read(0x0286) & 0x0F
                 self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
@@ -586,12 +711,7 @@ class CPU6502:
                 if cursor_addr >= SCREEN_MEM + 1000:
                     self.memory._scroll_screen_up()
                     cursor_addr = SCREEN_MEM + 24 * 40
-        self.memory.write(0xD1, cursor_addr & 0xFF)
-        self.memory.write(0xD2, (cursor_addr >> 8) & 0xFF)
-        row = (cursor_addr - SCREEN_MEM) // 40
-        col = (cursor_addr - SCREEN_MEM) % 40
-        self.memory.write(CURSOR_ROW_ADDR, row)
-        self.memory.write(CURSOR_COL_ADDR, col)
+        self._chrout_write_cursor(cursor_addr)
 
     def apply_chrout_petscii(self, char: int) -> None:
         """Emit one PETSCII character using the same screen rules as CHROUT (no JSR/RTS)."""
@@ -1019,15 +1139,30 @@ class CPU6502:
             self.memory.iec_bus is not None
             and not getattr(self.memory, "iec_disk_full_impl", False)
         )
+        tcp_iec = bool(getattr(self.memory, "kernal_tcp_iec_vectors", False))
         key = (
             self.kernal_disk_hook_vectors,
             iec_stub,
             self.memory.kernal_rom is None,
+            tcp_iec,
         )
         if self._rust_delegate_stop_pcs_key != key:
             pcs = [0xFFD2]
             if self.kernal_disk_hook_vectors or iec_stub:
                 pcs.extend((0xFFD5, 0xFFD8))
+            if tcp_iec:
+                pcs.extend(
+                    (
+                        0xF9ED,
+                        0xFDF9,
+                        0xFFC0,
+                        0xFFC3,
+                        0xFFC6,
+                        0xFFC9,
+                        0xFFCC,
+                        0xFFCF,
+                    )
+                )
             if self.memory.kernal_rom is None:
                 pcs.extend((0xFF5B, 0xFFCF))
             self._rust_delegate_stop_pcs_cached = tuple(sorted(set(pcs)))
@@ -1200,6 +1335,21 @@ class CPU6502:
                 _worst = 8
                 cap = max(1, remaining // _worst)
                 batch_n = min(batch_n, cap)
+        # Optional: one Rust instruction per batch so peer CLK/DATA match Python's IECBus
+        # after every opcode (Tcp listener-ready, etc.). Default is OFF — it cuts speed by
+        # ~50×+ vs normal C64PY_RUST_BATCH; use only while debugging PRINT# stalls on the
+        # Rust fast path. CIA2 $DD00 decode when CHAREN is off (memory.py) addresses the
+        # common "no wire transitions" case without this cap.
+        if (
+            os.environ.get("C64PY_IEC_WIRE_DECODE_STRICT_RUST", "").strip().lower()
+            in ("1", "yes", "true", "on")
+            and getattr(self.memory, "iec_bus", None) is not None
+            and getattr(
+                getattr(self.memory, "iec_kernal_tap", None), "_wire_decoder", None
+            )
+            is not None
+        ):
+            batch_n = 1
 
         stops = self._rust_delegate_stop_pcs()
         # Flush Python's buffered trace writes before Rust appends to the same file,
@@ -1216,16 +1366,24 @@ class CPU6502:
         mem = self.memory
         tA = mem.cia1_timer_a
         tB = mem.cia1_timer_b
-        if not recompute_irq and (not tA.running) and (not tB.running):
+        t2A = mem.cia2_timer_a
+        t2B = mem.cia2_timer_b
+        if (
+            not recompute_irq
+            and (not tA.running)
+            and (not tB.running)
+            and (not t2A.running)
+            and (not t2B.running)
+        ):
             return
-        # Update Timer A
+        # Update CIA1 Timer A
         if tA.update(cycles):
             if tA.irq_enabled:
                 mem.cia1_icr |= 0x01  # Timer A interrupt
                 mem.cia1_icr |= 0x80  # IRQ flag
             tA.reset()
 
-        # Update Timer B (can be clocked by Timer A underflow)
+        # Update CIA1 Timer B (can be clocked by Timer A underflow)
         timer_a_underflow = False
         if tA.counter <= 0 and tA.running:
             timer_a_underflow = True
@@ -1241,6 +1399,28 @@ class CPU6502:
                 mem.cia1_icr |= 0x02  # Timer B interrupt
                 mem.cia1_icr |= 0x80  # IRQ flag
                 tB.reset()
+
+        # CIA2 (NM on real hardware; we only model ICR bits for KERNAL polling.)
+        if t2A.update(cycles):
+            if t2A.irq_enabled:
+                mem.cia2_icr |= 0x01
+                mem.cia2_icr |= 0x80
+            t2A.reset()
+
+        t2a_under = t2A.counter <= 0 and t2A.running
+        if t2B.input_mode == 2:
+            if t2a_under:
+                if t2B.update(1):
+                    if t2B.irq_enabled:
+                        mem.cia2_icr |= 0x02
+                        mem.cia2_icr |= 0x80
+                    t2B.reset()
+        else:
+            if t2B.update(cycles):
+                if t2B.irq_enabled:
+                    mem.cia2_icr |= 0x02
+                    mem.cia2_icr |= 0x80
+                t2B.reset()
 
         if recompute_irq:
             mem.recompute_pending_irq()

@@ -22,8 +22,11 @@ be chained, or an ESP32/microcontroller can implement the same interface.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator, Optional
+
+from pathlib import Path
 
 from ..cpu import CPU6502
 from ..cpu_state import CIATimer
@@ -34,6 +37,12 @@ from .iec_backend import IECDriveBackend
 if TYPE_CHECKING:
     from ..iec_bus import IECBus
     from ..d64 import D64Image
+
+from ..d64 import (
+    dos_filetype_byte_closed,
+    normalize_commodore_disk_catalog_name,
+    parse_commodore_filename_mode,
+)
 
 
 @dataclass
@@ -46,6 +55,12 @@ class ChannelState:
     byte_iter: Optional[Iterator[int]] = None
     pending: Optional[int] = None
     found: bool = True
+    # Host ``OPEN`` with ``,W`` (write): accumulate payload until CLOSE.
+    write_mode: bool = False
+    write_buf: Optional[bytearray] = None
+    open_stem: str = ""
+    open_raw_filename: str = ""
+    dos_ft_nibble: int = 2
 
 
 class Drive1541Memory:
@@ -399,6 +414,13 @@ class Drive1541(IECDriveBackend):
         self.channels[channel] = ChannelState(channel=channel)
 
     def iec_close_channel(self, channel: int) -> None:
+        state = self.channels.get(channel)
+        if state is not None and state.write_mode and state.write_buf is not None:
+            raw = state.open_raw_filename.strip()
+            if raw and self._disk_helper.has_disk():
+                payload = bytes(state.write_buf)
+                if payload:
+                    self._disk_helper.save_file(raw, payload)
         self.channels.pop(channel, None)
         if self._opening_channel == channel:
             self._opening_channel = None
@@ -417,7 +439,24 @@ class Drive1541(IECDriveBackend):
         if state is None:
             return
         try:
-            filename = state.filename_buf.decode("ascii", errors="replace")
+            raw_name = state.filename_buf.decode("ascii", errors="replace")
+        except Exception:
+            raw_name = ""
+        if ",W" in raw_name.upper():
+            stem, want = parse_commodore_filename_mode(raw_name)
+            state.write_mode = True
+            state.dos_ft_nibble = int(want) if want is not None else 2
+            state.open_raw_filename = raw_name
+            state.open_stem, _ = normalize_commodore_disk_catalog_name(stem)
+            state.write_buf = bytearray()
+            state.found = True
+            state.byte_iter = iter(())
+            state.is_open = True
+            state.pending = None
+            state.filename_buf.clear()
+            return
+        try:
+            filename = raw_name
         except Exception:
             filename = ""
         data = self._disk_helper.load_file(filename, secondary_address=ch)
@@ -442,6 +481,12 @@ class Drive1541(IECDriveBackend):
             state.filename_buf.append(byte)
             return
         ch = self.current_channel
+        if ch is None:
+            return
+        st = self.channels.get(ch)
+        if st is not None and st.write_buf is not None:
+            st.write_buf.append(byte)
+            return
         if ch == 15:
             self.command_buffer.append(byte)
             return
@@ -487,23 +532,79 @@ class Drive1541(IECDriveBackend):
 # Standalone TCP drive server
 # ---------------------------------------------------------------------------
 
+def _resolve_c1541_log_path(template: str, device: int) -> Path:
+    """Expand ``{date}`` / ``{device}`` in *template* and return an absolute :class:`pathlib.Path`."""
+    from datetime import date
+
+    s = (
+        str(template)
+        .replace("{date}", date.today().isoformat())
+        .replace("{device}", str(int(device)))
+    )
+    p = Path(s)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p
+
+
+def _install_c1541_file_log_handler(logger: logging.Logger, device: int, log_level: int) -> None:
+    """If ``[c1541] file_logging_enabled`` is true in TOML config, append logs to a file."""
+    try:
+        from c64py.config import DEFAULT_CONFIG, _config_get, load_config
+    except ImportError:
+        return
+
+    cfg = load_config()
+    enabled = _config_get(cfg, "c1541.file_logging_enabled")
+    if enabled is None:
+        enabled = _config_get(DEFAULT_CONFIG, "c1541.file_logging_enabled")
+    if not bool(enabled):
+        return
+
+    template = _config_get(cfg, "c1541.file_logging_filename")
+    if not template:
+        template = _config_get(DEFAULT_CONFIG, "c1541.file_logging_filename")
+    path = _resolve_c1541_log_path(str(template), device)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler):
+            try:
+                if Path(h.baseFilename) == path.resolve():  # type: ignore[attr-defined]
+                    return
+            except (AttributeError, OSError, ValueError):
+                continue
+
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setLevel(log_level)
+    fh.setFormatter(
+        logging.Formatter(f"%(asctime)s [drive{device}] %(levelname)s %(message)s")
+    )
+    logger.addHandler(fh)
+    logger.info("c1541 file log: %s", path)
+
+
 def _run_server(device: int, port: int, disk_path: Optional[str],
                 dos_rom_path: Optional[str], serial_rom_path: Optional[str],
                 interface: str = "headless",
-                emulation: str = "fast") -> None:
-    """Run an asyncio TCP server wrapping a Drive1541 instance."""
+                emulation: str = "fast",
+                log_level: int = logging.INFO) -> None:
+    """Run an asyncio TCP server wrapping a Drive1541 instance.
+
+    ``log_level`` is a :mod:`logging` numeric level (e.g. ``logging.DEBUG``).
+    """
     import asyncio
     import json
-    import logging
     import sys
 
     import collections
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format=f"%(asctime)s [drive{device}] %(levelname)s %(message)s",
     )
     log = logging.getLogger(f"c1541.drive{device}")
+    log.setLevel(log_level)
 
     # Shared ring buffer: every handler appends (timestamp_str, level, message).
     # The TUI polls this; headless mode drains it to nothing (stdout via basicConfig).
@@ -517,6 +618,8 @@ def _run_server(device: int, port: int, disk_path: Optional[str],
     _rh = _RingHandler()
     _rh.setFormatter(logging.Formatter())
     log.addHandler(_rh)
+
+    _install_c1541_file_log_handler(log, device, log_level)
 
     log.info("interface=%s emulation=%s", interface, emulation)
 
@@ -810,7 +913,25 @@ if __name__ == "__main__":
         default="fast",
         help="Drive emulation tier (default: fast)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        metavar="LEVEL",
+        help=(
+            "Python logging level for this process (DEBUG, INFO, WARNING, ERROR, …). "
+            "Use DEBUG to see IEC wire JSON handlers (listen, open_channel, send_byte, …)."
+        ),
+    )
     args = parser.parse_args()
+
+    _lvl_name = str(args.log_level).strip().upper()
+    _log_level = getattr(logging, _lvl_name, None)
+    if not isinstance(_log_level, int):
+        print(
+            f"ERROR: invalid --log-level {args.log_level!r} (try DEBUG, INFO, WARNING, ERROR)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     if args.disk and args.new_disk:
         print("ERROR: use only one of --disk or --new-disk", file=sys.stderr)
@@ -855,4 +976,5 @@ if __name__ == "__main__":
         serial_rom_path=args.serial_rom,
         interface=args.interface,
         emulation=args.emulation,
+        log_level=_log_level,
     )

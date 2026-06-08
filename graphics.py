@@ -341,6 +341,12 @@ class PygameInterface:
         if not self.emulator or not self.emulator.running:
             return
 
+        # C64 RESTORE (NMI via $FFFA): host Scroll Lock / Pause — no matrix cell.
+        _restore = (pygame.K_SCROLLOCK, pygame.K_PAUSE)
+        if event.key in _restore:
+            self.emulator.cpu.trigger_nmi_coarse()
+            return
+
         mem = self.emulator.memory
 
         # 2a. Joystick mapping (item C/E). A host key may be bound to BOTH a

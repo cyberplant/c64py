@@ -1,290 +1,232 @@
 # C64 Emulator (Python)
 
-A Commodore 64 emulator implemented in Python with both text-based and graphical interfaces. This emulator supports text mode, bitmap graphics modes, sprites, and can load and run PRG files.
+A Commodore 64 emulator in Python with Textual, headless, and pygame interfaces. Run BASIC, load PRG/D64 media, attach drives over TCP, and debug with optional Rust-accelerated CPU/VIC paths.
+
+<p align="center">
+  <img src="docs/images/readme/boot_ready.gif" alt="BASIC READY with blinking cursor">
+</p>
 
 ## Features
 
-- **6502 CPU Emulation**: Full 6502 instruction set implementation
-- **Memory Management**: Complete C64 memory map with ROM/RAM mapping
-- **I/O Devices**: VIC-II, SID, CIA1, CIA2 emulation
-- **SID Audio Output**: Selectable audio backend via `--audio-emulation` (`resid`, `python-sid`, `disabled`)
-- **Text Mode Interface**: Beautiful textual UI using Rich and Textual libraries
-- **Graphics Modes**: Full VIC-II graphics mode support
-  - Standard text mode (40x25 characters)
-  - Bitmap mode (320x200 pixels)
-  - Multicolor bitmap mode (160x200 pixels)
-  - Multicolor text mode
-  - Extended color mode
-  - Hardware sprites (8 sprites, 24x21 pixels)
-- **Dual Rendering**:
-  - **--interface graphics mode**: Full-resolution pygame window with bitmap and sprite support
-  - **Text mode**: ASCII art representation of graphics using Unicode block characters
-- **PRG File Loading**: Load and auto-run Commodore 64 programs
-- **Server Mode**: TCP/UDP server for remote control
-- **Debug Support**: UDP debug logging and detailed debug output ([docs/DEBUGGING.md](docs/DEBUGGING.md))
-- **Memory Dumping**: Export memory state to files
-- **PAL/NTSC Support**: Configurable video standard
+- **6502 CPU** with optional **Rust fast batch** (`c64py_rust_core`) — see [docs/rust_core.md](docs/rust_core.md)
+- **Memory map**, **VIC-II**, **SID**, **CIA1/CIA2**, **IEC bus**
+- **Interfaces**: Textual TUI (default), headless, pygame (`--interface graphics`)
+- **Media**: `.prg` autoload, `.d64` attach (auto-spawn drive 8), `.bas` via `petcat`
+- **Disk & drives**: local auto-spawn, standalone `c1541_emulator`, remote `--tcp-drive` — see [docs/disk_support.md](docs/disk_support.md)
+- **Remote control**: TCP/UDP command server, TCP monitor, host-memory mailbox — see sections below
+- **Snapshots**, UDP/VICE tracing, TOML config — see linked docs
 
-## Requirements
+## Quick start
 
-- Python 3.8 or higher
-- See `requirements.txt` for Python dependencies
-
-## Installation
-
-### From PyPI (recommended)
+### Install
 
 ```bash
-pip install c64py
-```
-
-### From source (development)
-
-1. Install dependencies:
-```bash
+pip install c64py          # PyPI
+# or, from a clone:
 pip install -r requirements.txt
 ```
 
-2. Ensure ROM files are available:
-   - By default, the emulator auto-detects ROMs from common locations, including a per-user directory and common VICE install paths.
-   - You can always point to ROMs explicitly with `--rom-dir`.
-   - If ROMs are not found and you are running interactively, the emulator can offer to install ROMs from a **local** directory or archive into a per-user directory (so future runs work automatically). ROMs are not shipped by default because many ROM binaries are copyrighted.
-
-## Usage
-
-### Basic Usage
-
-Run the emulator with a media file (extension selects behavior):
-
-- `.prg` — load and auto-run
-- `.d64` — attach as drive 8 (same as the former `--disk` behavior)
-- `.bas` — convert with VICE `petcat` to a temporary PRG, then load (requires `petcat` on `PATH`)
+ROM files are **not** shipped. Point to a directory with C64 ROMs (or let the emulator offer a local install on first interactive run):
 
 ```bash
-c64py program.prg
-c64py disk.d64
+export C64PY_ROM_DIR=~/roms   # optional; auto-detect also checks ./roms, ~/.c64py/roms, VICE paths
+c64py --rom-dir ~/roms
 ```
 
-Run the emulator without a program (starts at BASIC prompt):
+### Run
+
 ```bash
-c64py
+c64py                        # Textual UI, BASIC READY
+c64py game.prg               # load + RUN after boot
+c64py disk.d64               # attach as drive 8 (auto-spawn headless 1541)
+c64py --interface graphics   # pygame window
+c64py --interface headless --max-cycles 3000000 --no-colors --no-config
 ```
 
-### Command Line Options
+Positional `FILE` behavior:
 
-- `FILE` (positional): Optional PRG, D64, or BAS file (see above)
-- `--rom-dir DIR`: Directory containing ROM files (default: auto-detect common locations)
-- `--tcp-port PORT`: Enable TCP server on specified port
-- `--udp-port PORT`: Enable UDP server on specified port
-- `--max-cycles N`: Maximum CPU cycles to run (default: unlimited)
-- `--dump-memory FILE`: Dump memory to file after execution
-- `--debug`: Enable debug output
-- `--udp-debug`: Send debug events via UDP
-- `--autoquit`: Automatically quit when max cycles is reached
-- `--udp-debug-port PORT`: UDP port for debug events (default: 64738)
-- `--udp-debug-host HOST`: UDP host for debug events (default: 127.0.0.1)
-- `--screen-update-interval SECONDS`: Screen update interval (default: 0.1)
-- `--video-standard {pal,ntsc}`: Video standard (default: pal)
-- `--no-colors`: Disable ANSI color output
-- `--interface {textual,text,tui,headless,graphics,pygame}`: Select UI mode
-- `--graphics-scale N`: Scale factor for graphics window (default: 2)
-- `--graphics-fps N`: Target FPS for graphics window (default: 30)
-- `--graphics-border N`: Border size in pixels for graphics window (default: 32)
-- `--audio-emulation {resid,python-sid,disabled}`: Select SID backend
+| Extension | Action |
+|-----------|--------|
+| `.prg` | Load at `$0801` and inject `RUN` after BASIC boot |
+| `.d64` | Auto-spawn drive 8 with the image (unless `--tcp-drive` is set) |
+| `.bas` | Convert with VICE `petcat`, then load like a PRG |
 
-### Examples
+### Common flags
 
-Run with debug output:
+| Flag | Notes |
+|------|--------|
+| `--rom-dir DIR` | KERNAL/BASIC/CHAR (and optional DOS) ROM directory |
+| `--interface {textual,headless,graphics,...}` | UI mode (default: `textual`) |
+| `--max-cycles N` | Stop after N CPU cycles (**implies `--autoquit`**; use `--no-autoquit` to keep running) |
+| `--turbo` | No wall-clock throttling |
+| `--no-config` | Ignore `c64py.toml` (useful for CI/repro runs) |
+| `--vic-emulation {fast,accurate-python,accurate-rust}` | VIC timing tier — [docs/emulation_modes.md](docs/emulation_modes.md) |
+| `--video-rendering {per-frame,per-raster,per-cycle}` | Host pixel sampling — [docs/per_cycle_vic.md](docs/per_cycle_vic.md) |
+| `--audio-emulation {resid,python-sid,disabled}` | SID backend |
+| `--tcp-port` / `--udp-port` | Control server (see below) |
+| `--monitor-port` | TCP monitor for stepping — [docs/DEBUGGING.md](docs/DEBUGGING.md) |
+| `--host-command-ctrl TX=…,RX=…` | Guest RAM mailbox — [docs/host_memory_command_channel.md](docs/host_memory_command_channel.md) |
+
+Headless smoke test (no Rust core required):
+
 ```bash
-c64py program.prg --debug
+C64PY_USE_RUST_FAST=0 c64py --no-config --no-colors --interface headless \
+  --max-cycles 3000000 --vic-emulation fast
 ```
 
-Run in server mode (TCP):
-```bash
-c64py --tcp-port 1234
-```
+## Demos
 
-Run with UDP debug logging:
-```bash
-c64py program.prg --udp-debug --udp-debug-port 64738
-```
+Captured straight from the emulator with the local capture tool
+(cycle-accurate `accurate-rust` VIC + `per-cycle` compositing, real SID audio in
+the MP4s). The clips below are short GIF previews — click through for the
+full-length video with sound.
 
-Run with auto-quit after max cycles:
-```bash
-c64py program.prg --max-cycles 5000000 --autoquit
-```
+| Demo | Preview | Full video (with SID audio) |
+|------|---------|------------------------------|
+| **Bruce Lee** — title/menu | ![Bruce Lee menu](docs/showcase/brucelee_menu.gif) | [brucelee_01_menu.mp4](docs/showcase/brucelee_01_menu.mp4) |
+| **Bruce Lee** — gameplay (joystick) | ![Bruce Lee gameplay](docs/showcase/brucelee_playing.gif) | [brucelee_03_playing.mp4](docs/showcase/brucelee_03_playing.mp4) |
+| **Swinth** — first song/animation | ![Swinth first](docs/showcase/swinth_first.gif) | [swinth_02_first_song.mp4](docs/showcase/swinth_02_first_song.mp4) |
+| **Swinth** — second song/animation | ![Swinth second](docs/showcase/swinth_second.gif) | [swinth_04_second_song.mp4](docs/showcase/swinth_04_second_song.mp4) |
 
-Dump memory after execution:
-```bash
-c64py program.prg --dump-memory memory.prg
-```
+> GIFs are silent, downscaled previews. The linked MP4s are full resolution and
+> include the SID soundtrack.
 
-Run with graphics window:
-```bash
-c64py program.prg --interface graphics --graphics-scale 3
-```
-
-Per-scanline effects (FLI, sub-row splits): use `--video-rendering per-raster` or `--video-rendering per-cycle` with `--vic-emulation accurate-python` (forced automatically when needed; text + bitmap + sprites from the sample grid — sprites per 8-pixel column, not full DMA timing; see `docs/per_cycle_vic.md`).
+Want to capture your own? See **[How to capture screenshots & videos](docs/capturing_screenshots.md)**.
 
 ## Configuration
 
-c64py reads an optional TOML config file so you don't have to retype CLI
-flags. The first existing file wins (cwd → `~/.c64py.toml` →
-`~/.config/c64py/c64py.toml`); CLI flags always override config.
-
-```toml
-# ~/.c64py.toml
-[video]
-rendering = "per-raster"
-scale     = 3
-
-[audio]
-emulation = "resid"
-volume = 0.8
-```
-
-Generate a fully-populated default with `c64py --write-config`. See
-[`docs/config.md`](docs/config.md) for the full schema, search order,
-and override rules.
-
-## VICE Test Assets
-
-The VICE compatibility corpus is external and not stored in this repository.
-Fetch the pinned snapshot on demand with:
+Optional TOML (`c64py.toml` in cwd → `~/.c64py.toml` → XDG config). CLI flags override config.
 
 ```bash
-./scripts/fetch_vice_tests.sh
+c64py --write-config    # emit a populated default
 ```
 
-## Graphics Mode Support
+See [docs/config.md](docs/config.md) for the full schema.
 
-The emulator supports all VIC-II graphics modes:
+## Video & VIC
 
-### Display Modes
+Host rendering (`--video-rendering`) is separate from VIC CPU timing (`--vic-emulation`).
 
-1. **Standard Text Mode** (40x25 characters)
-   - Default mode, 8x8 character cells
-   - 16 colors per character
-   - Controlled by VIC-II registers
+- **Modes & defaults**: [docs/emulation_modes.md](docs/emulation_modes.md)
+- **Per-cycle / FLI-style effects**: [docs/per_cycle_vic.md](docs/per_cycle_vic.md)
+- **Debugging matrix, monitor, traces**: [docs/DEBUGGING.md](docs/DEBUGGING.md)
+- **Rust hybrid VIC/CPU batch**: [docs/rust_core.md](docs/rust_core.md)
 
-2. **Bitmap Mode** (320x200 pixels)
-   - Hi-resolution bitmap graphics
-   - Each pixel can be one of two colors per 8x8 block
-   - Enabled via $D011 bit 5
+Per-scanline splits: `--video-rendering per-raster` with `--vic-emulation accurate-python` or `accurate-rust`. Sub-row effects need `--video-rendering per-cycle`.
 
-3. **Multicolor Bitmap Mode** (160x200 pixels)
-   - Lower resolution with 4 colors per 4x8 block
-   - Enabled via $D011 bit 5 + $D016 bit 4
+## Disk & drive emulation
 
-4. **Extended Color Mode**
-   - Text mode with 4 selectable background colors
-   - Enabled via $D011 bit 6
+| Topic | Doc |
+|-------|-----|
+| D64 attach, tiers, KERNAL hooks | [docs/disk_support.md](docs/disk_support.md) |
+| Standalone `c1541_emulator` process | [docs/drive_emulator.md](docs/drive_emulator.md) |
+| Remote drive over TCP (`--tcp-drive`) | [docs/tcp_hardware_drive.md](docs/tcp_hardware_drive.md) |
+| IEC bus status | [docs/iec_bus.md](docs/iec_bus.md) |
 
-5. **Multicolor Text Mode**
-   - Text mode with multicolor characters
-   - Enabled via $D016 bit 4
+Quick examples:
 
-### Sprite Support
+```bash
+# Local auto-spawn (pass .d64 as positional)
+c64py mydisk.d64
 
-- 8 hardware sprites (24x21 pixels each)
-- Hi-res and multicolor sprite modes
-- Sprite positioning and colors
-- Sprite enable/disable via $D015
-- Sprite data from memory pointers
-
-### Graphics Rendering
-
-**Pygame Window (`--interface graphics`):**
-- Full-resolution rendering (320x200 pixels)
-- Proper bitmap and sprite rendering
-- Accurate C64 color palette
-- Scalable window (--graphics-scale option)
-
-**Text Mode (default):**
-- ASCII art representation using Unicode block characters
-- Samples bitmap data to create approximate visualization
-- Uses characters: ░▒▓█ for different pixel densities
-- Maintains color information from C64 palette
-
-### VIC-II Registers
-
-The emulator implements key VIC-II registers:
-- `$D011`: Control Register 1 (bitmap mode, extended color mode)
-- `$D016`: Control Register 2 (multicolor mode)
-- `$D018`: Memory Control (screen/bitmap base addresses)
-- `$D020`: Border color
-- `$D021-$D024`: Background colors
-- `$D015`: Sprite enable
-- `$D027-$D02E`: Sprite colors
-
-### Programming Graphics
-
-Example BASIC program to enable bitmap mode:
-
-```basic
-10 REM ENABLE BITMAP MODE
-20 POKE 53265, PEEK(53265) OR 32
-30 POKE 53272, 8
-40 REM CLEAR BITMAP
-50 FOR I=8192 TO 16191:POKE I,0:NEXT
-60 REM SET COLORS
-70 FOR I=1024 TO 2023:POKE I,16:NEXT
-80 REM DRAW PIXELS
-90 POKE 8192,255
+# Standalone drive server + C64 client
+python -m c64py.drives.c1541_emulator --disk game.d64 --device 8 --port 6408
+c64py --tcp-drive 8:localhost:6408 game.prg
 ```
 
-See `programs/bitmap_test.prg` and `programs/graphics_test.bas` for examples.
+## Remote control (three channels)
 
-## Server Mode Commands
+These are **different** surfaces — do not confuse the TCP control port with the monitor or the guest mailbox.
 
-When running in server mode (with `--tcp-port` or `--udp-port`), you can send commands:
+### 1. Control server (`--tcp-port` / `--udp-port`)
 
-- `STATUS`: Get emulator status
-- `STEP [N]`: Step N CPU cycles (default: 1)
-- `RUN`: Start/resume emulation
-- `MEMORY [start] [end]`: Read memory (hex addresses)
-- `DUMP [start] [end]`: Dump memory as hex string
-- `SCREEN`: Get current screen output
-- `LOAD <file>`: Load a PRG file
-- `STOP`: Stop emulation
-- `QUIT` or `EXIT`: Exit the server
+Line-oriented **emulator control** on localhost. Same grammar as `HELP` in [command_dispatch.py](command_dispatch.py). Examples:
 
-## Textual Interface
+```bash
+c64py --tcp-port 6464 --interface headless --max-cycles 10000000
+# echo STATUS | nc localhost 6464
+```
 
-The emulator features a modern text-based UI when not in server mode:
+`STATUS`, `MEMORY`, `WRITE`, `DUMP`, `SCREEN`, `LOAD`, `ATTACH-DISK`, `DETACH-DISKS`, `SEND_KEY`, `INJECT`, `STOP`, `QUIT`, …
 
-- **C64 Display**: Shows the emulated C64 screen
-- **Debug Panel**: Real-time debug log with timestamps
-- **Status Bar**: Current emulator status
+`INJECT` injects keys with friendly syntax and a real-hardware option:
 
-### Keyboard Shortcuts
+```bash
+# echo 'INJECT {F1}'            | nc localhost 6464   # single key -> CIA1 matrix (real press)
+# echo 'INJECT RUN{return}'     | nc localhost 6464   # multiple keys -> KERNAL buffer
+# echo 'INJECT MATRIX {space}'  | nc localhost 6464   # force matrix (one keystroke)
+# echo 'INJECT BUFFER HELLO'    | nc localhost 6464   # force KERNAL buffer
+# echo 'INJECT JOY 2:up+fire:300ms' | nc localhost 6464   # hold joystick port 2
+```
 
-- `Ctrl+X`: Quit the emulator
-- `Ctrl+R`: Fill screen with random characters (debug)
-- `Ctrl+K`: Dump screen memory to debug logs
+Auto mode picks **matrix** for a single keystroke (so games scanning `$DC00`/`$DC01`
+directly — including F-keys like `{F1}` — see a real press) and the **KERNAL buffer**
+for multi-key strings. `--inject-keys` follows the same rule. `SEND_KEY`/`SEND_KEYS`
+remain buffer-only (raw PETSCII codes).
 
-## Error Handling
+### 2. Monitor server (`--monitor-port`)
 
-- If any ROM file fails to load, the emulator will:
-  1. Stop the textual UI (if running)
-  2. Print an error message
-  3. Exit immediately with error code 1
+Lightweight **CPU debugger** (step, breakpoints, memory dump) — not VICE protocol. See [docs/DEBUGGING.md](docs/DEBUGGING.md) §6.
 
-- On automatic exit (e.g., max cycles reached), the emulator will:
-  1. Capture the last 20 log messages
-  2. Shut down the textual UI
-  3. Print the captured logs to the console
+```bash
+c64py --monitor-port 6510 --interface headless
+```
+
+### 3. Host-memory command channel (`--host-command-ctrl`)
+
+Guest program pokes requests into C64 RAM mailboxes; host polls and dispatches the **same command grammar** as the TCP server. Off by default. See [docs/host_memory_command_channel.md](docs/host_memory_command_channel.md).
+
+## Textual interface
+
+Default UI when not using `--interface headless|graphics` and not relying solely on server ports.
+
+- **C64 panel**: colored 40×25 screen
+- **Debug log** and **status bar**
+- **Shortcuts**: `Ctrl+X` quit · `F10` turbo · `F11` layout · `F12` save text snapshot to `snapshots/textual_screen_*.txt`
+
+![Textual UI overview](docs/images/readme/textual_ui.png)
 
 ## Architecture
 
-The emulator consists of several key components:
+| Component | Location |
+|-----------|----------|
+| Entry point / CLI | `C64.py` |
+| Emulator loop, IEC, KERNAL hooks | `emulator.py` |
+| 6502 CPU | `cpu.py` (+ optional `c64py_rust_core`) |
+| Memory, VIC snapshots | `memory.py` |
+| pygame presenter | `graphics.py`, `presenter.py` |
+| Textual UI | `ui.py` |
+| Control server | `server.py`, `command_dispatch.py` |
+| Monitor TCP | `monitor_tcp.py` |
+| Drive stack | `drives/` — `drive.py`, `c1541_emulator.py`, `tcp_drive_client.py`, … |
+| Snapshots | `snapshot.py` — [docs/snapshots.md](docs/snapshots.md) |
 
-- **C64**: Main emulator class
-- **CPU6502**: 6502 CPU emulator
-- **MemoryMap**: Memory management with ROM/RAM mapping
-- **TextualInterface**: Text-based UI using Textual
-- **EmulatorServer**: TCP/UDP server for remote control
+## Documentation index
+
+| Doc | Contents |
+|-----|----------|
+| [docs/config.md](docs/config.md) | TOML config schema |
+| [docs/emulation_modes.md](docs/emulation_modes.md) | VIC & audio tiers |
+| [docs/per_cycle_vic.md](docs/per_cycle_vic.md) | Per-cycle / per-raster rendering |
+| [docs/DEBUGGING.md](docs/DEBUGGING.md) | Traces, monitor, repro matrix |
+| [docs/rust_core.md](docs/rust_core.md) | Optional Rust extension |
+| [docs/disk_support.md](docs/disk_support.md) | D64, tiers, KERNAL LOAD path |
+| [docs/drive_emulator.md](docs/drive_emulator.md) | Standalone 1541 server |
+| [docs/tcp_hardware_drive.md](docs/tcp_hardware_drive.md) | TCP-attached drives |
+| [docs/iec_bus.md](docs/iec_bus.md) | IEC bus implementation status |
+| [docs/host_memory_command_channel.md](docs/host_memory_command_channel.md) | Guest→host mailbox |
+| [docs/snapshots.md](docs/snapshots.md) | Save/load emulator state |
+| [docs/performance.md](docs/performance.md) | Benchmarks & profiling |
+| [docs/input_ux.md](docs/input_ux.md) | Keyboard/joystick UX |
+| [docs/capturing_screenshots.md](docs/capturing_screenshots.md) | Capture screenshots/videos (dev tooling) |
+| [AGENTS.md](AGENTS.md) | Agent/CI notes |
+
+## Requirements
+
+- Python 3.8+
+- Runtime: `requirements.txt`
+- README screenshot tooling only: `requirements-docs.txt`
 
 ## License
 
-Licensed under the **BSD 3-Clause License**. See `LICENSE`.
+BSD 3-Clause — see [LICENSE](LICENSE).

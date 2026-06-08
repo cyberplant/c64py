@@ -36,7 +36,7 @@ If none exist, the built-in defaults (see below) are used.
 
 ```toml
 [video]
-rendering  = "per-frame"     # "per-frame" | "per-raster" | "per-cycle" (per-cycle needs accurate-python VIC; see docs/per_cycle_vic.md)
+rendering  = "per-frame"     # "per-frame" | "per-raster" | "per-cycle" (needs accurate-python or accurate-rust VIC; see docs/per_cycle_vic.md)
 standard   = "pal"           # "pal" | "ntsc"
 scale      = 2               # graphics window scale factor (integer)
 fps        = 30              # graphics present rate cap
@@ -52,6 +52,12 @@ interface     = "textual"    # "textual" | "headless" | "graphics"
 disk_emulation = "fast"      # "fast" | "accurate-python" | "accurate-rust"
 vic_emulation  = "fast"      # "fast" | "accurate-python" | "accurate-rust"
 
+[c1541]
+# Standalone TCP drive (`python -m c64py.drives.c1541_emulator`).
+# `{date}` → ISO date, `{device}` → drive number (8–11).
+file_logging_enabled = false
+file_logging_filename = "logs/c1541-{date}.log"
+
 [debug]
 turbo     = false            # run at maximum speed (no throttle)
 udp_debug = false            # emit debug events over UDP
@@ -64,13 +70,13 @@ screen_update_interval = 0.1 # seconds between text/status refreshes
 [input.joystick.port2]
 # Host-key bindings for emulated joystick port 2 (the C64 default for most
 # games). A direction can be a single key or a list.
-# Names are case-insensitive; "Up"/"K_UP", "RCtrl"/"K_RCTRL", "Space",
-# "LShift", individual letters/digits, etc. all resolve to pygame.K_*.
+# Names are case-insensitive; "Up"/"K_UP", "Space", "LShift",
+# individual letters/digits, etc. all resolve to pygame.K_*.
 up    = "Up"
 down  = "Down"
 left  = "Left"
 right = "Right"
-fire  = ["RCtrl", "Space"]
+fire  = ["Space"]
 
 [input.joystick.port1]
 # Empty by default. Example WASD remap:
@@ -169,7 +175,7 @@ same way; games disambiguate via the CIA1 DDR. BASIC ignores joystick
 lines, so binding `Space` as fire does not break typing in graphics mode.
 
 If no `[input.joystick]` table is present, the built-in defaults
-(arrows + RCtrl/Space → port 2; port 1 empty) apply. To disable a
+(arrows + Space for port 2 fire; port 1 empty) apply. To disable a
 direction entirely, set it to an empty string or a name pygame can't
 resolve (e.g. `up = ""`).
 
@@ -246,6 +252,8 @@ Editor controls:
 - `Enter`: on **keyboard** joystick rows, capture a host key; on **gamepad** mapping
   rows, capture a button/axis/hat token (opens the capture screen; pygame opens all
   SDL devices first). Bluetooth: focus the window, wake the pad; polling runs ~30s.
+  On **`[c1541]`** string fields (e.g. `file_logging_filename`), `Enter` opens a short
+  text prompt for the path template (`{date}` / `{device}` placeholders allowed).
 - `S`: save
 - `Q` or `Esc`: quit; if there are unsaved changes, choose **Save and quit** (default),
   **Discard and quit**, or **Cancel**

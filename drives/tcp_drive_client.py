@@ -18,6 +18,13 @@ Usage:
 The client is intentionally synchronous and non-blocking: ``step()`` drains
 whatever reply bytes are already in the OS socket buffer without waiting.
 This keeps the emulator main loop from stalling on network I/O.
+
+For ``PRINT#`` / LISTEN data-secondaries, the stock KERNAL waits in a tight
+``$DD00`` read loop until the listener pulls DATA low ("ready"). A real 1541
+does this via VIA; :class:`TcpDriveClient` asserts DATA on the logical
+:class:`~c64py.iec_bus.IECBus` when ATN is released after a data-secondary and
+re-asserts after each logical ``iec_receive_byte`` so CIA2 reads can progress
+while JSON is proxied to the TCP server.
 """
 
 from __future__ import annotations
@@ -47,6 +54,11 @@ class TcpDriveClient(IECDriveBackend):
         self._recv_buf = b""
         self._connected = False
         self._last_disconnect: float = 0.0
+        # Simulated open-collector DATA pull for KERNAL bit-bang "listener ready"
+        # (see :meth:`on_atn_changed` / :meth:`iec_receive_byte`).
+        self._iec_peer_tag = f"tcp_drv_{int(device_number)}"
+        self._listen_data_low: bool = False
+        self._await_listen_ready: bool = False
 
     # ------------------------------------------------------------------
     # Connection management
@@ -95,6 +107,7 @@ class TcpDriveClient(IECDriveBackend):
 
     def disconnect(self) -> None:
         """Close the TCP connection."""
+        self._release_listen_data_line()
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -108,11 +121,24 @@ class TcpDriveClient(IECDriveBackend):
         return self._connected
 
     # ------------------------------------------------------------------
+    # Simulated IEC DATA (listener ready) for KERNAL $DD00 polling loops
+    # ------------------------------------------------------------------
+
+    def _release_listen_data_line(self) -> None:
+        bus = self.iec_bus
+        if bus is None or not self._listen_data_low:
+            self._listen_data_low = False
+            return
+        bus.set_data(self._iec_peer_tag, True)
+        self._listen_data_low = False
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _mark_disconnected(self) -> None:
         """Record a connection loss and close the socket."""
+        self._release_listen_data_line()
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -219,22 +245,44 @@ class TcpDriveClient(IECDriveBackend):
         pass
 
     def on_atn_changed(self, atn_state: bool) -> None:
-        pass
+        """Pull DATA low once when ATN is released after a data-secondary (PRINT#)."""
+        if not self._await_listen_ready:
+            return
+        bus = self.iec_bus
+        if bus is None or not atn_state:
+            return
+        if bus.secondary_phase != "data":
+            return
+        if bus.talker is not None:
+            return
+        if bus.listener != self.device_number and bus.current_listener != self.device_number:
+            return
+        bus.set_data(self._iec_peer_tag, False)
+        self._listen_data_low = True
+        self._await_listen_ready = False
 
     # ------------------------------------------------------------------
     # IECDriveBackend — byte-level protocol callbacks
     # ------------------------------------------------------------------
 
     def on_listen(self) -> None:
+        self._await_listen_ready = False
+        self._release_listen_data_line()
         self._send({"type": "listen", "device": self.device_number})
 
     def on_unlisten(self) -> None:
+        self._await_listen_ready = False
+        self._release_listen_data_line()
         self._send({"type": "unlisten"})
 
     def on_talk(self) -> None:
+        self._await_listen_ready = False
+        self._release_listen_data_line()
         self._send({"type": "talk", "device": self.device_number})
 
     def on_untalk(self) -> None:
+        self._await_listen_ready = False
+        self._release_listen_data_line()
         self._send({"type": "untalk"})
 
     def on_secondary_address(self, channel: int) -> None:
@@ -248,15 +296,44 @@ class TcpDriveClient(IECDriveBackend):
 
     def iec_secondary(self, channel: int, kind: str) -> None:
         self._send({"type": "secondary", "channel": channel, "kind": kind})
+        if kind == "data":
+            bus = self.iec_bus
+            if (
+                bus is not None
+                and bus.talker is None
+                and (
+                    bus.listener == self.device_number
+                    or bus.current_listener == self.device_number
+                )
+            ):
+                self._await_listen_ready = True
 
     def iec_unlisten(self) -> None:
+        self._await_listen_ready = False
+        self._release_listen_data_line()
         self._send({"type": "unlisten"})
 
     def iec_untalk(self) -> None:
+        self._await_listen_ready = False
+        self._release_listen_data_line()
         self._send({"type": "untalk"})
 
     def iec_receive_byte(self, byte: int, eoi: bool = False) -> None:
+        self._release_listen_data_line()
         self._send({"type": "send_byte", "byte": byte & 0xFF, "eoi": bool(eoi)})
+        bus = self.iec_bus
+        if (
+            bus is not None
+            and bus.atn
+            and bus.secondary_phase == "data"
+            and bus.talker is None
+            and (
+                bus.listener == self.device_number
+                or bus.current_listener == self.device_number
+            )
+        ):
+            bus.set_data(self._iec_peer_tag, False)
+            self._listen_data_low = True
 
     def iec_send_byte(self) -> Optional[Tuple[int, bool]]:
         reply = self._request({"type": "request_byte"})

@@ -264,6 +264,7 @@ class ReSIDEmulator:
         sampling_method: int = SAMPLE_INTERPOLATE,
         cpu_lockstep: bool = True,
         audio_volume: float = 1.0,
+        start_audio: bool = True,
     ) -> None:
         self._lib = _load_resid_lib()
         self._sid_ptr = self._lib.resid_create()
@@ -363,7 +364,31 @@ class ReSIDEmulator:
                 except ValueError:
                     self._wav_max_bytes = None
 
-        self._init_audio(mixer_buffer)
+        # Offline capture mode: skip the pygame mixer + worker thread entirely so
+        # ``tick_cpu_cycles`` accumulates deterministic PCM in ``_pcm_pending`` for a
+        # caller to harvest via :meth:`drain_pcm` (no real-time audio output).
+        self._offline = not start_audio
+        if start_audio:
+            self._init_audio(mixer_buffer)
+
+    def drain_pcm(self) -> bytes:
+        """Return and clear all lockstep PCM produced so far (little-endian int16 mono).
+
+        Intended for offline capture (``start_audio=False``): drive the CPU so
+        ``tick_cpu_cycles`` fills the queue, then drain at a known cadence. The
+        cycle→sample mapping is ``sample_rate / clock_hz``.
+        """
+        with self._lock:
+            if not self._sid_ptr or not self._pcm_pending:
+                return b""
+            chunk = bytes(self._pcm_pending)
+            self._pcm_pending.clear()
+        return chunk
+
+    def clear_pcm(self) -> None:
+        """Discard any queued PCM (e.g. just before a recording window starts)."""
+        with self._lock:
+            self._pcm_pending.clear()
 
     # ------------------------------------------------------------------
     # Lockstep queue stats / trace (underrun & overrun)

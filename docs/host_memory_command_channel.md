@@ -1,89 +1,129 @@
-# Host command channel via C64 RAM (draft)
+# Host command channel via C64 RAM
 
-This document sketches a **machine-local control plane**: a BASIC or ML program inside the emulated C64 sets up a small protocol in RAM; the **host** Python process watches fixed addresses and performs actions (exit, snapshot, HTTP bridge, etc.), then writes a reply the guest can poll.
+A guest program (BASIC or ML) running on the emulated C64 controls the host emulator by writing into a fixed pair of 256-byte mailboxes in C64 RAM. The host polls those mailboxes once per CPU quantum, dispatches the request, and writes a reply back into RAM where the guest can read it.
 
-It is **not** a security boundary. Anyone who can run the emulator with the feature enabled can define arbitrary handlers. Treat it like `DEBUG` ports: **off by default**, for scripted harnesses and developer workflows only.
+This is **not** a security boundary. It is **off by default** and only active when `--host-command-ctrl` is passed. The dispatcher reuses the full TCP server grammar (`STATUS`, `MEMORY`, `WRITE`, `LOAD`, `ATTACH-DISK`, …), so anything the user can do over TCP they can also do from the guest CPU. Treat it like an open debug port.
 
-## Motivation
-
-- Drive the emulator from **BASIC** without adding custom KERNAL ROMs or IEC gadgets.
-- Clean shutdown after a batch job (`PRINT` progress, then request `exit`).
-- Future: return structured JSON to the guest for tests (golden-master comparisons).
-
-## Proposed CLI shape (illustrative)
+## CLI
 
 ```text
-python C64.py --host-command-ctrl 0xC000,0xC002 ...
+python C64.py --host-command-ctrl TX=0xC000,RX=0xC100 ...
 ```
 
-- **Argument 1** (e.g. `C000`): **guest → host** “mailbox” — two bytes (or one pointer) meaning “command block address low/high” or a **ZP-style 16-bit pointer** to a descriptor in guest RAM.
-- **Argument 2** (e.g. `C002`): **host → guest** “response pointer” — where the host writes the address of a reply block after handling a command.
+- `TX` (guest → host): 256-byte mailbox where the guest places its request.
+- `RX` (host → guest): 256-byte mailbox where the host places its reply.
+- Addresses are mandatory and have **no defaults**. Hex (`0x…` / `$…`) and decimal both accepted.
+- Each region is `[base, base+255]` inclusive (256 bytes total). The two regions must not overlap and each base must be ≤ `$FF00`.
 
-Exact semantics (flat 16-bit vs zero-page only, endianness) must be fixed before implementation. Little-endian 6510 order is the natural default.
+## Wire format
 
-## Descriptor layout (sketch)
+Both directions are identical and symmetric:
 
-Guest allocates a contiguous block, e.g. starting at `$1000`:
+| Offset | Bytes | Meaning |
+|--------|-------|---------|
+| `+0`   | 1     | **Size byte**: `0` = idle, `1..255` = N bytes ready |
+| `+1..+N` | N   | Payload bytes |
 
-| Offset | Size | Meaning |
-|--------|------|---------|
-| +0 | 1 | **Magic / version** (e.g. `$01`) |
-| +1 | 1 | **Command id** (enum: `1` = exit, `2` = snapshot, …) |
-| +2 | 1 | **Flags** (reserved) |
-| +3 | 1 | **Payload length** `N` (0–255 for v1) |
-| +4 | N | **Payload** (PETSCII or UTF-8 subset; JSON if both sides agree) |
+State machine, same on both sides:
 
-The **control word** at `$C000` could mean: “pointer = `$1000`” using two bytes low/high, **or** a sentinel: non-zero `$C000` means “poll `$C000/$C001` as 16-bit LE pointer to descriptor”.
+1. **Idle**: size byte is `0`. Producer may start writing payload.
+2. **Producer commits**: writes payload bytes first, then writes the byte count to `+0` last (single store). Until the size byte changes, the consumer sees idle.
+3. **Consumer reads**: when it sees a non-zero size byte, it copies that many bytes from `+1`, processes them, and writes `0` back to `+0` to acknowledge.
+4. Producer must wait for the size byte to be `0` again before sending the next message.
 
-After the host consumes the command it should **clear** the mailbox (write `$0000` to `$C000`) or set a **status byte** so the guest does not double-fire.
+Maximum payload per message: **255 bytes**. The host returns `ERROR: reply too long (N bytes, max 255)` (text mode) or `{"ok":false,"error":"reply too long…"}` (JSON mode) when a reply would exceed the cap.
 
-## Host → guest reply (sketch)
+## Encoding sniff
 
-Symmetric block at an address the host chooses, **written into RAM** by the emulator:
+The host inspects the **first byte** of every guest request:
 
-| Field | Meaning |
-|-------|---------|
-| Status | `0` pending, `1` ok, `$FF` error |
-| Length + payload | Same as guest → host |
+- `payload[0] == 0x7B` (ASCII `{`) → parsed as **JSON** (UTF-8 expected). Replies are always `{"ok":true,"result":"…"}` or `{"ok":false,"error":"…"}`.
+- otherwise → treated as a **simple text command** (the existing TCP server grammar). Replies are the raw string the dispatcher returns.
 
-The second CLI address (`$C002`) could hold the **reply block address** (16-bit), updated by the host when a reply is ready; the guest polls until non-zero, reads the block, then clears `$C002`/`C003`.
+The host does **not** PETSCII-normalize. The guest is responsible for poking the byte values it wants the host to see. Note that BASIC `PRINT "{"` and ASCII `{` both happen to encode as `$7B`, so JSON mode works identically from BASIC strings or hand-poked bytes.
 
-## When to poll on the host
+### JSON envelope
 
-- **Per instruction** (expensive): simplest semantics.
-- **Every N virtual cycles** or **once per emulated frame**: cheaper; adds latency.
-- **Cooperative**: guest hits a `NOP` sled that maps to a “trap” PC (heavy-handed).
+Request:
 
-The right default is probably **once per CPU quantum** in the Python loop, or a hook next to existing **snapshot / trace** checks, with a **rate limit** so a buggy guest cannot busy-spin the host.
+```json
+{"cmd": "STATUS"}
+{"cmd": "WRITE", "args": ["$C200", "$AB"]}
+```
 
-## JSON in guest RAM
+`cmd` is a non-empty string. `args` is an optional list; numbers and strings are stringified and joined with the `cmd` (so `WRITE`, `["$C200", "$AB"]` becomes the text command `WRITE $C200 $AB`).
 
-Putting ASCII/JSON in C64 RAM is fine for small messages. Constraints:
+Reply:
 
-- Keep payloads **short** (≤ 256 bytes v1) to avoid spanning I/O shadows and to simplify parsing.
-- **PETSCII vs ASCII**: document whether the host normalizes or expects PETSCII only.
+```json
+{"ok": true,  "result": "PC=$1000 A=$11 ..."}
+{"ok": false, "error":  "missing or empty 'cmd' field"}
+```
+
+## Polling cadence
+
+The host polls TX once per CPU quantum at the end of
+`C64.run_cpu_instruction_quantum` (including the Pygame and Textual CPU
+threads, which call that method directly rather than `C64.run`). In the
+`C64.run` loop, `_service_snapshot_requests()` runs on the same cadence but
+**after** each quantum returns; host-command polling is tied to the quantum
+itself. Latency is roughly one Rust fast-batch (default 64 instructions).
+There is no rate limiting beyond that — a guest that pokes the size byte every
+iteration will drive the dispatcher every quantum.
+
+When the host produces a reply but RX size byte is still non-zero (the guest hasn't acked the previous reply yet), the new reply is **dropped** and a counter is bumped (`HostCommandChannel.replies_dropped`). The host never blocks waiting for the guest.
+
+## Examples
+
+### BASIC
+
+```basic
+10 T = 49152 : R = 49408
+20 A$ = "STATUS" + CHR$(13)
+30 FOR I = 1 TO LEN(A$) : POKE T+I, ASC(MID$(A$,I,1)) : NEXT
+40 POKE T, LEN(A$)
+50 IF PEEK(R) = 0 THEN 50
+60 N = PEEK(R)
+70 FOR I = 1 TO N : PRINT CHR$(PEEK(R+I)); : NEXT : PRINT
+80 POKE R, 0
+```
+
+### Machine code (sketch)
+
+```asm
+; assume A=cmd-len, X=lo(payload), Y=hi(payload), TX=$C000, RX=$C100
+        ; ... copy payload bytes to $C001+ ...
+        sta $C000               ; commit (size byte last)
+.wait   lda $C100
+        beq .wait
+        ; reply length now in A; payload at $C101..
+        ; ... read it ...
+        lda #0
+        sta $C100               ; ack
+```
 
 ## Security and abuse
 
-- **Never enable by default** in distro packages.
-- **Path / network commands** must validate against an allow-list (e.g. snapshot path under `TMPDIR` only).
-- **“Run shell command”** should not exist in v1; if added later, require an explicit second flag and a config file allow-list.
+- **Off by default.** Distro packages and CI defaults must not flip this on.
+- The dispatcher is the same one the TCP server uses, so it accepts `LOAD`, `ATTACH-DISK`, `WRITE`, `STOP`, `QUIT/EXIT`, etc. Trust level matches the user running the emulator — this is **not** a sandbox.
+- A read-only / allow-listed sub-mode is out of scope for v1. If you need one, file an issue.
 
-## Alternatives
+## Limits and future work
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| This RAM mailbox | Zero extra hardware in the guest | Easy to foot-gun; needs clear ABI |
-| TCP control port (`C64.py --tcp-port`) from ML | Already exists | harder from pure BASIC |
-| `USR()` hook to Python | Typed arguments | needs stub ML or modified BASIC |
+- Max single message: 255 bytes. Replies that overflow are returned as an explicit error, not truncated silently.
+- No chunked / streaming replies. If you need to read more than 255 bytes (e.g. `DUMP`), use multiple narrower commands (`MEMORY $XXXX` per byte) or use the TCP server.
+- No PETSCII normalization. The guest decides what bytes to send.
+- No `--host-command-ctrl-readonly` flag yet.
+- No TOML config key — flag must be passed on the CLI.
 
-## Open questions
+## Implementation pointers
 
-1. **ZP-only restriction?** Some users want `$00–$FF` mailboxes; others want `$C000` cartridge RAM. Support both with validation.
-2. **Re-entrancy**: guest issues command while host is still writing reply.
-3. **Rust fast core**: mailbox must be observed from the same place **KERNAL hooks** already stop the batch, or the guest may never be seen.
-4. **Unit tests**: small PRG that pokes mailbox; host asserts `exit` within N cycles.
+- Module: `host_command_channel.py` — `HostCommandChannel` (poll/handle/encode) and `parse_host_command_ctrl` (CLI parser).
+- Polling site: `emulator.py` — end of `C64.run_cpu_instruction_quantum` via `_poll_host_cmd_channel` (covers `C64.run`, `graphics.py`, `ui.py`, and scripts).
+- Construction site: `C64.py`, near the monitor / TCP server bring-up.
+- Dispatcher: `command_dispatch.py` — shared with `EmulatorServer` so both transports speak the same grammar.
+- Tests: `test/test_host_command_channel.py` (no ROMs required).
 
 ## Status
 
-**Not implemented** — design only. When you pick address semantics and command IDs, add a short `docs/` section here and wire the CLI in `C64.py` behind an explicit flag name (bikeshed: `--host-command-ctrl`, `--guest-mailbox`, …).
+Implemented (v1). Off by default. See the security notes before enabling.

@@ -104,6 +104,8 @@ def test_fast_load_directory(drive_tcp_server):
     assert len(data) >= 4
     assert data[0] == 0x01
     assert data[1] == 0x08
+    assert data[4:6] == b"\x00\x00"
+    assert data[6] == 0x12
 
 
 def test_fast_load_wildcard_blank_has_no_prg(drive_tcp_server):

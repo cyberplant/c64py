@@ -47,6 +47,10 @@ out/
 # Accidental root-level ReSID/debug captures (not part of the repo).
 /test.wav
 
+# User-provided screenshot media and generated PNGs (see docs/screenshots/local/README.md)
+docs/screenshots/local/output/
+docs/screenshots/local/manifest.local.json
+
 # find_first_ram_diff_cycle.py RAM + log cache
 .c64py_ram_cache/
 

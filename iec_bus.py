@@ -55,10 +55,12 @@ Logical (byte-level) protocol — modelled by ``send_command``/``send_byte``/
 
 from __future__ import annotations
 
-from typing import Optional, List, TYPE_CHECKING
+from typing import Optional, List, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .drives.c1541_emulator import Drive1541
+
+Triple = Tuple[bool, bool, bool]
 
 
 class IECBus:
@@ -70,6 +72,11 @@ class IECBus:
         self.atn = True  # Attention line (C64 controls)
         self.clk = True  # Clock line (bidirectional)
         self.data = True  # Data line (bidirectional)
+        # When True, :meth:`set_atn` / :meth:`set_clk` / :meth:`set_data` skip
+        # :attr:`iec_line_receiver` (used to batch CIA2 port A into one tap event).
+        self.iec_line_events_suppressed: bool = False
+        # Optional tap / decoder implementing ``on_iec_lines(before, after, cyc=0)``.
+        self.iec_line_receiver: Optional[object] = None
         
         # Track who's pulling each line low
         self.clk_pullers = set()  # Set of device IDs pulling CLK low
@@ -93,6 +100,17 @@ class IECBus:
         self.eoi = False
         # Latches an EOI-on-receive so callers can poll after receive_byte().
         self.eoi_pending = False
+
+    def line_triple(self) -> Triple:
+        """Resolved ``(ATN, CLK, DATA)`` with ``True`` = released / high."""
+        return (bool(self.atn), bool(self.clk), bool(self.data))
+
+    def _emit_iec_line_change_if_needed(self, before: Triple, after: Triple, cyc: int = 0) -> None:
+        if before == after or self.iec_line_events_suppressed:
+            return
+        recv = self.iec_line_receiver
+        if recv is not None and hasattr(recv, "on_iec_lines"):
+            recv.on_iec_lines(before, after, cyc)
         
     def attach_device(self, device: Drive1541) -> None:
         """Attach a device to the bus.
@@ -119,6 +137,7 @@ class IECBus:
         Args:
             state: True = released (high), False = asserted (low)
         """
+        before = self.line_triple()
         if self.atn != state:
             self.atn = state
             # Notify all devices of ATN change
@@ -126,6 +145,8 @@ class IECBus:
                 device.on_atn_changed(state)
                 if hasattr(device, "notify_bus_change"):
                     device.notify_bus_change()
+        after = self.line_triple()
+        self._emit_iec_line_change_if_needed(before, after, 0)
                 
     def set_clk(self, device_id: str, state: bool) -> None:
         """Set CLK line state from a specific device.
@@ -134,6 +155,7 @@ class IECBus:
             device_id: ID of device setting the line
             state: True = released (high), False = asserted (low)
         """
+        before = self.line_triple()
         prev = self.clk
         if state:
             # Release - remove from pullers
@@ -148,6 +170,8 @@ class IECBus:
             for device in self.devices:
                 if hasattr(device, "notify_bus_change"):
                     device.notify_bus_change()
+        after = self.line_triple()
+        self._emit_iec_line_change_if_needed(before, after, 0)
         
     def set_data(self, device_id: str, state: bool) -> None:
         """Set DATA line state from a specific device.
@@ -156,6 +180,7 @@ class IECBus:
             device_id: ID of device setting the line
             state: True = released (high), False = asserted (low)
         """
+        before = self.line_triple()
         prev = self.data
         if state:
             # Release - remove from pullers
@@ -170,6 +195,8 @@ class IECBus:
             for device in self.devices:
                 if hasattr(device, "notify_bus_change"):
                     device.notify_bus_change()
+        after = self.line_triple()
+        self._emit_iec_line_change_if_needed(before, after, 0)
         
     def get_clk(self) -> bool:
         """Get current CLK line state.
@@ -222,9 +249,14 @@ class IECBus:
         - Otherwise fall back to the legacy ``receive_byte(byte)`` hook.
         """
         self.eoi = bool(eoi)
-        if self.listener is None:
+        dev = (
+            self.current_listener
+            if self.current_listener is not None
+            else self.listener
+        )
+        if dev is None:
             return False
-        device = self._find_device(self.listener)
+        device = self._find_device(dev)
         if device is None:
             return False
         if hasattr(device, "iec_receive_byte"):
@@ -258,29 +290,14 @@ class IECBus:
         # Legacy device: returns just an int.
         return device.send_byte()
         
-    def send_command(self, command: int) -> bool:
-        """Send a command byte with ATN asserted.
+    def deliver_command(self, command: int) -> bool:
+        """Apply a logical IEC command byte **without** toggling ATN on the bus.
 
-        Primary commands:
-            0x20 + dev (0..30)  LISTEN device
-            0x3F                UNLISTEN
-            0x40 + dev (0..30)  TALK device
-            0x5F                UNTALK
-
-        Secondary commands (interpreted relative to the current LISTEN/TALK):
-            0x60 + ch  open data on channel ch (assumes file already open)
-            0x70 + ch  reserved (treated like 0x60+ch for safety)
-            0xE0 + ch  close channel ch
-            0xF0 + ch  open new file on channel ch — filename bytes follow
-                       (until UNLISTEN) and are streamed to the listener via
-                       send_byte/iec_receive_byte.
-
-        Returns:
-            True if the command was recognised and dispatched.
+        Used when a KERNAL wire decoder has already asserted ATN on the CIA2
+        lines and only the listener/talker/secondary state machine must run.
+        :meth:`send_command` wraps this with ``set_atn(False)`` / ``set_atn(True)``
+        for programmatic / test callers.
         """
-        # Assert ATN
-        self.set_atn(False)
-
         handled = True
 
         if 0x20 <= command <= 0x3E:
@@ -382,9 +399,31 @@ class IECBus:
         else:
             handled = False
 
-        # Release ATN
-        self.set_atn(True)
+        return handled
 
+    def send_command(self, command: int) -> bool:
+        """Send a command byte with ATN asserted.
+
+        Primary commands:
+            0x20 + dev (0..30)  LISTEN device
+            0x3F                UNLISTEN
+            0x40 + dev (0..30)  TALK device
+            0x5F                UNTALK
+
+        Secondary commands (interpreted relative to the current LISTEN/TALK):
+            0x60 + ch  open data on channel ch (assumes file already open)
+            0x70 + ch  reserved (treated like 0x60+ch for safety)
+            0xE0 + ch  close channel ch
+            0xF0 + ch  open new file on channel ch — filename bytes follow
+                       (until UNLISTEN) and are streamed to the listener via
+                       send_byte/iec_receive_byte.
+
+        Returns:
+            True if the command was recognised and dispatched.
+        """
+        self.set_atn(False)
+        handled = self.deliver_command(command)
+        self.set_atn(True)
         return handled
 
     def unlisten(self) -> bool:
@@ -407,13 +446,15 @@ class IECBus:
         if not 0 <= channel <= 15:
             return False
         ok = self.send_command(0xF0 | channel)
-        if filename is not None and ok:
+        if not ok:
+            return False
+        if filename is not None:
             data = bytes(filename)
             if data:
                 for i, b in enumerate(data):
                     self.send_byte(b, eoi=(i == len(data) - 1))
-            self.unlisten()
-        return ok
+        self.unlisten()
+        return True
 
     def close_channel(self, channel: int) -> bool:
         """High-level helper: CLOSE ``channel`` on current listener/talker."""

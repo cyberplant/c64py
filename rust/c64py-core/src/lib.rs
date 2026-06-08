@@ -42,6 +42,9 @@ fn rust_core_version() -> &'static str {
     pending_irq,
     cia1_icr,
     cia2_pra, cia2_ddra,
+    cia2_icr,
+    c2ta_latch, c2ta_counter, c2ta_running, c2ta_irq_en, c2ta_oneshot, c2ta_input,
+    c2tb_latch, c2tb_counter, c2tb_running, c2tb_irq_en, c2tb_oneshot, c2tb_input,
     cia1_pra, cia1_prb, cia1_ddra, cia1_ddrb,
     kbd_matrix,
     joy_inject1_clear, joy_inject2_clear,
@@ -64,7 +67,7 @@ fn rust_core_version() -> &'static str {
     beam_vic_flat=None, beam_cia2_flat=None,
     per_cycle_capture=false,
     per_cycle_vic_flat=None, per_cycle_cia2_flat=None,
-    trace_path=None,
+    trace_path=None, iec_cia2_write_log=false,
 ))]
 fn run_fast_batch_py<'py>(
     py: Python<'py>,
@@ -87,6 +90,19 @@ fn run_fast_batch_py<'py>(
     cia1_icr: u8,
     cia2_pra: u8,
     cia2_ddra: u8,
+    cia2_icr: u8,
+    c2ta_latch: u16,
+    c2ta_counter: i32,
+    c2ta_running: bool,
+    c2ta_irq_en: bool,
+    c2ta_oneshot: bool,
+    c2ta_input: u8,
+    c2tb_latch: u16,
+    c2tb_counter: i32,
+    c2tb_running: bool,
+    c2tb_irq_en: bool,
+    c2tb_oneshot: bool,
+    c2tb_input: u8,
     cia1_pra: u8,
     cia1_prb: u8,
     cia1_ddra: u8,
@@ -149,6 +165,7 @@ fn run_fast_batch_py<'py>(
     per_cycle_vic_flat: Option<Bound<'py, PyByteArray>>,
     per_cycle_cia2_flat: Option<Bound<'py, PyByteArray>>,
     trace_path: Option<String>,
+    iec_cia2_write_log: bool,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
         1u8
@@ -180,6 +197,19 @@ fn run_fast_batch_py<'py>(
         bool,
         u8,
         u8,
+        u8,
+        u8,
+        u16,
+        i32,
+        bool,
+        bool,
+        bool,
+        u8,
+        u16,
+        i32,
+        bool,
+        bool,
+        bool,
         u8,
         u16,
         i32,
@@ -312,7 +342,8 @@ fn run_fast_batch_py<'py>(
 
     // Run the heavy batch outside the GIL so Python-side audio/UI threads can run.
     // Safe: we copied the bytearray into `backing` and do not touch Python objects inside.
-    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 22]), String> =
+    let iec_log_flag = iec_cia2_write_log;
+    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 22], Vec<u8>), String> =
         py.detach(move || (move || {
         let ram_arr: &mut [u8; 65536] = backing
             .as_mut_slice()
@@ -328,6 +359,23 @@ fn run_fast_batch_py<'py>(
         mem.cia1_icr = cia1_icr;
         mem.cia2_pra = cia2_pra;
         mem.cia2_ddra = cia2_ddra;
+        mem.cia2_icr = cia2_icr;
+        mem.cia2_timer_a = CiaTimer {
+            latch: c2ta_latch,
+            counter: c2ta_counter,
+            running: c2ta_running,
+            irq_enabled: c2ta_irq_en,
+            one_shot: c2ta_oneshot,
+            input_mode: c2ta_input,
+        };
+        mem.cia2_timer_b = CiaTimer {
+            latch: c2tb_latch,
+            counter: c2tb_counter,
+            running: c2tb_running,
+            irq_enabled: c2tb_irq_en,
+            one_shot: c2tb_oneshot,
+            input_mode: c2tb_input,
+        };
         mem.cia1_pra = cia1_pra;
         mem.cia1_prb = cia1_prb;
         mem.cia1_ddra = cia1_ddra;
@@ -340,6 +388,10 @@ fn run_fast_batch_py<'py>(
         mem.iec_merge_cia2 = iec_enabled;
         mem.iec_peer_clk_high = iec_peer_clk_high;
         mem.iec_peer_data_high = iec_peer_data_high;
+        mem.cia2_iec_log_enabled = iec_log_flag && iec_enabled;
+        if mem.cia2_iec_log_enabled {
+            mem.cia2_iec_log.clear();
+        }
         mem.cia1_timer_a = CiaTimer {
             latch: ta_latch,
             counter: ta_counter,
@@ -450,6 +502,19 @@ fn run_fast_batch_py<'py>(
             mem.cia1_icr,
             mem.cia2_pra,
             mem.cia2_ddra,
+            mem.cia2_icr,
+            mem.cia2_timer_a.latch,
+            mem.cia2_timer_a.counter,
+            mem.cia2_timer_a.running,
+            mem.cia2_timer_a.irq_enabled,
+            mem.cia2_timer_a.one_shot,
+            mem.cia2_timer_a.input_mode,
+            mem.cia2_timer_b.latch,
+            mem.cia2_timer_b.counter,
+            mem.cia2_timer_b.running,
+            mem.cia2_timer_b.irq_enabled,
+            mem.cia2_timer_b.one_shot,
+            mem.cia2_timer_b.input_mode,
             mem.cia1_timer_a.latch,
             mem.cia1_timer_a.counter,
             mem.cia1_timer_a.running,
@@ -473,9 +538,11 @@ fn run_fast_batch_py<'py>(
         mem.per_cycle_vic_ptr = std::ptr::null_mut();
         mem.per_cycle_cia2_ptr = std::ptr::null_mut();
         mem.per_cycle_capture_enabled = false;
-        Ok((out, backing, pcm_bytes, vpack))
+        let cia2_iec_log_out = mem.cia2_iec_log.clone();
+        std::mem::drop(mem);
+        Ok((out, backing, pcm_bytes, vpack, cia2_iec_log_out))
     })());
-    let (out, backing_out, pcm_bytes, vpack) = result.map_err(|e: String| PyValueError::new_err(e))?;
+    let (out, backing_out, pcm_bytes, vpack, cia2_iec_log) = result.map_err(|e: String| PyValueError::new_err(e))?;
     let dst = unsafe { ram.as_bytes_mut() };
     dst.copy_from_slice(&backing_out);
 
@@ -498,6 +565,19 @@ fn run_fast_batch_py<'py>(
         cia_icr,
         c2pra,
         c2ddra,
+        c2icr,
+        c2tala,
+        c2tac,
+        c2tar,
+        c2taie,
+        c2taos,
+        c2tai,
+        c2tbl,
+        c2tbc,
+        c2tbr,
+        c2tbie,
+        c2tbos,
+        c2tbi,
         tala,
         tac,
         tar,
@@ -520,6 +600,7 @@ fn run_fast_batch_py<'py>(
     // Beam data is written in-place into Python bytearrays; keep empty trailers for tuple shape.
     let beam_vic_py = PyBytes::new(py, &[]);
     let beam_cia2_py = PyBytes::new(py, &[]);
+    let cia2_log_py = PyBytes::new(py, &cia2_iec_log);
     PyTuple::new(
         py,
         [
@@ -541,6 +622,19 @@ fn run_fast_batch_py<'py>(
             cia_icr.into_bound_py_any(py)?,
             c2pra.into_bound_py_any(py)?,
             c2ddra.into_bound_py_any(py)?,
+            c2icr.into_bound_py_any(py)?,
+            c2tala.into_bound_py_any(py)?,
+            c2tac.into_bound_py_any(py)?,
+            c2tar.into_bound_py_any(py)?,
+            c2taie.into_bound_py_any(py)?,
+            c2taos.into_bound_py_any(py)?,
+            c2tai.into_bound_py_any(py)?,
+            c2tbl.into_bound_py_any(py)?,
+            c2tbc.into_bound_py_any(py)?,
+            c2tbr.into_bound_py_any(py)?,
+            c2tbie.into_bound_py_any(py)?,
+            c2tbos.into_bound_py_any(py)?,
+            c2tbi.into_bound_py_any(py)?,
             tala.into_bound_py_any(py)?,
             tac.into_bound_py_any(py)?,
             tar.into_bound_py_any(py)?,
@@ -582,6 +676,7 @@ fn run_fast_batch_py<'py>(
             vpack[21].into_bound_py_any(py)?,
             beam_vic_py.into_any(),
             beam_cia2_py.into_any(),
+            cia2_log_py.into_any(),
         ],
     )
 }

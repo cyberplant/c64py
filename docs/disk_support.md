@@ -1,95 +1,234 @@
-# Disk drive support
+# Disk and 1541 support
 
-c64py supports D64 disk images. All tiers run the real 1541 6502 + DOS
-ROM; tiers differ in how much of the disk-controller and IEC-bus
-hardware is actually emulated.
+> **Audience.** Single source of truth for D64 handling, the TCP drive split,
+> emulation tiers, and forward plan. The standalone 1541 server is documented
+> in [drive_emulator.md](drive_emulator.md); third-party TCP firmware in
+> [tcp_hardware_drive.md](tcp_hardware_drive.md).
 
-## Tiers (`[emulation] disk_emulation` / `c1541_emulator --emulation`)
+---
 
-| Tier | Drive 6502 | IEC bus | Disk surface | KERNAL `$FFD5`/`$FFD8` shortcut | Speed |
-|---|---|---|---|---|---|
-| `fast` (default) | Real 1541 6502 in Python | Bytes synthesized; ATN handshake stub | Job-queue trap → `D64Image` sector I/O | Yes (instant LOAD) | Practical full speed |
-| `accurate-python` | Real, in Python | Full bit-level (planned: ATN/CLK/DATA edges, EOI, talk/listen) | Real GCR head: SYNC/PB7, density, stepper, GCR codec | None | WIP, falls back to `fast` until M2 lands |
-| `accurate-rust` | Real, in Rust | Same as `accurate-python`, in Rust | Same, in Rust | None | WIP, falls back to `accurate-python` then `fast` |
+## 1. Architecture
 
-The `--accurate` shortcut on `C64.py` sets aggressive **VIC + video** defaults only; it does not change `disk_emulation` (set that in TOML or on the standalone drive).
+The 1541 is a **separate process** (`python -m c64py.drives.c1541_emulator`).
+The C64 emulator holds **no `DiskDrive`, no `D64Image`, and no 1541 CPU state**.
+All disk bytes and DOS logic live in the drive subprocess; the C64 side speaks
+JSON over TCP via [`TcpDriveClient`](../drives/tcp_drive_client.py).
 
-## What works
+```text
+┌─────────────────────────┐      JSON/TCP       ┌────────────────────────────┐
+│  C64.py / emulator.py   │ ◀────────────────▶  │  c1541_emulator            │
+│                         │  fast_load/save     │  (subprocess)              │
+│  TcpDriveClient         │  attach_disk        │                            │
+│  IECBus + CIA2          │  status / step      │  Drive1541 (6502+VIAs+ROM) │
+│  KERNAL $FFD5/$FFD8     │                     │  DiskDrive → D64Image      │
+│  kernal_tcp_iec_hooks   │                     │  job-queue trap (fast)     │
+│  (optional wire decode) │                     │  text_ui (optional TUI)    │
+└─────────────────────────┘                     └────────────────────────────┘
+```
 
-- **D64 parser** (`d64.py`): 35-track 1541 images, BAM, directory, file
-  reads. Directory listings are formatted as the C64 would display them.
-- **D64 write-back** (`d64.py`): `D64Image.write_file` allocates free
-  sectors via the BAM, chains data sectors, inserts a directory entry
-  (linking a new directory sector when the chain is full), and persists
-  via `save_to_file`. `_free_sector` is available for delete/rename.
-- **Drive emulation** (`drives/c1541_emulator.py`, `drives/drive.py`): real
-  1541 6502 + DOS ROM running in a subprocess (TCP) or test harness. Devices
-  8–11 supported simultaneously.
-- **CLI**: pass a `.d64` file as the positional argument to attach on
-  startup; `LOAD"$",8` is auto-injected after BASIC is ready. Optional
-  `--disk2` / `--disk3` paths auto-spawn drives 9 and 10 when the primary
-  image is auto-spawned (no `--tcp-drive`). To **create** a new image for
-  the standalone drive process, use
-  ``python -m c64py.drives.c1541_emulator --new-disk path.d64 …`` (see
-  `docs/drive_emulator.md`).
-- **Server commands** (`server.py`): `ATTACH-DISK <file.d64> [device]`,
-  `DETACH-DISKS`.
-- **Job-queue trap** (`drives/c1541_emulator.py`, `fast` tier): when DOS writes a
-  job code to `$00-$05`, the trap synthesizes the read/write directly
-  from the attached `D64Image`, bypassing GCR + bit-level disk I/O.
-- **KERNAL LOAD shortcut** (`fast` tier, or whenever no drive / TCP client is
-  attached): intercepts LOAD for devices 8-11, services the file from the D64
-  via the drive helper, and writes data straight into C64 RAM.
-  Handles `LOAD"$",8` (directory), `LOAD"NAME",8,1` (named PRG), optional
-  `,P`/`,S`/`,R`/`,U` filename suffixes, VERIFY (`A=1` at `$FFD5`), and
-  `dos_filetype` metadata from the TCP `fast_load_reply`.
-- **KERNAL SAVE shortcut** at `$FFD8` (`fast` tier only): `SAVE"NAME",8`
-  writes a PRG into the attached D64 and persists the image. Sets
-  `FILE EXISTS` / `DISK FULL` / `WRITE PROTECT ON` via the drive
-  status channel on failure.
-- **Status / command channel** (`drive.py`): `Drive.get_status()`
-  reports a Commodore-DOS-style `NN,MESSAGE,TT,SS` string driven by
-  `last_error`; `set_error(code)` looks up canonical messages.
-  `command_channel_write(line)` parses `I` / `V` / `S0:NAME[,…]`
-  (scratch) / `R0:NEW=OLD` (rename) / `N0:NAME,ID` (no-op format).
-- **Drive activity LED**: VIA2 PB3 (the actual 1541 LED line) is
-  exposed via `Drive1541.led_on`. Both UIs render one indicator per
-  attached device (8-11): textual mode shows `8● 9○ …` next to the
-  floppy emoji; graphics mode stacks small red squares in the
-  top-right corner.
+**“Local” disk in `C64.py game.d64`** does **not** mean in-process emulation.
+[`_spawn_local_drive`](../emulator.py) launches a **headless** `c1541_emulator`
+child on `127.0.0.1`, waits for a free port, and attaches it with
+[`attach_tcp_drive`](../emulator.py) — same TCP path as `--tcp-drive`.
 
-Tested with `test/test_d64_write.py`, `test/test_drive_status.py`,
-`test/test_disk_integration.py`, `test/test_disk_accurate_e2e.py`,
-and `test/test_drive_led.py`.
+### 1.1 What lives on the C64 side (host only)
 
-## What's missing
+| Component | Role |
+|---|---|
+| [`TcpDriveClient`](../drives/tcp_drive_client.py) | TCP client: `fast_load`, `fast_save`, `attach_disk_remote`, `status`, IEC backend hooks that forward logical bytes as JSON. |
+| [`IECBus`](../iec_bus.py) + CIA2 `$DD00` | Wired-AND ATN/CLK/DATA when KERNAL bit-bangs the serial bus. |
+| [`KernalIecTap`](../iec_kernal_bridge.py) | Records CIA2 line transitions; optional wire decoder when `C64PY_IEC_WIRE_DECODE=1`. |
+| [`kernal_tcp_iec_hooks`](../kernal_tcp_iec_hooks.py) | Fast-path OPEN / CHKIN / CHKOUT / CLOSE / BSOUT over TCP when KERNAL shortcuts are enabled. |
+| `_handle_kernal_load` / `_handle_kernal_save` | `$FFD5` / `$FFD8` → `fast_load` / `fast_save` RPC → bytes written into C64 RAM. |
+| `_spawn_local_drive` | Convenience: spawn headless drive subprocess + TCP connect (not in-process disk). |
+| `_step_iec_drives` | Calls `TcpDriveClient.step()` (drains socket replies; remote server runs its own loop). |
 
-- **Bit-level IEC + GCR head (M2).** The `accurate-python` tier
-  currently falls back to `fast` until the wire-level IEC handshake
-  and the GCR read/write head land. Tracking: plan
-  [`.windsurf/plans/disk-support-rework-1758d2.md`](../.windsurf/plans/disk-support-rework-1758d2.md)
-  (authoring milestone B0 before implementation).
-- **Rust drive port (M3).** `accurate-rust` will move the 1541 6502 +
-  VIAs + GCR head into the Rust core (mirroring `--vic-emulation
-  accurate-rust`). Until then it falls back to `accurate-python`.
-- **REL / SEQ / USR file types.** SEQ and USR are supported via `d64.py` /
-  `DiskDrive` and `,S`/`,U` filename suffixes; REL read via side-sector layout
-  is implemented for `read_rel_file`; REL save and full `RECORD#` semantics
-  remain future work.
-- **Real disk format (`N0:`)**. Currently a no-op.
-- **Drive 9–11 simultaneous stepping.** Currently only device 8 is
-  fully exercised. Multi-device coordination would need independent
-  job-queue dispatch per drive while maintaining IEC bus arbitration.
-- **Fastloaders and non-standard protocols.** The `fast` tier handles
-  standard `LOAD` / `SAVE`. Custom loaders that bit-bang the IEC bus
-  directly (bypassing KERNAL vectors) need `accurate-python` /
-  `accurate-rust` once those land.
+There is **no** `Drive1541`, **no** sector I/O, and **no** D64 parser inside
+`emulator.py`. Shared library code [`d64.py`](../d64.py) and
+[`drives/drive.py`](../drives/drive.py) are used by the **drive process** and
+tests, not by the C64 core loop.
+
+### 1.2 What lives in the drive process
+
+| Component | Role |
+|---|---|
+| [`c1541_emulator.py`](../drives/c1541_emulator.py) | asyncio JSON server, CLI, `Drive1541` lifecycle. |
+| [`Drive1541`](../drives/c1541_emulator.py) | Real 1541 6502 + two VIA 6522 chips + DOS ROM. |
+| [`DiskDrive`](../drives/drive.py) | D64 attach, directory, `fast_load`/`fast_save`, status channel, command channel parser. |
+| [`D64Image`](../d64.py) | 35-track image I/O, BAM, file read/write. |
+| Job-queue trap (`fast` tier) | Intercepts DOS ZP job writes; serves sectors from `D64Image` without GCR head. |
+
+---
+
+## 2. Connecting a drive
+
+| Method | Example |
+|---|---|
+| Manual TCP | Terminal 1: `python -m c64py.drives.c1541_emulator --disk game.d64 --device 8 --port 6408` — Terminal 2: `python C64.py --tcp-drive 8:localhost:6408` |
+| Multiple drives | Spawn one `c1541_emulator` per device (8–11), then `python C64.py --tcp-drive 8:localhost:6408 --tcp-drive 9:localhost:6409` |
+| Auto-spawn (drive 8 only) | `python C64.py game.d64` — spawns one headless drive 8, connects via TCP. |
+| Control server | `ATTACH-DISK path.d64 [device]` / `DETACH-DISKS` in [`command_dispatch.py`](../command_dispatch.py) → `attach_disk` RPC. |
+
+See [drive_emulator.md](drive_emulator.md) for `--new-disk`, interfaces (`headless` / `text`), and the JSON protocol.
+
+---
+
+## 3. Emulation tiers
+
+Set via `[emulation] disk_emulation` in `c64py.toml` or
+`c1541_emulator --emulation`. The `--accurate` shortcut on `C64.py` changes
+**VIC/video** defaults only; it does **not** change `disk_emulation`.
+
+| Tier | Where it runs | Disk surface | KERNAL `$FFD5`/`$FFD8` on C64 | Today |
+|---|---|---|---|---|
+| `fast` (default) | Drive subprocess | Job-queue trap → `D64Image` | Shortcut ON (TCP `fast_load`/`fast_save`) | **Shipped** |
+| `accurate-python` | Drive subprocess | Real GCR head + bit-level IEC (planned) | Shortcut OFF when no TCP client | **Placeholder** — drive still uses `fast` internally with a warning |
+| `accurate-rust` | Drive in Rust (planned) | Same as accurate-python | Same | **Placeholder** — falls back to accurate-python |
+
+On the C64 side, `kernal_load_shortcut_enabled` stays **ON** whenever any
+`TcpDriveClient` is attached (including auto-spawned headless servers), because
+LOAD/SAVE over TCP uses the fast RPC path. Disabling the shortcut without a
+working IEC bridge would hang KERNAL serial routines.
+
+Optional **`C64PY_IEC_WIRE_DECODE=1`**: KERNAL CIA2 edges are decoded into
+logical `IECBus` commands and forwarded to TCP (`test/test_iec_tcp_wire_integration.py`).
+This is **partial** (OPEN/LISTEN/byte phases); not all BASIC disk I/O paths
+are covered without the shortcut hooks in [`kernal_tcp_iec_hooks.py`](../kernal_tcp_iec_hooks.py).
+
+---
+
+## 4. What works end-to-end
+
+### Drive subprocess (`d64.py`, `drives/drive.py`, `c1541_emulator.py`)
+
+- **D64 parser / write-back** — 35-track images, BAM, directory, chained sectors,
+  `write_file`, scratch/rename/no-op format commands on the command channel.
+- **Job-queue trap** (`fast` tier) — DOS ZP jobs served from `D64Image`.
+- **`fast_load` / `fast_save` RPC** — used by C64 KERNAL hooks; supports PRG,
+  directory (`"$"`), `,S`/`,U` suffixes, VERIFY metadata via `dos_filetype`.
+- **Status RPC** — `"NN,MESSAGE,TT,SS"` from `Drive.get_status()`.
+- **Multi-device routing** — `--tcp-drive 8:… --tcp-drive 9:…` on the C64 side;
+  each server binds one device number.
+
+### C64 host
+
+- **`LOAD"NAME",8` / `LOAD"$",8`** — KERNAL hook → TCP → RAM; end addresses and
+  directory pointers updated.
+- **`SAVE"NAME",8`** — KERNAL hook → TCP → D64 persisted on drive side.
+- **VERIFY** — `$FFD5` with `A≠0` compares file bytes to RAM
+  (`test/test_d64_filetypes.py::test_kernal_verify_match_and_mismatch`).
+- **TCP IEC hooks** — OPEN / PRINT# / INPUT# / CLOSE for attached TCP drives when
+  shortcuts are enabled (`kernal_tcp_iec_hooks`, covered by integration tests).
+- **Wire decode (opt-in)** — `C64PY_IEC_WIRE_DECODE=1` for CIA2 → logical IEC → JSON
+  (`iec_wire_decode.py`, `test/test_iec_wire_decode.py`).
+- **Auto-reconnect** — 5 s backoff on TCP drop (`TcpDriveClient.RECONNECT_DELAY`).
+
+### UI
+
+- **Textual drive TUI** — `c1541_emulator --interface text`.
+- **C64 textual mode** — per-device activity indicators (TCP `led_on` is always
+  `False`; real LED only reflects VIA activity inside the drive process when the
+  6502 actually runs I/O, not during `fast_load` RPC).
+
+Tests: `test/test_d64_write.py`, `test/test_drive_status.py`,
+`test/test_disk_integration.py`, `test/test_fast_load_rpc.py`,
+`test/test_kernal_load.py`, `test/test_iec_tcp_wire_integration.py`, etc.
+
+---
+
+## 5. Gaps and limitations
+
+### UX / correctness
+
+1. **LED dark during `fast_load`/`fast_save`.** RPC bypasses the 1541 CPU → VIA2
+   PB3 never toggles. Honest fix: bit-level path (§6) so DOS runs for real loads.
+2. **REL save / full `RECORD#`** — REL read exists; REL write and full REL semantics remain open.
+3. **Real `N0:` format** — parses as no-op (BAM not reset).
+4. **Drives 9–11 under simultaneous load** — routing exists; heavy multi-drive
+   arbitration is lightly tested.
+5. **Fastloaders / copy protection** — need accurate IEC + GCR (§6).
+
+### C64 / TCP bridge
+
+6. **Mid-batch IEC on Rust CPU path** — peer CLK/DATA snapshotted at batch start;
+   see [rust_core.md](rust_core.md) batch limitations when mixing disk I/O with
+   large Rust batches.
+7. **Without KERNAL shortcuts or wire decode**, OPEN/PRINT# over `--tcp-drive`
+   can stall in KERNAL serial code — use auto-spawn + shortcuts, enable wire
+   decode, or restrict remote workflows to LOAD/SAVE until accurate tier ships.
+
+---
+
+## 6. Bit-level rework (forward plan)
+
+The largest outstanding piece: make **`accurate-python`** / **`accurate-rust`**
+mean real IEC edges + GCR head, KERNAL shortcuts off, LED and fastloaders honest.
+
+**Detailed milestones:** [`.windsurf/plans/disk-support-rework-1758d2.md`](../.windsurf/plans/disk-support-rework-1758d2.md)
+
+Summary:
+
+| Milestone | Goal |
+|---|---|
+| B0 | Plan authoring (**done** — plan file above) |
+| B1 | Edge-level `iec_bus.py` (wired-AND, golden traces) |
+| B2 | Drive VIA1 + C64 CIA2; disable JSON byte shortcuts on accurate-python |
+| B3 | GCR codec (`drives/gcr.py`) |
+| B4 | GCR head (VIA2 PA/PB, motor, stepper, LED from PB3) |
+| B5 | Disable KERNAL shortcut for non-`fast` tiers (when IEC path works) |
+| B6 | LED regression under accurate-python |
+| B7 | Fastloader smoke test |
+| B8 | Rust drive port (`accurate-rust`) |
+| B9 | Multi-drive IEC accuracy |
+| B10 | Docs + changelog |
+
+**Definition of done:** LOAD/SAVE through real KERNAL serial + GCR round-trip;
+LED visible in drive TUI; representative fastloader loads; new tests
+(`test_iec_bitlevel`, `test_gcr_codec`, `test_gcr_head_roundtrip`, …).
+
+References: VICE `src/drive/iec*.c`, *Inside Commodore DOS*, 1541 schematic
+(VIA2 PA = head data, PB3 = write enable + LED).
+
+---
+
+## 7. Smaller independent tasks
+
+Can ship without §6:
+
+| Task | Notes |
+|---|---|
+| REL save / `RECORD#` | `d64.py` + `DiskDrive`. |
+| BASIC status channel over IEC | `OPEN 1,8,15:INPUT#1,…` end-to-end test (RPC status exists). |
+| Graphics drive UI | Pygame 1541 window — see [drive_emulator.md](drive_emulator.md). |
+
+---
+
+## 8. Resuming work
+
+1. `git log --oneline -10` — see what shipped.
+2. Read **this file** and [drive_emulator.md](drive_emulator.md).
+3. Pick from [TODO.md](../TODO.md) §1541 / disk or milestone B1+ in the bit-level plan.
+4. Test slice: `pytest -q test/test_drive*.py test/test_disk*.py test/test_kernal*.py test/test_iec*.py`
+5. Full suite: `pytest -q --ignore=test/test_all_vice.py --ignore=test/test_vice.py`
+
+---
+
+## 9. Glossary
+
+- **D64** — 174,848-byte logical 1541 sector dump (no on-disk GCR).
+- **GCR** — 4-to-5 bit channel encoding on real media.
+- **IEC** — ATN + CLK + DATA serial bus.
+- **Job-queue trap** — Intercepts 1541 ZP `$00–$05` job posts; `fast` tier shortcut.
+- **KERNAL shortcut** — C64 hooks at `$FFD5`/`$FFD8` → TCP RPC, skipping DOS serial I/O.
+- **Auto-spawn** — Headless drive subprocess + localhost TCP; not in-process disk.
+
+---
 
 ## Changelog
 
-- **2026-04**: tier rename. Removed legacy `--disk-emulation fast`
-  (KERNAL hooks + virtual `DiskDrive`) and `--disk-emulation
-  semi-accurate` (Python IEC responder). The previous `accurate`
-  tier is now the new `fast` default. Two placeholder tiers
-  `accurate-python` and `accurate-rust` were added for the in-flight
-  bit-level path; both currently fall back to `fast` with a warning.
+- **2026-05**: consolidated 1541 status and forward plan into this file; corrected
+  architecture (TCP-only on C64 side; no in-process `DiskDrive`); documented
+  wire decode and VERIFY; pointed bit-level plan to
+  `.windsurf/plans/disk-support-rework-1758d2.md`.
+- **2026-04**: tier rename (`fast` / `accurate-python` / `accurate-rust`);
+  drive split (M0–M6) completed — 1541 runs as TCP server subprocess.

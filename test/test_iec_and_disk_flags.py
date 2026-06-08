@@ -210,3 +210,43 @@ def test_find_drive_rom_vice_combined_glob_revision(tmp_path) -> None:
     (tmp_path / "dos1541-325302-01+901229-07.bin").write_bytes(dos_part + ser_part)
     assert find_drive_rom("dos1541", str(tmp_path)) == dos_part
     assert find_drive_rom("serial1541", str(tmp_path)) == ser_part
+
+
+def test_cia2_dd00_routes_to_chip_when_iec_bus_even_if_charen_off() -> None:
+    """KERNAL IEC touches $DD00; CHAREN can read as 0 while DDR still drives PA2."""
+    bus = IECBus()
+    mem = MemoryMap()
+    mem.iec_bus = bus
+    mem.ram[0x0000] = 0x2F
+    mem.ram[0x0001] = 0x33  # CHAREN output low (IEC window banked out for most I/O)
+    mem.invalidate_6510_port_read_cache()
+    mem.ram[0xDD00] = 0x42
+    mem.write(0xDD00, 0xF7)  # ATN released (PA3 high), CLK/DATA idle-high
+    assert mem.cia2_pra == 0xF7
+    assert mem.ram[0xDD00] == 0x42
+    assert bus.atn is True
+
+
+def test_cia2_dd00_read_sees_iec_bus_when_attached_even_if_charen_off() -> None:
+    bus = IECBus()
+    mem = MemoryMap()
+    mem.iec_bus = bus
+    mem.ram[0x0000] = 0x2F
+    mem.ram[0x0001] = 0x33
+    mem.invalidate_6510_port_read_cache()
+    mem.cia2_pra = 0xFF
+    mem.apply_cia2_port_a_to_iec_bus()
+    bus.set_data("peer", False)
+    v = mem.read(0xDD00)
+    assert (v & 0x80) == 0  # DATA line low merged into bit 7
+
+
+def test_cia2_dd00_without_iec_goes_to_ram_when_charen_off() -> None:
+    mem = MemoryMap()
+    mem.ram[0x0000] = 0x2F
+    mem.ram[0x0001] = 0x33
+    mem.invalidate_6510_port_read_cache()
+    mem.ram[0xDD00] = 0x00
+    mem.write(0xDD00, 0xAB)
+    assert mem.ram[0xDD00] == 0xAB
+    assert mem.cia2_pra == 0xFF  # default; not updated by RAM-only write

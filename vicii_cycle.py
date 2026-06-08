@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Performance note: tick() runs once per emulated CPU cycle on the hot path. A future
 # optional Cython/C extension module exposing the same ViciiCycleEngine.tick() contract
@@ -144,6 +144,38 @@ class ViciiCycleEngine:
     # $D015 sprite enable bits (set each tick from MemoryMap by CPU); 0 = no sprite BA.
     sprite_enable_mask: int = 0
 
+    # $D017 Y-expansion mask (synced from MemoryMap; affects exp_flop toggling).
+    sprite_y_expand_mask: int = 0
+
+    # Sprite Y positions ($D001, $D003, ..., $D00F), low byte only (VICE compares
+    # against ``raster_line & 0xFF``). Synced from MemoryMap each tick.
+    sprite_y: list = field(default_factory=lambda: [0] * 8)
+
+    # VICE-style sprite DMA internal state (see vicii-cycle.c). ``sprite_dma_mask``
+    # is the only bit used for BA arbitration; the rest tracks the state machine
+    # that turns DMA on/off at the proper PAL cycles.
+    #
+    # - ``sprite_dma_mask`` bit i == 1 ⇒ sprite i DMA is active this frame (Y matched
+    #   and DMA window has not closed via mcbase=63). This replaces the erroneous
+    #   use of ``sprite_enable_mask`` in BA arbitration (VICE gates BA on sprite_dma,
+    #   not the CPU-written $D015 mask).
+    # - ``sprite_mc[i]`` and ``sprite_mcbase[i]`` mirror VICE's MC/MCBASE counters
+    #   (0..63 each). We simulate the 3 sprite-DMA fetches per line by incrementing
+    #   ``mc`` by 3 at end-of-line for DMA-active sprites, then copying to mcbase
+    #   at PAL cycle 16 (``_sprite_mcbase_update``).
+    # - ``sprite_exp_flop`` is an 8-bit bitmask where bit i is the exp_flop for
+    #   sprite i. Initialized to 0xFF (all 1s) so non-Y-expanded sprites always
+    #   copy mc→mcbase. Toggled by ``_check_exp`` at PAL cycle 56 when $D017 bit
+    #   is set.
+    sprite_dma_mask: int = 0
+    sprite_mc: list = field(default_factory=lambda: [0] * 8)
+    sprite_mcbase: list = field(default_factory=lambda: [0] * 8)
+    sprite_exp_flop: int = 0xFF
+
+    # Sprite collision registers ($D01E, $D01F)
+    sprite_sprite_collision: int = 0
+    sprite_bg_collision: int = 0
+
     def set_d011(self, d011: int, current_raster_msb: int) -> None:
         self.ysmooth = d011 & 0x07
         self.den = (d011 & 0x10) != 0
@@ -161,6 +193,49 @@ class ViciiCycleEngine:
         if self.raster_line == self.last_dma_line:
             self.allow_bad_lines = False
         self.bad_line = False
+        # Simulate the 3 sprite-DMA fetches for every DMA-active sprite. In VICE
+        # these happen at per-sprite cycles (58..10 for the line where DMA is
+        # active), each incrementing ``mc`` once. We collapse them to a single
+        # +3 at end-of-line/start-of-line; mcbase_update at cycle 15 then sees
+        # the correctly-advanced ``mc``. This yields identical BA-relevant
+        # behavior (``sprite_dma_mask`` turn-off timing).
+        if self.sprite_dma_mask:
+            for i in range(8):
+                if self.sprite_dma_mask & (1 << i):
+                    self.sprite_mc[i] = (self.sprite_mc[i] + 3) & 0x3F
+
+    def _sprite_mcbase_update(self) -> None:
+        """Mirror of VICE ``sprite_mcbase_update`` (vicii-cycle.c). Runs at PAL cycle 16."""
+        for i in range(8):
+            if self.sprite_exp_flop & (1 << i):
+                self.sprite_mcbase[i] = self.sprite_mc[i]
+                if self.sprite_mcbase[i] == 63:
+                    self.sprite_dma_mask &= ~(1 << i)
+
+    def _check_sprite_dma(self) -> None:
+        """Mirror of VICE ``check_sprite_dma``. Runs at PAL cycles 55 and 56.
+
+        For each enabled sprite whose Y position matches the current raster line
+        (low byte), and which is not already in DMA, turn DMA on: set the bit in
+        ``sprite_dma_mask``, reset mcbase to 0, and set exp_flop to 1.
+        """
+        enable = self.sprite_enable_mask & 0xFF
+        rl_low = self.raster_line & 0xFF
+        for i in range(8):
+            bit = 1 << i
+            if (enable & bit) and self.sprite_y[i] == rl_low and not (self.sprite_dma_mask & bit):
+                self.sprite_dma_mask |= bit
+                self.sprite_mcbase[i] = 0
+                self.sprite_exp_flop |= bit
+
+    def _check_exp(self) -> None:
+        """Mirror of VICE ``check_exp``. Runs at PAL cycle 56.
+
+        For each DMA-active sprite whose Y-expansion bit is set, toggle exp_flop.
+        """
+        y_exp = self.sprite_y_expand_mask & 0xFF
+        togglable = self.sprite_dma_mask & y_exp & 0xFF
+        self.sprite_exp_flop ^= togglable
 
     def tick(self) -> tuple[bool, bool, bool]:
         """Advance one CPU cycle.
@@ -170,7 +245,18 @@ class ViciiCycleEngine:
         VICE nuance: when BA transitions low, the CPU can still complete a few cycles
         before reads are blocked. This is modeled via `prefetch_cycles`.
         """
+        # Index 0 == chip cycle 1: use current index, then advance (Rust u32 interop).
         rc = self.raster_cycle
+
+        # VICE sprite DMA state machine (vicii-cycle.c) on PAL cycles 16/55/56
+        # (0-based indices 15/54/55).
+        if rc == 15:
+            self._sprite_mcbase_update()
+        elif rc == 54:
+            self._check_sprite_dma()
+        elif rc == 55:
+            self._check_sprite_dma()
+            self._check_exp()
 
         # Update badline state when allowed (VICE checks each cycle); inlined for hot path.
         al = self.allow_bad_lines
@@ -191,7 +277,13 @@ class ViciiCycleEngine:
         sprite_ba_mask, fetch_ba, _phi2_fetch_c, _visible = table[rc]
 
         ba_matrix = bool(self.bad_line and fetch_ba)
-        sprite_ba = (sprite_ba_mask & self.sprite_enable_mask) != 0
+        # VICE gates sprite BA on ``sprite_dma`` (active DMA), NOT on the CPU-
+        # written $D015 enable mask (see ``vicii_check_sprite_ba`` in
+        # vicii-fetch.c). Using the enable mask caused ~2 spurious stall cycles
+        # per raster line whenever a sprite was enabled but not yet in its Y
+        # range — accumulating hundreds of cycles over a title-screen setup
+        # and drifting our raster IRQ position by ~5 lines vs VICE.
+        sprite_ba = (sprite_ba_mask & self.sprite_dma_mask) != 0
         ba_low = ba_matrix or sprite_ba
 
         # Prefetch handling (VICE: BA transition low starts a 3-cycle delay before Phi2 access)
@@ -203,19 +295,15 @@ class ViciiCycleEngine:
 
         ba_blocks_cpu = ba_low and (self.prefetch_cycles == 0)
 
+        line_advanced = False
         self.raster_cycle += 1
         if self.raster_cycle >= self.cycles_per_line:
             self.raster_cycle = 0
             self.raster_line = (self.raster_line + 1) % self.num_raster_lines
+            line_advanced = True
             self._cycle_start_of_line()
 
-        # Raster IRQ edge trigger
-        if self.raster_line == self.raster_irq_line:
-            irq_edge = not self.raster_irq_triggered
-            self.raster_irq_triggered = True
-        else:
-            irq_edge = False
-            self.raster_irq_triggered = False
+        irq_edge = self.raster_line == self.raster_irq_line and line_advanced
 
         return ba_low, ba_blocks_cpu, irq_edge
 

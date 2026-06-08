@@ -7,7 +7,7 @@ These ASCII listings are meant to be converted with VICE **petcat** (same as any
 | `disk_host_write.bas` | Prints a line, **`OPEN`** a sequential file on device 8, **`PRINT#`**, **`CLOSE`**, then **`SAVE "HOSTPRG",8`** (SAVE uses the KERNAL fast path → TCP `fast_save`). |
 | `disk_host_read.bas` | **`OPEN`** the same sequential file, **`LINE INPUT#`**, **`CLOSE`**. Intended to run after `disk_host_write.bas` on the **same** D64. |
 
-**TCP (`--tcp-drive`) today:** `SAVE` / `LOAD` work via KERNAL hooks and JSON `fast_save` / `fast_load`. **`OPEN` / `PRINT#` / `INPUT#`** still use CIA2 bit-bang IEC; until the **KERNAL → logical `IECBus` bridge** is complete (see `iec_kernal_bridge.py` and `docs/plans/release_blockers_iec_percycle_vic.md`), the TCP drive may not see `listen` / `open_channel` and the guest can **hang** on `OPEN`. These fixtures are kept **on purpose** as regression targets once that bridge lands. For a round-trip that works **now** over TCP, use only the `SAVE` / `LOAD` portions or a **local** auto-spawned drive (no `--tcp-drive`). See `docs/drive_emulator.md` § *C64 with ``--tcp-drive``*.
+**TCP (`--tcp-drive`):** `SAVE` / `LOAD` still use KERNAL hooks and JSON `fast_save` / `fast_load`. **`OPEN` / `PRINT#` / `INPUT#`** use CIA2 bit-bang IEC; with **`C64PY_IEC_WIRE_DECODE=1`** (and a TCP-attached tap from `C64.py` / :meth:`c64py.emulator.C64.initialize_iec_bus`), the wire decoder turns LISTEN / OPEN / filename / UNLISTEN into logical `IECBus` calls so the TCP client emits `listen` / `open_channel` / `send_byte` / `unlisten` JSON. Hermetic coverage: ``pytest test/test_iec_tcp_wire_integration.py``. Full BASIC round-trip over TCP may still need more KERNAL edge cases; these fixtures remain regression targets. For a round-trip that works **without** wire decode today, use a **local** auto-spawned drive (no `--tcp-drive`) or only `SAVE` / `LOAD` over TCP. See `docs/drive_emulator.md` § *C64 with ``--tcp-drive``*.
 
 ## Example: C64 auto-spawn (no TCP drive process)
 
@@ -34,7 +34,7 @@ rm -f "$OUT"
   --new-disk "$OUT" --device 8 --port 6408
 ```
 
-Terminal 2 — C64 with ``--tcp-drive`` and a ``.bas`` positional (petcat on ``PATH``). **Until the KERNAL IEC bridge is done**, this fixture may **hang on ``OPEN``**; use a local drive for a full round-trip, or run only a SAVE-only snippet for TCP smoke.
+Terminal 2 — C64 with ``--tcp-drive`` and a ``.bas`` positional (petcat on ``PATH``). Set **`C64PY_IEC_WIRE_DECODE=1`** so OPEN/PRINT#/INPUT# can reach the TCP drive over the wire decoder; without it, ``OPEN`` may still **hang** on some KERNAL paths.
 
 ```bash
 .venv/bin/python C64.py --no-config --tcp-drive 8:127.0.0.1:6408 \

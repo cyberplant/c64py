@@ -1,0 +1,22 @@
+# Git LFS — large binary showcase + documentation media.
+#
+# Scope: videos/animations anywhere, and images under docs/ media dirs.
+# Test fixtures (test/**: *.snap, *.prg, *.d64, *.wav) and demo programs
+# (programs/**) are intentionally NOT in LFS so a plain clone (without LFS)
+# still runs the test suite. See docs/screenshots/local/README.md.
+
+# Videos / animations (showcase only)
+*.mp4  filter=lfs diff=lfs merge=lfs -text
+*.mov  filter=lfs diff=lfs merge=lfs -text
+*.webm filter=lfs diff=lfs merge=lfs -text
+*.gif  filter=lfs diff=lfs merge=lfs -text
+
+# Documentation / screenshot images (scoped to docs media dirs)
+docs/images/**/*.png       filter=lfs diff=lfs merge=lfs -text
+docs/images/**/*.jpg       filter=lfs diff=lfs merge=lfs -text
+docs/images/**/*.jpeg      filter=lfs diff=lfs merge=lfs -text
+docs/images/**/*.webp      filter=lfs diff=lfs merge=lfs -text
+docs/screenshots/**/*.png  filter=lfs diff=lfs merge=lfs -text
+docs/screenshots/**/*.jpg  filter=lfs diff=lfs merge=lfs -text
+docs/screenshots/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
+docs/screenshots/**/*.webp filter=lfs diff=lfs merge=lfs -text

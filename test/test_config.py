@@ -54,15 +54,27 @@ def test_defaults_when_no_file_present(isolated_env):
     assert cfg["emulation"]["interface"] == "textual"
     assert cfg["emulation"]["disk_emulation"] == "fast"
     assert cfg["emulation"]["vic_emulation"] == "fast"
+    assert cfg["c1541"]["file_logging_enabled"] is False
+    assert "logs/c1541-{date}.log" in cfg["c1541"]["file_logging_filename"]
     assert cfg["debug"]["turbo"] is False
     assert cfg["debug"]["udp_debug"] is False
     assert cfg["debug"]["screen_update_interval"] == 0.1
     assert cfg["input"]["joystick"]["port1"] == {}
     assert cfg["input"]["joystick"]["port2"]["up"] == "Up"
-    assert cfg["input"]["joystick"]["port2"]["fire"] == ["RCtrl", "Space"]
+    assert cfg["input"]["joystick"]["port2"]["fire"] == ["Space"]
     assert cfg["input"]["gamepad"]["port1"]["enabled"] is False
     assert cfg["input"]["gamepad"]["port2"]["enabled"] is False
     assert cfg["input"]["gamepad"]["port2"]["mapping"]["fire"] == "button0"
+
+
+def test_config_editor_rows_include_c1541_tcp_drive_fields(isolated_env):
+    from c64py.config import _editor_build_rows
+
+    rows = _editor_build_rows()
+    kinds = {r[1] for r in rows if r[0] == "fld"}
+    assert "c1541.file_logging_enabled" in kinds
+    assert "c1541.file_logging_filename" in kinds
+    assert any(r == ("hdr", "--- C1541 (TCP DRIVE) ---") for r in rows)
 
 
 def test_search_order_cwd_wins(isolated_env):

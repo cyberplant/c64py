@@ -5,6 +5,12 @@ The matrix layout (row, col) is the standard C64 hardware table; see
 each entry declare whether the host press should also synthesize a SHIFT
 press on the matrix (e.g. ``F2`` = SHIFT + F1).
 
+Default punctuation follows a US ANSI host keyboard aligned to a C64 photo
+(e.g. host ``'`` → C64 ``;``, ``[`` → ``@``, ``]`` → ``*``, ``-``/``+``,
+host ``=`` → C64 ``-``, host ``\\`` → C64 ``=``). C64 RESTORE (NMI via
+``$FFFA``) is bound in ``graphics.py`` to Scroll Lock and Pause — not in this
+table.
+
 Pygame is imported lazily so importing ``c64py`` headlessly never forces a
 pygame init. Call :func:`build_host_to_matrix` once at startup; the returned
 dict maps ``pygame.K_*`` constants to ``(row, col, ShiftReq)`` triples.
@@ -54,7 +60,8 @@ DEFAULT_JOYSTICK_CONFIG: Dict[str, Dict[str, Any]] = {
         "down": "Down",
         "left": "Left",
         "right": "Right",
-        "fire": ["RCtrl", "Space"],
+        # RCtrl is mapped to C= on the matrix; use Space (and optional extras in TOML).
+        "fire": ["Space"],
     },
 }
 
@@ -83,13 +90,13 @@ def build_host_to_matrix() -> Dict[int, Tuple[int, int, ShiftReq]]:
         K.K_SPACE: (7, 4, ShiftReq.NONE),
         K.K_ESCAPE: (7, 7, ShiftReq.NONE),          # RUN/STOP
         K.K_HOME: (6, 3, ShiftReq.NONE),            # HOME / CLR (SHIFT)
-        K.K_TAB: (7, 2, ShiftReq.NONE),             # CTRL
-        K.K_LCTRL: (7, 2, ShiftReq.NONE),           # CTRL
-        K.K_RCTRL: (7, 2, ShiftReq.NONE),
+        K.K_TAB: (7, 2, ShiftReq.NONE),             # CTRL (C64 bottom row)
+        # Host Ctrl → C= (Commodore key). Joystick default fire uses Space, not RCtrl.
+        K.K_LCTRL: (7, 5, ShiftReq.NONE),
+        K.K_RCTRL: (7, 5, ShiftReq.NONE),
         K.K_LSHIFT: (1, 7, ShiftReq.NONE),
         K.K_RSHIFT: (6, 4, ShiftReq.NONE),
-        # Commodore key (no host equivalent): map to LAlt by default. Documented
-        # in ``docs/input_config_plan.md``; future TOML config can override.
+        # Extra C= for keyboards where Alt is easier than Ctrl.
         K.K_LALT: (7, 5, ShiftReq.NONE),
         K.K_RALT: (7, 5, ShiftReq.NONE),
 
@@ -140,19 +147,25 @@ def build_host_to_matrix() -> Dict[int, Tuple[int, int, ShiftReq]]:
         K.K_y: (3, 1, ShiftReq.NONE),
         K.K_z: (1, 4, ShiftReq.NONE),
 
-        # --- Punctuation ---
+        # --- Punctuation (ANSI host layout aligned to C64 photo: '→; [→@ ]→* …) ---
         K.K_PLUS: (5, 0, ShiftReq.NONE),
-        K.K_MINUS: (5, 3, ShiftReq.NONE),
+        K.K_MINUS: (5, 0, ShiftReq.NONE),          # host - → C64 +
+        K.K_KP_PLUS: (5, 0, ShiftReq.NONE),
+        K.K_KP_MINUS: (5, 0, ShiftReq.NONE),
         K.K_PERIOD: (5, 4, ShiftReq.NONE),
         K.K_COMMA: (5, 7, ShiftReq.NONE),
         K.K_SLASH: (6, 7, ShiftReq.NONE),
         K.K_ASTERISK: (6, 1, ShiftReq.NONE),
-        K.K_BACKSLASH: (6, 1, ShiftReq.NONE),     # \ maps to *
-        K.K_KP_MULTIPLY: (6, 1, ShiftReq.NONE),   # numpad * maps to *
-        K.K_SEMICOLON: (6, 2, ShiftReq.NONE),
+        K.K_KP_MULTIPLY: (6, 1, ShiftReq.NONE),
+        K.K_LEFTBRACKET: (5, 6, ShiftReq.NONE),   # host [ → C64 @
+        K.K_RIGHTBRACKET: (6, 1, ShiftReq.NONE),  # host ] → C64 *
+        K.K_SEMICOLON: (5, 5, ShiftReq.NONE),      # host ; → C64 :
+        K.K_QUOTE: (6, 2, ShiftReq.NONE),          # host ' → C64 ;
         K.K_COLON: (5, 5, ShiftReq.NONE),
         K.K_AT: (5, 6, ShiftReq.NONE),
-        K.K_EQUALS: (6, 5, ShiftReq.NONE),
+        K.K_EQUALS: (5, 3, ShiftReq.NONE),        # host = → C64 -
+        K.K_KP_EQUALS: (5, 3, ShiftReq.NONE),
+        K.K_BACKSLASH: (6, 5, ShiftReq.NONE),    # host \ → C64 = (PETSCII BASIC)
         K.K_BACKQUOTE: (7, 1, ShiftReq.NONE),       # ← (left-arrow) on C64
         K.K_CARET: (6, 6, ShiftReq.NONE),           # ↑ (up-arrow) on C64
     }
@@ -235,7 +248,7 @@ def build_host_to_joystick(
 
     ``config`` shape mirrors :data:`DEFAULT_JOYSTICK_CONFIG`::
 
-        {"port1": {"up": "W", ...}, "port2": {"fire": ["RCtrl", "Space"]}}
+        {"port1": {"up": "W", ...}, "port2": {"fire": ["Space"]}}
 
     Multiple ports/directions can target the same host key (returned as a
     list so the runtime ORs all matching bits on press). Unknown key names
