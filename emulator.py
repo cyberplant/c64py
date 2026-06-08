@@ -48,7 +48,6 @@ from .cpu import CPU6502
 from .debug import UdpDebugLogger
 from .memory import MemoryMap
 from .roms import REQUIRED_ROMS
-from .ui import TextualInterface
 from .iec_bus import IECBus
 from .drives.tcp_drive_client import TcpDriveClient
 from .drives.iec_backend import IECDriveBackend
@@ -121,6 +120,8 @@ class C64:
         rust_hybrid_vic = vic_emulation == "accurate-rust"
         self.memory = MemoryMap()
         if interface_factory is None:
+            from .ui import TextualInterface
+
             self.interface = TextualInterface(self)
         else:
             self.interface = interface_factory(self)
