@@ -59,6 +59,8 @@ def xlat_line(line: str) -> str:
     s = re.sub(r"\bself\.state\.sp\b", "cpu.sp", s)
     s = re.sub(r"\bself\.state\.p\b", "cpu.p", s)
     s = re.sub(r"\bself\.state\.stopped\b", "cpu.stopped", s)
+    s = re.sub(r"\bself\.state\.cli_sei_delay\b", "cpu.cli_sei_delay", s)
+    s = re.sub(r"\bself\.state\.pre_i_flag\b", "cpu.pre_i_flag", s)
     s = re.sub(r"self\._mr\(", "mr(mem, cpu, ", s)
     s = re.sub(r"self\._mw\(", "mw(mem, cpu, ", s)
     s = re.sub(r"self\._read_word\(", "read_word_at(mem, ", s)

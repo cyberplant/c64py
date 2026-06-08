@@ -30,6 +30,7 @@ from typing import Optional, Tuple
 
 # Handle both direct execution and module import
 try:
+    from . import config as _config_mod
     from .debug import UdpDebugLogger, ViceTraceLogger
     from .emulator import C64
     from .server import EmulatorServer
@@ -47,6 +48,7 @@ try:
 except ImportError:
     # When run directly, add parent directory to path
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from c64py import config as _config_mod
     from c64py.debug import UdpDebugLogger, ViceTraceLogger
     from c64py.emulator import C64
     from c64py.server import EmulatorServer
@@ -172,8 +174,7 @@ def _print_benchmark_record(
         "vic_emulation": getattr(emu, "vic_emulation", "fast"),
         "cycles": cycles,
         "emulated_cpu_mhz": round(mhz, 4),
-        "enable_resid": bool(args.enable_resid),
-        "enable_sid": bool(args.enable_sid),
+        "audio_emulation": str(args.audio_emulation),
         "max_cycles_arg": args.max_cycles,
         "prg": prg_display_basename,
         "schema": 1,
@@ -183,6 +184,49 @@ def _print_benchmark_record(
         "wall_seconds": round(elapsed, 6),
     }
     print("C64PY_BENCHMARK " + json.dumps(rec, sort_keys=True))
+
+
+def _default_snapshot_path(prg_basename: Optional[str], cycle: Optional[int], kind: str) -> str:
+    """Synthesize snapshots/<prg>_<kind>_<cycle>.snap when user omitted PATH."""
+    name = (prg_basename or "session").rsplit(".", 1)[0]
+    safe = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name) or "session"
+    tag = f"{kind}_{int(cycle)}" if cycle is not None else kind
+    return os.path.join("snapshots", f"{safe}_{tag}.snap")
+
+
+def _configure_snapshot_saving(args, emu, prg_basename: Optional[str]) -> None:
+    """Translate --save-snapshot-* flags into emulator-side scheduling."""
+    at_cycle_raw = getattr(args, "save_snapshot_at_cycle", None)
+    if at_cycle_raw:
+        spec = str(at_cycle_raw)
+        path: Optional[str] = None
+        if ":" in spec:
+            cstr, path = spec.split(":", 1)
+            path = path.strip() or None
+        else:
+            cstr = spec
+        try:
+            cycle = int(cstr.strip(), 0)
+        except ValueError:
+            print(
+                f"ERROR: --save-snapshot-at-cycle expected CYCLE[:PATH], got {spec!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if path is None:
+            path = _default_snapshot_path(prg_basename, cycle, "cycle")
+        note = f"save-at-cycle={cycle} prg={prg_basename or ''}"
+        emu._snapshot_at_cycle = (cycle, path, note)
+
+    at_exit_raw = getattr(args, "save_snapshot_at_exit", None)
+    if at_exit_raw is not None:
+        if at_exit_raw == "__default__":
+            # Path resolved at exit time from current_cycles (not known yet).
+            path = _default_snapshot_path(prg_basename, None, "exit")
+        else:
+            path = str(at_exit_raw)
+        note = f"save-at-exit prg={prg_basename or ''}"
+        emu._snapshot_at_exit = (path, note)
 
 
 def _parse_debug_inject_pair(lhs_s: str, val_s: str, *, source: str) -> tuple[int | str, int]:
@@ -225,6 +269,64 @@ def _parse_debug_inject_file(path: str) -> list[tuple[int | str, int]]:
         lhs, rhs = s.split("=", 1)
         pairs.append(_parse_debug_inject_pair(lhs.strip().lower(), rhs, source=f"{path}:{lineno}"))
     return pairs
+
+
+def _check_rust_core_available(
+    vic_emulation: str,
+    emu: C64,
+    *,
+    show_ui_logs: bool,
+    no_colors: bool,
+) -> None:
+    """Check if Rust core is available when required (accurate-rust mode).
+    
+    If accurate-rust is selected but Rust is not available, exit with an error.
+    Other modes (fast, accurate-python) only print a warning.
+    """
+    v = os.environ.get("C64PY_USE_RUST_FAST", "1").strip().lower()
+    if v in ("0", "no", "false"):
+        return
+    try:
+        from . import _core
+    except ImportError:
+        from c64py import _core
+    if _core.is_available:
+        return
+    
+    # For accurate-rust, we MUST have the Rust core - fail fast
+    if vic_emulation == "accurate-rust":
+        lines = (
+            "ERROR: --vic-emulation accurate-rust requires the Rust core (c64py_rust_core), but it is not available.",
+            "Fix (same Python / venv as this command):",
+            "  1. Ensure Rust >= 1.83 is installed:",
+            "       macOS:  brew install rust",
+            "       Linux:  curl https://sh.rustup.rs -sSf | sh   # or: sudo apt-get install rustc",
+            "       (brew/apt Rust may be outdated; rustup is the most reliable way to get 1.83+)",
+            "       Check:  rustc --version",
+            "  2. Install maturin (if not already):",
+            "       pip install 'maturin>=1.7,<2'",
+            "  3. Build the extension:",
+            "       maturin develop --manifest-path rust/c64py-core/Cargo.toml",
+            "Or skip the Rust core and use: --vic-emulation accurate-python",
+        )
+        for line in lines:
+            print(line, file=sys.stderr)
+        sys.exit(1)
+
+    # For other modes, just warn
+    lines = (
+        "WARNING: Optional Rust CPU core (c64py_rust_core) is not installed — using the Python instruction loop.",
+        '  The "VIC emulation: …" line is only VIC-II timing. Without the extension, --vic-emulation fast is slower;',
+        "  (--vic-emulation accurate-python is unchanged: it always uses Python for cycle-accurate VIC.)",
+        "  Fix — ensure Rust >= 1.83, then (same Python / venv as this command):",
+        "    pip install 'maturin>=1.7,<2'",
+        "    maturin develop --manifest-path rust/c64py-core/Cargo.toml",
+    )
+    for line in lines:
+        if show_ui_logs:
+            emu.interface.add_debug_log(line, style=None if no_colors else "orange")
+        else:
+            print(line, file=sys.stderr)
 
 
 def _warn_if_rust_fast_core_unavailable(
@@ -270,11 +372,106 @@ def _warn_if_rust_fast_core_unavailable(
         )
 
 
+def _preparse_config_args(argv: Optional[list] = None) -> Tuple[argparse.Namespace, list]:
+    """First pass: extract config-related flags before building the full parser.
+
+    Returns ``(ns, remaining)`` where ``ns`` has ``config``, ``no_config``,
+    ``write_config``, ``force_overwrite_config`` and ``remaining`` is the
+    rest of the argv to be processed by the full parser.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None, metavar="FILE")
+    pre.add_argument("--no-config", action="store_true")
+    pre.add_argument(
+        "--write-config",
+        nargs="?",
+        const="__default__",
+        default=None,
+        metavar="PATH",
+    )
+    pre.add_argument("--force-overwrite-config", action="store_true")
+    return pre.parse_known_args(argv)
+
+
 def main():
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
+    # First pass: pull out --config / --no-config / --write-config so we can
+    # load the TOML before constructing the full parser. CLI explicit values
+    # in the second pass will override config; config overrides hardcoded
+    # defaults.
+    pre_ns, _remaining = _preparse_config_args()
+
+    if pre_ns.write_config is not None:
+        target = pre_ns.write_config
+        if target == "__default__":
+            home = os.environ.get("HOME") or str(Path.home())
+            target_path = Path(home) / ".c64py.toml"
+        else:
+            target_path = Path(target).expanduser()
+        try:
+            _config_mod.write_config(
+                target_path, force=pre_ns.force_overwrite_config
+            )
+        except FileExistsError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Wrote default config to {target_path}")
+        sys.exit(0)
+
+    if pre_ns.config is not None:
+        cfg = _config_mod.load_config(Path(pre_ns.config).expanduser())
+    else:
+        cfg = _config_mod.load_config(skip_search=pre_ns.no_config)
+
+    # Convenience accessors with defaults baked in (cfg is already merged).
+    cfg_video = cfg.get("video", {})
+    cfg_audio = cfg.get("audio", {})
+    cfg_debug = cfg.get("debug", {})
+    cfg_emulation = cfg.get("emulation", {})
+    _allowed_drive_tiers = ("fast", "accurate-python", "accurate-rust")
+    _raw_disk_tier = str(cfg_emulation.get("disk_emulation", "fast")).strip()
+    if _raw_disk_tier not in _allowed_drive_tiers:
+        print(
+            "ERROR: [emulation] disk_emulation must be one of "
+            f"{', '.join(_allowed_drive_tiers)}, got {_raw_disk_tier!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    drive_tier: str = _raw_disk_tier
+
     ap = argparse.ArgumentParser(description="C64 Emulator")
+    # Re-declare the config-control flags on the full parser so they show up
+    # in --help and round-trip through parse_args. Their values were already
+    # consumed above; we just need them recognised.
+    ap.add_argument(
+        "--config",
+        default=None,
+        metavar="FILE",
+        help="Force loading this TOML config file (skips the default search).",
+    )
+    ap.add_argument(
+        "--no-config",
+        action="store_true",
+        help="Skip loading any config file; use built-in defaults only.",
+    )
+    ap.add_argument(
+        "--write-config",
+        nargs="?",
+        const="__default__",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a fully-populated default config and exit. Default path: "
+            "~/.c64py.toml. Refuses to overwrite without --force-overwrite-config."
+        ),
+    )
+    ap.add_argument(
+        "--force-overwrite-config",
+        action="store_true",
+        help="With --write-config: overwrite an existing file.",
+    )
     ap.add_argument(
         "media_file",
         nargs="?",
@@ -287,24 +484,18 @@ def main():
         help="Directory containing ROM files (default: auto-detect common locations)",
     )
     ap.add_argument(
-        "--disk-emulation",
-        choices=("fast", "accurate"),
-        default="fast",
-        help=(
-            "fast: KERNAL hooks + virtual DiskDrive (default). "
-            "accurate: also initialize IEC bus + 1541 ROM drives when DOS ROM is found; "
-            "interleaved drive stepping; Rust CIA2 IEC merge when IEC is active."
-        ),
-    )
-    ap.add_argument(
         "--video-rendering",
-        choices=("fast", "accurate"),
-        default="fast",
+        choices=("per-frame", "per-raster", "per-cycle", "fast", "accurate"),
+        default=cfg_video.get("rendering", "per-frame"),
         help=(
-            "Pygame output sampling. fast: one VIC latch per presented frame (default). "
-            "accurate: per-raster-line VIC + CIA2 bank for vertical splits; with the Rust "
-            "fast-batch path and --vic-emulation accurate-rust, beam capture runs in Rust "
-            "into shared flat buffers when the extension is built. "
+            "Pygame output sampling tier. "
+            "`per-frame` (aka `fast`): one VIC latch per presented frame — cheapest, but "
+            "miscomposites games that change VIC registers mid-frame (raster splits). "
+            "`per-raster` (aka `accurate`): one VIC/CIA2 sample per raster line, dispatched "
+            "per content row — handles vertical split screens (HUD + playfield, color bars, "
+            "charset/bank swaps mid-frame) for text/bitmap/MCM/ECM modes. "
+            "`per-cycle`: not yet implemented; currently falls back to `per-raster` "
+            "(see docs/per_cycle_vic.md). "
             "See docs/DEBUGGING.md."
         ),
     )
@@ -312,8 +503,12 @@ def main():
         "--accurate",
         action="store_true",
         help=(
-            "Shortcut: set --disk-emulation accurate, --video-rendering accurate, "
-            "and --vic-emulation accurate-rust."
+            "Shortcut: set --video-rendering per-raster and --vic-emulation accurate-rust "
+            "(overrides TOML defaults for those two). Drive tier stays "
+            "[emulation] disk_emulation (set in c64py.toml or via the standalone "
+            "c1541_emulator --emulation). When per-cycle video exists, pass "
+            "--video-rendering per-cycle after --accurate to opt in (currently still maps "
+            "to per-raster with a one-line stderr note)."
         ),
     )
     ap.add_argument(
@@ -323,10 +518,51 @@ def main():
         metavar="PORT",
         help="TCP port for minimal debugger (REGS, STEP, M, BREAK); see docs/DEBUGGING.md",
     )
+    ap.add_argument(
+        "--tcp-drive",
+        action="append",
+        metavar="DEVICE:HOST:PORT",
+        default=[],
+        help=(
+            "Attach a TCP drive client. Format: DEVICE:HOST:PORT, e.g. "
+            "8:localhost:6408. Repeatable for multiple drives. Requires "
+            "``python -m c64py.drives.c1541_emulator`` with ``--disk`` (existing image) "
+            "or ``--new-disk`` (create blank). Example: "
+            "``python -m c64py.drives.c1541_emulator --disk game.d64 --device 8 --port 6408``"
+        ),
+    )
+    ap.add_argument(
+        "--disk2",
+        metavar="PATH",
+        default=None,
+        help="With a D64 in media_file: auto-spawn drive 9 (headless TCP) for this image.",
+    )
+    ap.add_argument(
+        "--disk3",
+        metavar="PATH",
+        default=None,
+        help="With a D64 in media_file: auto-spawn drive 10 (headless TCP) for this image.",
+    )
     ap.add_argument("--tcp-port", type=int, help="TCP port for control interface")
     ap.add_argument("--udp-port", type=int, help="UDP port for control interface")
     ap.add_argument("--max-cycles", type=int, default=None, help="Maximum cycles to run (default: unlimited)")
     ap.add_argument("--dump-memory", help="Dump memory to file after execution")
+    ap.add_argument(
+        "--dump-ram-raw",
+        metavar="FILE",
+        default=None,
+        help="After run: write exactly 65536 bytes ($0000–$FFFF) of RAM to FILE (no PRG header).",
+    )
+    ap.add_argument(
+        "--dump-ram-sha256",
+        action="store_true",
+        help="After run: print one line with sha256 of full 64 KiB RAM (cheap fingerprint for diffs).",
+    )
+    ap.add_argument(
+        "--dump-cpu-state",
+        action="store_true",
+        help="After run: print one line with PC, A, X, Y, SP, P and cumulative cpu_cycles.",
+    )
     ap.add_argument(
         "--dump-hex-range",
         metavar="START-END",
@@ -337,31 +573,66 @@ def main():
         ),
     )
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
-    ap.add_argument("--udp-debug", action="store_true", help="Send debug events via UDP")
-    ap.add_argument("--autoquit", action="store_true", help="Automatically quit when max cycles is reached")
-    ap.add_argument("--udp-debug-port", type=int, default=64738, help="UDP port for debug events (default: 64738)")
+    ap.add_argument("--udp-debug", action="store_true", default=cfg_debug.get("udp_debug", False), help="Send debug events via UDP")
+    ap.add_argument(
+        "--no-autoquit",
+        action="store_true",
+        help="Don't automatically quit when max cycles is reached (by default, --max-cycles implies autoquit)",
+    )
+    ap.add_argument("--udp-debug-port", type=int, default=cfg_debug.get("udp_port", 64738), help="UDP port for debug events (default: 64738)")
     ap.add_argument("--udp-debug-host", type=str, default="127.0.0.1", help="UDP host for debug events (default: 127.0.0.1)")
-    ap.add_argument("--screen-update-interval", type=float, default=0.1, help="Screen update interval in seconds (default: 0.1)")
-    ap.add_argument("--video-standard", choices=["pal", "ntsc"], default="pal", help="Video standard (pal or ntsc, default: pal)")
+    ap.add_argument(
+        "--screen-update-interval",
+        type=float,
+        default=cfg_debug.get("screen_update_interval", 0.1),
+        help=(
+            "Screen refresh cadence in seconds for text/headless status updates "
+            "(lower values update logs/UI more frequently)."
+        ),
+    )
+    ap.add_argument(
+        "--video-standard",
+        choices=["pal", "ntsc"],
+        default=cfg_video.get("standard", "pal"),
+        help="Video standard (pal or ntsc, default: pal)",
+    )
     ap.add_argument("--no-colors", action="store_true", help="Disable ANSI color output")
-    ap.add_argument("--fullscreen", action="store_true", help="Show only C64 screen output (no debug panel or status bar)")
-    ap.add_argument("--graphics", action="store_true", help="Render output in a pygame graphics window")
-    ap.add_argument("--graphics-scale", type=int, default=2, help="Graphics window scale factor (default: 2)")
+    ap.add_argument("--fullscreen", action="store_true", default=cfg_video.get("fullscreen", False), help="Show only C64 screen output (no debug panel or status bar)")
+    ap.add_argument(
+        "--interface",
+        choices=("textual", "text", "tui", "headless", "graphics", "pygame"),
+        default=cfg_emulation.get("interface", "textual"),
+        help="Interface mode: textual|text|tui (default), headless, graphics|pygame",
+    )
+    ap.add_argument("--graphics-scale", type=int, default=cfg_video.get("scale", 2), help="Graphics window scale factor (default: 2)")
     ap.add_argument(
         "--graphics-fps",
         type=int,
-        default=30,
+        default=cfg_video.get("fps", 30),
         help="Graphics target FPS / max host present rate (default: 30)",
     )
-    ap.add_argument("--graphics-border", type=int, default=None, help="Graphics border size in pixels (default: 32)")
-    ap.add_argument("--enable-sid", action="store_true", help="Enable SID audio output via pygame")
     ap.add_argument(
-        "--enable-resid",
+        "--graphics-border",
+        type=int,
+        default=cfg_video.get("border", 32),
+        help="Graphics border size in pixels (default: 32)",
+    )
+    ap.add_argument(
+        "--audio-emulation",
+        choices=("resid", "python-sid", "disabled"),
+        default=cfg_audio.get("emulation", "resid"),
+        help="Audio emulation backend: resid (default), python-sid, disabled",
+    )
+    ap.add_argument(
+        "--audio-volume",
+        type=float,
+        default=cfg_audio.get("volume", 1.0),
+        help="Audio volume (0.0 to 1.0, where 0.0 is muted)",
+    )
+    ap.add_argument(
+        "--audio-muted",
         action="store_true",
-        help=(
-            "Enable high-accuracy SID audio via the VICE-Team reSID C++ library "
-            "(requires resid_c.so – see src/resid_wrapper/README.md)"
-        ),
+        help="Mute audio output (equivalent to --audio-volume 0.0)",
     )
     ap.add_argument(
         "--inject-keys",
@@ -375,7 +646,38 @@ def main():
             "braced {F1}-{F8}, {joy1-left}, etc. See keyboard_inject module docstring."
         ),
     )
-    ap.add_argument("--turbo", action="store_true", help="Run at maximum speed (no speed limiting)")
+    ap.add_argument(
+        "--save-snapshot-at-cycle",
+        metavar="CYCLE[:PATH]",
+        default=None,
+        help=(
+            "Save a full-state snapshot once cumulative cpu_cycles >= CYCLE. "
+            "Optional :PATH overrides the default location "
+            "(snapshots/<basename>_<cycle>.snap). See docs on snapshot format."
+        ),
+    )
+    ap.add_argument(
+        "--save-snapshot-at-exit",
+        metavar="PATH",
+        nargs="?",
+        const="__default__",
+        default=None,
+        help=(
+            "Save a snapshot when the emulator stops (max-cycles, KIL, stuck). "
+            "Without PATH, uses snapshots/<basename>_exit_<cycle>.snap."
+        ),
+    )
+    ap.add_argument(
+        "--load-snapshot",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Load a snapshot file at startup and resume from that state. "
+            "Skips BASIC boot, PRG/disk autoloading, and the reset vector. "
+            "ROMs are still required and loaded from --rom-dir as usual."
+        ),
+    )
+    ap.add_argument("--turbo", action="store_true", default=cfg_debug.get("turbo", False), help="Run at maximum speed (no speed limiting)")
     ap.add_argument("--benchmark", action="store_true", help="Run benchmark (implies --turbo --autoquit --no-colors)")
     ap.add_argument("--vice-trace", type=str, metavar="FILE", help="Write VICE-compatible CPU trace to FILE for comparison debugging")
     ap.add_argument(
@@ -388,15 +690,14 @@ def main():
         action="store_true",
         help="With --vice-trace: same as wall time but append ' ; w <sec>' on the instruction line instead of a separate '; w' line",
     )
-    ap.add_argument("--headless", action="store_true", help="Run without UI (useful for trace automation)")
     ap.add_argument(
         "--vic-emulation",
         choices=("fast", "accurate-python", "accurate-rust"),
-        default="accurate-rust",
+        default=cfg_emulation.get("vic_emulation", "fast"),
         help=(
             "VIC timing: fast (coarse raster); accurate-python (per-cycle Python VIC+BA stalls); "
-            "accurate-rust (PAL/NTSC hybrid VIC in optional Rust core when built — default; "
-            "requires the extension)."
+            "accurate-rust (PAL hybrid VIC in optional Rust core when built — default). "
+            "NTSC accurate-rust falls back to Python accurate path."
         ),
     )
     ap.add_argument(
@@ -437,11 +738,32 @@ def main():
     )
 
     args = ap.parse_args()
+    interface_mode = str(args.interface).strip().lower()
+    if interface_mode in ("text", "tui"):
+        interface_mode = "textual"
+    elif interface_mode == "pygame":
+        interface_mode = "graphics"
+    args.interface = interface_mode
 
+    # Backward-compatible aliases. Old names remain valid CLI inputs; we
+    # normalize to the canonical new names so downstream code only sees
+    # `per-frame` / `per-raster`.
+    _VIDEO_RENDERING_ALIASES = {"fast": "per-frame", "accurate": "per-raster"}
+    if args.video_rendering in _VIDEO_RENDERING_ALIASES:
+        args.video_rendering = _VIDEO_RENDERING_ALIASES[args.video_rendering]
+
+    # Master "max accuracy" flag — must run as its own block (not tied to per-cycle).
     if args.accurate:
-        args.disk_emulation = "accurate"
-        args.video_rendering = "accurate"
+        args.video_rendering = "per-raster"
         args.vic_emulation = "accurate-rust"
+
+    if args.video_rendering == "per-cycle":
+        print(
+            "Note: --video-rendering per-cycle is not implemented yet; using per-raster. "
+            "See docs/per_cycle_vic.md.",
+            file=sys.stderr,
+        )
+        args.video_rendering = "per-raster"
 
     if args.accurate_vic:
         if args.vic_emulation != "accurate-python":
@@ -468,13 +790,19 @@ def main():
         )
         sys.exit(1)
 
+    # --max-cycles implies autoquit (unless explicitly disabled with --no-autoquit)
+    if args.max_cycles is not None and not args.no_autoquit:
+        args_autoquit = True
+    else:
+        args_autoquit = not args.no_autoquit
+
     # --benchmark implies other flags and loads benchmark PRG
     if args.benchmark:
         args.turbo = True
-        args.autoquit = True
+        args_autoquit = True
         args.no_colors = True
-        if not args.graphics:
-            args.headless = True
+        if args.interface != "graphics":
+            args.interface = "headless"
         if args.max_cycles is None:
             args.max_cycles = 15_000_000  # Enough cycles for benchmark to complete
         # Auto-load benchmark PRG if no file specified
@@ -484,7 +812,7 @@ def main():
                 args.media_file = benchmark_prg
             else:
                 print(f"Warning: Benchmark PRG not found at {benchmark_prg}")
-                print("Run: ./compile.sh to build it (needs VICE petcat).")
+                print("Run: ./tools/compile.sh to build it (needs VICE petcat).")
 
     temp_prg_cleanup: Optional[str] = None
     prg_path: Optional[str] = None
@@ -500,33 +828,53 @@ def main():
     start_time = time.perf_counter()
 
     interface_factory = None
-    if args.headless:
+    if args.interface == "headless":
         interface_factory = lambda _emu: None
-    if args.graphics:
+    if args.interface == "graphics":
         try:
             from .graphics import PygameInterface
         except ImportError:
             from c64py.graphics import PygameInterface
+        # Resolve [input.joystick] from the loaded TOML (None if absent).
+        cfg_input = cfg.get("input", {}) if isinstance(cfg, dict) else {}
+        joystick_cfg = (
+            cfg_input.get("joystick")
+            if isinstance(cfg_input, dict) and isinstance(cfg_input.get("joystick"), dict)
+            else None
+        )
         interface_factory = functools.partial(
             PygameInterface,
             max_cycles=args.max_cycles,
             scale=args.graphics_scale,
             fps=args.graphics_fps,
             border_size=args.graphics_border,
+            joystick_config=joystick_cfg,
         )
 
+    # Audio is pointless in headless mode and pygame.mixer.init() can hang
+    # on machines without an audio device; skip it entirely.
+    audio_mode = str(args.audio_emulation).strip().lower()
+    enable_resid = (audio_mode == "resid") and (args.interface != "headless")
+    enable_sid = (audio_mode == "python-sid") and (args.interface != "headless")
+    
+    # Handle audio volume
+    audio_volume = 0.0 if args.audio_muted else max(0.0, min(1.0, args.audio_volume))
+    
     emu = C64(
         interface_factory=interface_factory,
-        enable_sid=args.enable_sid,
-        enable_resid=args.enable_resid,
+        enable_sid=enable_sid,
+        enable_resid=enable_resid,
+        audio_volume=audio_volume,
         vic_emulation=vic_emulation,
-        disk_emulation=args.disk_emulation,
+        disk_emulation=drive_tier,
     )
+    # Expose merged host config to UI layers (graphics input/gamepad, tools).
+    emu.host_config = cfg
     # Pygame needs latched VIC regs for rendering; headless skips copies for throughput.
-    emu.memory.vic_render_snapshots = bool(args.graphics)
+    emu.memory.vic_render_snapshots = bool(args.interface == "graphics")
     # Fast VIC: latch when pygame presents (~Hz), not every emulated PAL frame (turbo regression).
     # Accurate VIC: keep CPU-thread snapshot at each emulated frame for cycle-stable sampling.
-    emu.memory.vic_snapshot_each_emulated_frame = bool(args.graphics) and bool(emu.accurate_vic)
+    emu.memory.vic_snapshot_each_emulated_frame = bool(args.interface == "graphics") and bool(emu.accurate_vic)
     if args.debug_inject_at_cycle is not None:
         inject_pairs: list[tuple[int | str, int]] = []
         if args.debug_inject_file:
@@ -539,7 +887,7 @@ def main():
         emu.cpu.debug_inject_at_cycle = args.debug_inject_at_cycle
         emu.cpu.debug_inject_writes = inject_pairs
     emu.debug = args.debug
-    emu.autoquit = args.autoquit
+    emu.autoquit = args_autoquit
     emu.turbo = args.turbo
     emu.screen_update_interval = args.screen_update_interval
     emu.no_colors = args.no_colors
@@ -554,60 +902,64 @@ def main():
             emu.inject_key_rules = parse_inject_key_entries(_inject_entries)
         except ValueError as exc:
             print(f"ERROR: --inject-keys: {exc}", file=sys.stderr)
-            sys.exit(1)
-    print(
-        f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}  "
-        f"|  disk emulation: {emu.disk_emulation}"
-    )
+            # os._exit: pygame/reSID are already initialised; sys.exit() raises
+            # SystemExit which SDL atexit hooks can intercept, causing a hang.
+            # os._exit() bypasses all cleanup and terminates the process immediately.
+            os._exit(1)
     if args.debug:
         emu.cpu.enable_trace(1024)
     supports_ui_logs = (emu.interface is not None) and hasattr(emu.interface, "fullscreen")
     if supports_ui_logs:
         emu.interface.fullscreen = args.fullscreen
     show_ui_logs = (not args.fullscreen) if supports_ui_logs else False
-    _warn_if_rust_fast_core_unavailable(
-        vic_emulation,
-        emu,
-        show_ui_logs=show_ui_logs,
-        no_colors=args.no_colors,
-    )
-    if args.debug and show_ui_logs and emu.interface is not None:
-        emu.interface.add_debug_log("🐛 Debug mode enabled")
 
-    # Setup UDP debug logging if requested
-    if args.udp_debug:
-        emu.udp_debug = UdpDebugLogger(port=args.udp_debug_port, host=args.udp_debug_host)
-        emu.udp_debug.enable()
-        if show_ui_logs and emu.interface is not None:
-            emu.interface.add_debug_log(f"📡 UDP debug logging enabled: {args.udp_debug_host}:{args.udp_debug_port}")
-        # Test UDP connection
-        try:
-            test_msg = {'type': 'test', 'message': 'UDP debug initialized'}
-            emu.udp_debug.send('test', test_msg)
-            if show_ui_logs and emu.interface is not None:
-                emu.interface.add_debug_log("✅ UDP test message sent successfully")
-        except Exception as e:
-            if show_ui_logs and emu.interface is not None:
-                emu.interface.add_debug_log(f"❌ UDP test failed: {e}")
-
-    # Pass UDP debug logger to memory
-    if emu.udp_debug:
-        emu.memory.udp_debug = emu.udp_debug
-
-    # Setup VICE-compatible trace logging if requested
     vice_trace = None
-    if args.vice_trace:
-        vice_trace = ViceTraceLogger(
-            filename=args.vice_trace,
-            wall_time=args.vice_trace_wall or args.vice_trace_inline_wall,
-            wall_inline=args.vice_trace_inline_wall,
-        )
-        vice_trace.enable()
-        emu.vice_trace = vice_trace
-        if show_ui_logs and emu.interface is not None:
-            emu.interface.add_debug_log(f"📝 VICE trace logging to: {args.vice_trace}")
-
     try:
+        print(
+            f"VIC emulation: {vic_emulation}  |  video rendering: {args.video_rendering}  "
+            f"|  drive tier (config): {drive_tier}"
+        )
+        _check_rust_core_available(
+            vic_emulation,
+            emu,
+            show_ui_logs=show_ui_logs,
+            no_colors=emu.no_colors,
+        )
+        if args.debug and show_ui_logs and emu.interface is not None:
+            emu.interface.add_debug_log("🐛 Debug mode enabled")
+
+        # Setup UDP debug logging if requested
+        if args.udp_debug:
+            emu.udp_debug = UdpDebugLogger(port=args.udp_debug_port, host=args.udp_debug_host)
+            emu.udp_debug.enable()
+            if show_ui_logs and emu.interface is not None:
+                emu.interface.add_debug_log(f"📡 UDP debug logging enabled: {args.udp_debug_host}:{args.udp_debug_port}")
+            # Test UDP connection
+            try:
+                test_msg = {'type': 'test', 'message': 'UDP debug initialized'}
+                emu.udp_debug.send('test', test_msg)
+                if show_ui_logs and emu.interface is not None:
+                    emu.interface.add_debug_log("✅ UDP test message sent successfully")
+            except Exception as e:
+                if show_ui_logs and emu.interface is not None:
+                    emu.interface.add_debug_log(f"❌ UDP test failed: {e}")
+
+        # Pass UDP debug logger to memory
+        if emu.udp_debug:
+            emu.memory.udp_debug = emu.udp_debug
+
+        # Setup VICE-compatible trace logging if requested
+        if args.vice_trace:
+            vice_trace = ViceTraceLogger(
+                filename=args.vice_trace,
+                wall_time=args.vice_trace_wall or args.vice_trace_inline_wall,
+                wall_inline=args.vice_trace_inline_wall,
+            )
+            vice_trace.enable()
+            emu.vice_trace = vice_trace
+            if show_ui_logs and emu.interface is not None:
+                emu.interface.add_debug_log(f"📝 VICE trace logging to: {args.vice_trace}")
+
         # Video standard (memory + SID/reSID clock when audio is enabled)
         emu.set_video_standard(args.video_standard)
         if show_ui_logs and emu.interface is not None:
@@ -626,40 +978,131 @@ def main():
                 # Relative to the directory containing this script (repo root when C64.py is there).
                 explicit_rom_dir = os.path.normpath(os.path.join(script_dir, explicit_rom_dir))
 
+            print("[INIT] Searching for ROMs...", flush=True)
             rom_dir_path = ensure_roms_available(
                 explicit_rom_dir,
                 allow_prompt=True,
-                require_char_rom=args.graphics,
+                require_char_rom=args.interface == "graphics",
             )
-            emu.load_roms(str(rom_dir_path), require_char_rom=args.graphics)
+            emu.load_roms(str(rom_dir_path), require_char_rom=args.interface == "graphics")
             if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"💾 ROM directory: {rom_dir_path}")
 
-            if args.disk_emulation == "accurate":
-                iec_ok = emu.initialize_iec_bus(str(rom_dir_path))
-                if not iec_ok:
+            # All disk tiers now run the real 1541 6502 + DOS ROM. The tiers
+            # differ in *how* the disk surface and IEC bus are emulated:
+            #
+            #   fast            → job-queue trap (zero-page) + KERNAL LOAD
+            #                     shortcut at $FFD5. Disk I/O is essentially
+            #                     free; the drive CPU runs but isn't stressed
+            #                     by GCR / serial bit-banging.
+            #   accurate-python → real GCR head + bit-level IEC, no shortcuts
+            #                     (in active development; until M2 lands this
+            #                     tier currently behaves like `fast` and
+            #                     warns).
+            #   accurate-rust   → same as accurate-python but in the Rust core
+            #                     (M3; falls back to accurate-python today).
+            # Drive tier comes from [emulation] disk_emulation (TOML); the
+            # standalone c1541_emulator uses --emulation with the same names.
+            # All tiers run the real 1541 6502 + DOS ROM. The job-queue trap
+            # is currently always enabled (until M2b ships a real GCR head).
+            # The KERNAL `$FFD5`/`$FFD8` shortcut is the dominant difference:
+            # `fast` keeps it on (instant LOAD); `accurate-*` turns it off so
+            # the real KERNAL serial routines bit-bang the IEC bus and DOS
+            # ships file bytes back over the wire — exercising the bit-level
+            # handshake end-to-end.
+            emu._iec_disk_full_impl = True
+            # The KERNAL shortcut ($FFD5/$FFD8 hook → TCP RPC) must stay ON
+            # whenever --tcp-drive is used: the TCP drive has no IEC bus wired
+            # up, so disabling the shortcut would hang KERNAL serial routines.
+            # accurate-* tiers disable the shortcut only for the local IEC path
+            # (attach_disk without --tcp-drive, M2 work in progress).
+            # With --tcp-drive, kernal_load_shortcut_enabled stays ON by design (see
+            # below); no stderr warning — mixing TOML accurate-* with TCP is normal.
+            # KERNAL $FFD5/$FFD8 shortcut: set after IEC init + optional auto-spawn
+            # (see below once ``iec_drives`` is populated).
+            # Parse --tcp-drive DEVICE:HOST:PORT entries into a dict.
+            tcp_drives: dict[int, str] = {}
+            for entry in args.tcp_drive:
+                parts = entry.split(":", 1)
+                if len(parts) != 2:
                     print(
-                        "ERROR: --disk-emulation accurate needs a 1541 DOS ROM in the ROM path "
-                        "(e.g. dos1541, d1541-325302-01.bin, or VICE DRIVES/ "
-                        "dos1541-325302-01+901229-05.bin — usually 16 KiB). "
-                        "Optional serial ROM: d1541II / 901229-05.bin (see roms.py, IEC_BUS_STATUS.md).",
+                        f"ERROR: --tcp-drive must be DEVICE:HOST:PORT, got: {entry!r}",
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                if disk_path:
-                    w = (
-                        "WARNING: Accurate disk emulation (IEC) is planned but not yet functional; "
-                        "LOAD from disk will show a stub error instead of hanging."
+                try:
+                    tcp_drives[int(parts[0])] = parts[1]
+                except ValueError:
+                    print(
+                        f"ERROR: --tcp-drive device must be an integer, got: {entry!r}",
+                        file=sys.stderr,
                     )
-                    print(w, file=sys.stderr)
-                    if show_ui_logs and emu.interface is not None:
-                        emu.interface.add_debug_log(f"⚠ {w}")
-                if show_ui_logs and emu.interface is not None:
-                    emu.interface.add_debug_log("📀 Disk emulation: accurate (IEC bus active)")
-            elif show_ui_logs and emu.interface is not None:
-                emu.interface.add_debug_log("📀 Disk emulation: fast (KERNAL hooks)")
+                    sys.exit(1)
+            emu.initialize_iec_bus(tcp_drives=tcp_drives or None)
 
-            if args.video_rendering == "accurate":
+            # Auto-spawn a headless drive for args.disk only when the user
+            # did NOT pass any --tcp-drive (so we don't double-attach).
+            if disk_path and not tcp_drives:
+                dos_rom = None
+                _dos_candidate = rom_dir_path / "dos1541"
+                if _dos_candidate.exists():
+                    dos_rom = str(_dos_candidate)
+                try:
+                    emu._spawn_local_drive(
+                        disk_path, device=8,
+                        tier=drive_tier,
+                        dos_rom_path=dos_rom,
+                    )
+                    # Signal the post-boot code to inject LOAD"$",8 without
+                    # going through the old local attach_disk path.
+                    emu._auto_spawned_drive = True
+                    if show_ui_logs and emu.interface is not None:
+                        emu.interface.add_debug_log(
+                            f"💾 Auto-spawned drive 8 (headless, tier={drive_tier})"
+                        )
+                except Exception as exc:
+                    print(f"ERROR: could not auto-spawn drive: {exc}", file=sys.stderr)
+                    sys.exit(1)
+
+            def _any_tcp_drive_client() -> bool:
+                from c64py.drives.tcp_drive_client import TcpDriveClient
+
+                return any(
+                    isinstance(x, TcpDriveClient) for x in emu.iec_drives.values()
+                )
+
+            # Keep the KERNAL LOAD/SAVE shortcut ON whenever there is no drive to
+            # answer bit-level IEC (avoids infinite KERNAL wait → "hang"), when
+            # using `fast`, or when any attached drive is a TcpDriveClient
+            # (including auto-spawned headless servers) — TCP path has no host IEC
+            # wiring yet. Only disable for a future local non-TCP accurate path.
+            emu.kernal_load_shortcut_enabled = (
+                drive_tier == "fast"
+                or _any_tcp_drive_client()
+                or not emu.iec_drives
+            )
+
+            if drive_tier == "accurate-python" and not emu.kernal_load_shortcut_enabled:
+                msg = (
+                    "Note: [emulation] disk_emulation accurate-python disables the KERNAL "
+                    "LOAD shortcut; LOAD goes through the real 1541 DOS over IEC. "
+                    "Expect noticeably slower disk I/O than `fast` until the GCR "
+                    "head + Rust drive port land."
+                )
+                print(msg, file=sys.stderr)
+                if show_ui_logs and emu.interface is not None:
+                    emu.interface.add_debug_log(f"ℹ {msg}")
+            if show_ui_logs and emu.interface is not None:
+                labels = {
+                    "fast": "fast (real 1541 DOS ROM + job-queue trap + KERNAL LOAD shortcut)",
+                    "accurate-python": "accurate-python (real KERNAL ↔ DOS over IEC, job-queue trap for sectors)",
+                    "accurate-rust": "accurate-rust (drive port WIP → falls back to accurate-python)",
+                }
+                emu.interface.add_debug_log(
+                    f"📀 Drive tier: {labels.get(drive_tier, drive_tier)}"
+                )
+
+            if args.video_rendering == "per-raster":
                 emu.memory.beam_render_enabled = True
                 emu.memory.ensure_beam_buffers()
                 emu.memory.prime_beam_snapshots_from_current_vic()
@@ -681,17 +1124,43 @@ def main():
             if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"📂 PRG file will be loaded after BASIC boot: {prg_path}")
 
-        # Store D64 disk image path for attaching after boot
-        if disk_path:
+        # Store D64 disk image path for attaching after boot.
+        # When a drive was auto-spawned the disk is already in the subprocess;
+        # skip the local attach_disk path and just inject LOAD"$",8 after boot.
+        if disk_path and not getattr(emu, "_auto_spawned_drive", False):
             emu.disk_image_path = disk_path
             if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log(f"💾 D64 disk will be attached after BASIC boot: {disk_path}")
+        elif disk_path and getattr(emu, "_auto_spawned_drive", False):
+            # Drive is remote; inject directory load after BASIC boot.
+            emu._auto_spawned_drive_device = 8
 
         # Initialize CPU (use _read_word to ensure correct byte order and ROM mapping)
         reset_vector = emu.cpu._read_word(0xFFFC)
         emu.cpu.state.pc = reset_vector
         if show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(f"🔄 Reset vector: ${reset_vector:04X}")
+
+        # --load-snapshot: replace full state (after reset vector so ROMs still
+        # present; snapshot overrides CPU.PC, RAM, VIC, CIAs, cycles, etc.).
+        if getattr(args, "load_snapshot", None):
+            try:
+                emu.load_snapshot(args.load_snapshot)
+            except Exception as exc:
+                print(f"ERROR: failed to load snapshot {args.load_snapshot}: {exc}")
+                sys.exit(1)
+            # Suppress autoload paths: snapshot already carries the loaded game.
+            emu.prg_file_path = None
+            emu.disk_image_path = None
+            emu._program_loaded_after_boot = True
+            emu._disk_attached_after_boot = True
+            if show_ui_logs and emu.interface is not None:
+                emu.interface.add_debug_log(
+                    f"📥 Snapshot loaded from {args.load_snapshot} — skipping BASIC boot/autoload"
+                )
+
+        # --save-snapshot-at-cycle CYCLE[:PATH] / --save-snapshot-at-exit [PATH].
+        _configure_snapshot_saving(args, emu, prg_display_basename)
 
         if args.debug and show_ui_logs and emu.interface is not None:
             emu.interface.add_debug_log(
@@ -731,7 +1200,7 @@ def main():
             print()
 
         # Start graphics interface if requested
-        if args.graphics and emu.interface is not None:
+        if args.interface == "graphics" and emu.interface is not None:
             emu.interface.max_cycles = args.max_cycles
             if show_ui_logs and emu.interface is not None:
                 emu.interface.add_debug_log("🎨 Graphics interface active")
@@ -868,6 +1337,33 @@ def main():
                 hexb = " ".join(f"{b:02X}" for b in chunk)
                 print(f"${base:04X}: {hexb}")
 
+        if args.dump_ram_sha256:
+            ram64 = bytes(emu.memory.ram[0:0x10000])
+            digest = hashlib.sha256(ram64).hexdigest()
+            print(
+                f"=== ram-sha256-full cpu_cycles={emu.current_cycles} "
+                f"sha256={digest} ==="
+            )
+
+        if args.dump_cpu_state:
+            st = emu.cpu.state
+            ec = int(emu.current_cycles)
+            sc = int(st.cycles)
+            print(
+                "=== cpu-state "
+                f"emulated_cycles={ec} cpu_state_cycles={sc} "
+                f"PC=${st.pc & 0xFFFF:04X} "
+                f"A=${st.a & 0xFF:02X} X=${st.x & 0xFF:02X} Y=${st.y & 0xFF:02X} "
+                f"SP=${st.sp & 0xFF:02X} P=${st.p & 0xFF:02X} ==="
+            )
+
+        if args.dump_ram_raw:
+            raw_path = Path(args.dump_ram_raw)
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(raw_path, "wb") as rf:
+                rf.write(bytes(emu.memory.ram[0:0x10000]))
+            print(f"Raw 65536-byte RAM written to {raw_path.resolve()}")
+
         # Dump memory if requested
         if args.dump_memory:
             memory_dump = emu.dump_memory()
@@ -876,9 +1372,13 @@ def main():
                 f.write(memory_dump)
             print(f"Memory dumped to {args.dump_memory}")
 
-        # Show final screen (only if Rich was not used)
+        # Show final screen (only if Rich was not used). Skip in headless + RAM snapshot mode so
+        # stdout stays text-safe for grep/pipes (PETSCII/control chars confuse grep -a on some setups).
+        skip_final_text = (args.interface == "headless") and (
+            args.dump_ram_sha256 or args.dump_cpu_state or bool(args.dump_ram_raw)
+        )
         if not server or not server.running:
-            if args.no_colors:
+            if args.no_colors and not skip_final_text:
                 # Only show final screen if colors are disabled
                 emu._update_text_screen()
                 print("\nFinal Screen output:")

@@ -46,12 +46,12 @@ from .constants import (
 )
 from .cpu import CPU6502
 from .debug import UdpDebugLogger
-from .drive import DiskDrive
 from .memory import MemoryMap
-from .roms import REQUIRED_ROMS, find_drive_rom
+from .roms import REQUIRED_ROMS
 from .ui import TextualInterface
 from .iec_bus import IECBus
-from .drive1541 import Drive1541
+from .drives.tcp_drive_client import TcpDriveClient
+from .drives.iec_backend import IECDriveBackend
 
 class C64:
     """Main C64 emulator"""
@@ -82,6 +82,7 @@ class C64:
         interface_factory=None,
         enable_sid: bool = False,
         enable_resid: bool = False,
+        audio_volume: float = 1.0,
         vic_emulation: str = "fast",
         disk_emulation: str = "fast",
     ):
@@ -90,7 +91,7 @@ class C64:
             raise ValueError(
                 f"vic_emulation must be one of {sorted(allowed_vic)}, got {vic_emulation!r}"
             )
-        allowed_disk = frozenset({"fast", "accurate"})
+        allowed_disk = frozenset({"fast", "accurate-python", "accurate-rust"})
         if disk_emulation not in allowed_disk:
             raise ValueError(
                 f"disk_emulation must be one of {sorted(allowed_disk)}, got {disk_emulation!r}"
@@ -135,12 +136,14 @@ class C64:
         self.current_cycles = 0  # Track current cycle count
         self.program_loaded = False  # Track if a program was loaded via command line
         self.prg_file_path = None  # Store PRG file path to load after BASIC is ready
+        # Snapshot scheduling (see snapshot.py / C64.py CLI flags).
+        self._snapshot_at_cycle: Optional[tuple[int, str, str]] = None  # (cycle, path, note)
+        self._snapshot_at_exit: Optional[tuple[str, str]] = None  # (path, note)
+        self._snapshot_runtime_request: Optional[tuple[str, str]] = None  # Alt+S, TCP, etc.
         self.screen_update_callback = None  # Callback for screen updates (set by interface)
         self.turbo = False  # When True, no wall-clock throttling (see --turbo)
         self.inject_key_rules: List[InjectKeyRule] = []
 
-        # Disk drives (devices 8-11)
-        self.drives: Dict[int, DiskDrive] = {}
         self.disk_image_path = None  # Store D64 path to attach after BASIC is ready
 
         self.monitor_server = None  # type: ignore[var-annotated]
@@ -151,10 +154,14 @@ class C64:
 
         # IEC serial bus for 1541 drive emulation (optional, created when needed)
         self.iec_bus: Optional[IECBus] = None
-        self.iec_drives: Dict[int, Drive1541] = {}  # 1541 drives with ROM
+        self.iec_drives: Dict[int, IECDriveBackend] = {}  # TCP drive clients
         self.use_iec_bus = False  # Enable when 1541 ROMs are available
-        # True when full IEC byte protocol + 1541 VIA/IEC is implemented (LOAD works like hardware).
-        self._iec_disk_full_impl: bool = False
+        # When True (default), the Python KERNAL LOAD/SAVE hooks at $FFD5/$FFD8
+        # short-circuit disk I/O by serving the requested file directly from the
+        # `D64Image`. Set False for `disk_emulation` accurate-python /
+        # `accurate-rust` so the real KERNAL code paths talk to the 1541 over
+        # the IEC bus (exercises the bit-level handshake + DOS ROM end to end).
+        self.kernal_load_shortcut_enabled: bool = True
         # Thread-safe queue: UI/server threads must not write $C6/$0277 directly (races KERNAL
         # CHRIN on the CPU thread). Producers call send_petscii; CPU thread drains in sync_keyboard_host_queue.
         self._keyboard_incoming: queue.Queue[int] = queue.Queue(maxsize=64)
@@ -174,6 +181,7 @@ class C64:
                 self.sid = ReSIDEmulator(
                     video_standard=self.memory.video_standard,
                     cpu_lockstep=accurate_vic,
+                    audio_volume=audio_volume,
                 )
                 self.memory.sid = self.sid
                 if self.interface:
@@ -443,13 +451,13 @@ class C64:
 
         # Initialize VIC registers (simplified)
         # VIC register $D018: Screen and character memory
-        # Bit 1-3: Screen memory (default $0400 = %000 = 0)
-        # Bit 4-7: Character memory (default $1000 = %010 = 2)
-        # So $D018 = %00010000 = $10
+        # Bits 7-4 (vm): video matrix base (1 → $0400)
+        # Bits 3-1 (cb): char base (2 → offset $1000 within VIC bank, which is
+        #                 the char ROM window in banks 0 and 2)
+        # $D018 = %00010101 = $15 → screen at $0400, chars at char ROM (uppercase)
         # Seed key VIC state so early frames render like a real C64, even before ROM init.
         # Use memory-mapped I/O writes so the values land in the VIC register model.
-        # Seed VIC state directly (independent of banking).
-        self.memory.poke_vic(0x18, 0x10)  # Screen at $0400, chars at $1000
+        self.memory.poke_vic(0x18, 0x15)  # Screen at $0400, chars at char ROM ($1000)
         self.memory.poke_vic(0x20, 0x0E)  # Border: light blue
         self.memory.poke_vic(0x21, 0x06)  # Background: blue
 
@@ -621,6 +629,60 @@ class C64:
             self.sid = None
             self.memory.sid = None
 
+    def save_snapshot(self, path, *, note: str = "") -> str:
+        """Save a snapshot of the current emulator state to *path*.
+
+        See :mod:`c64py.snapshot` for the file format and caveats (ROMs,
+        IEC/disk, and SID internal state are intentionally not captured).
+        """
+        from .snapshot import save_snapshot as _save
+        out = _save(self, path, note=note)
+        msg = f"💾 Snapshot saved: {out} (cycle={int(self.current_cycles)})"
+        if self.interface and hasattr(self.interface, "add_debug_log"):
+            self.interface.add_debug_log(msg)
+        print(msg, flush=True)
+        return str(out)
+
+    def load_snapshot(self, path) -> None:
+        """Replace the current emulator state with a snapshot from *path*."""
+        from .snapshot import load_snapshot as _load, describe_payload
+        payload = _load(self, path)
+        msg = f"📥 Snapshot loaded: {path} — {describe_payload(payload)}"
+        if self.interface and hasattr(self.interface, "add_debug_log"):
+            self.interface.add_debug_log(msg)
+        print(msg, flush=True)
+
+    def request_runtime_snapshot(self, path, *, note: str = "") -> None:
+        """Queue a snapshot to be written on the CPU thread (Alt+S / signal).
+
+        Writing from a UI thread while the CPU thread is mid-instruction would
+        race the ``ram`` / VIC register arrays; the request is serviced between
+        instructions by :meth:`_service_snapshot_requests`.
+        """
+        self._snapshot_runtime_request = (str(path), str(note))
+
+    def _service_snapshot_requests(self) -> None:
+        """Save queued snapshot (Alt+S / --save-snapshot-at-cycle) in-loop."""
+        if getattr(self, "_snapshot_runtime_request", None) is not None:
+            path, note = self._snapshot_runtime_request
+            self._snapshot_runtime_request = None
+            try:
+                self.save_snapshot(path, note=note)
+            except Exception as exc:
+                err = f"❌ Snapshot save failed: {exc}"
+                print(err, flush=True)
+                if self.interface and hasattr(self.interface, "add_debug_log"):
+                    self.interface.add_debug_log(err)
+        sched = getattr(self, "_snapshot_at_cycle", None)
+        if sched is not None:
+            target_cycle, path, note = sched
+            if self.current_cycles >= target_cycle:
+                self._snapshot_at_cycle = None
+                try:
+                    self.save_snapshot(path, note=note)
+                except Exception as exc:
+                    print(f"❌ Scheduled snapshot failed: {exc}", flush=True)
+
     def load_prg(self, prg_path: str) -> None:
         """Load a PRG file into memory"""
         with open(prg_path, "rb") as f:
@@ -753,106 +815,216 @@ class C64:
             self.interface.add_debug_log(f"💾 Injected 'LOAD\"$\",{device}' command into keyboard buffer")
 
     def attach_disk(self, disk_path: str, device: int = 8) -> None:
-        """Attach a D64 disk image to a drive.
-        
+        """Attach a D64 disk image to the TCP drive server for *device*.
+
+        Sends an ``attach_disk`` RPC to the connected :class:`TcpDriveClient`.
+        Falls back to a no-op (with a log warning) when no TCP client is
+        registered for *device* — this preserves the previous call-site
+        signature.
+
         Args:
             disk_path: Path to D64 disk image file
             device: Device number (8-11, default 8)
         """
-        from .d64 import load_d64
-        
         if device < 8 or device > 11:
             raise ValueError(f"Invalid device number: {device} (must be 8-11)")
-        
-        # Load D64 image
-        d64 = load_d64(disk_path)
-        
-        # Create or get drive
-        if device not in self.drives:
-            self.drives[device] = DiskDrive(device)
-        
-        # Attach disk
-        self.drives[device].attach_disk(d64, disk_path)
-        iec = self.iec_drives.get(device)
-        if iec is not None:
-            iec.attach_disk(d64, disk_path)
-        
+        client = self.iec_drives.get(device)
+        if client is None or not isinstance(client, TcpDriveClient):
+            if self.interface:
+                self.interface.add_debug_log(
+                    f"⚠ attach_disk: no TCP client for device {device}, ignoring"
+                )
+            return
+        ok = client.attach_disk_remote(disk_path)
         if self.interface:
-            disk_name, disk_id = d64.read_bam()
-            self.interface.add_debug_log(f"💾 Attached disk '{disk_name}' (ID: {disk_id}) to drive {device}")
-            self.interface.add_debug_log(f"   File: {disk_path}")
+            if ok:
+                self.interface.add_debug_log(
+                    f"💾 Disk attached on drive {device}: {disk_path}"
+                )
+            else:
+                self.interface.add_debug_log(
+                    f"❌ attach_disk RPC failed for device {device}"
+                )
 
     def detach_disks(self) -> None:
-        """Detach all disk images from drives."""
-        for device, drive in self.drives.items():
-            drive.detach_disk()
-            if self.interface:
-                self.interface.add_debug_log(f"💾 Detached disk from drive {device}")
-        self.drives.clear()
-        
-        # Also detach from IEC drives if using IEC bus
-        for device, drive in self.iec_drives.items():
-            drive.detach_disk()
-            if self.interface:
-                self.interface.add_debug_log(f"💾 Detached disk from IEC drive {device}")
+        """Detach disk images from all connected TCP drive servers."""
+        for device, client in self.iec_drives.items():
+            if isinstance(client, TcpDriveClient):
+                client.detach_disk_remote()
+                if self.interface:
+                    self.interface.add_debug_log(f"💾 Detached disk from drive {device}")
 
-    def get_drive(self, device: int) -> Optional[DiskDrive]:
-        """Get disk drive by device number.
-        
-        Args:
-            device: Device number (8-11)
-            
-        Returns:
-            DiskDrive instance or None if not attached
-        """
-        return self.drives.get(device)
+    def get_drive(self, device: int) -> Optional[TcpDriveClient]:
+        """Return the TCP drive client for *device*, or None."""
+        client = self.iec_drives.get(device)
+        if isinstance(client, TcpDriveClient):
+            return client
+        return None
     
-    def initialize_iec_bus(self, rom_dir: Optional[str] = None) -> bool:
-        """Initialize IEC bus and 1541 drive emulation.
-        
-        This loads 1541 ROMs and creates the IEC bus infrastructure.
-        If ROMs cannot be found, falls back to KERNAL hook method.
-        
+    def initialize_iec_bus(self, tcp_drives: Optional[Dict[int, str]] = None,
+                           rom_dir: Optional[str] = None) -> bool:
+        """Initialize IEC bus with TCP-connected drive clients.
+
+        Each entry in ``tcp_drives`` maps a device number (8–11) to a
+        ``"host:port"`` string.  A ``TcpDriveClient`` is created for each
+        entry and attached to the ``IECBus``.  If ``tcp_drives`` is omitted
+        the bus is created with no drives attached (drives can be added later
+        via :meth:`attach_tcp_drive`).
+
+        ``rom_dir`` is accepted for API compatibility but is no longer used —
+        ROMs live in the standalone ``c1541_emulator`` server process.
+
         Args:
-            rom_dir: Optional ROM directory path
-            
+            tcp_drives: Optional mapping of device# → "host:port", e.g.
+                        ``{8: "localhost:6408", 9: "localhost:6409"}``
+            rom_dir: Ignored (kept for back-compat).
+
         Returns:
-            True if IEC bus was successfully initialized
+            True if the IEC bus was successfully initialized.
         """
         if self.iec_bus is not None:
+            self._sync_iec_kernal_tap()
             return self.use_iec_bus
 
-        # Try to load 1541 DOS ROM
-        dos_rom = find_drive_rom("dos1541", rom_dir)
-        if dos_rom is None:
-            if self.interface:
-                self.interface.add_debug_log("⚠️  1541 DOS ROM not found - using KERNAL hooks for disk I/O")
-            self.use_iec_bus = False
-            return False
-        
-        # Serial ROM is optional
-        serial_rom = find_drive_rom("serial1541", rom_dir)
-        if serial_rom is None:
-            if self.interface:
-                self.interface.add_debug_log("⚠️  1541 Serial ROM not found (optional)")
-        
-        # Create IEC bus
         self.iec_bus = IECBus()
         self.memory.iec_bus = self.iec_bus
-        
-        # Create 1541 drives for devices 8-11
-        for device in range(8, 12):
-            drive = Drive1541(device_number=device)
-            drive.load_rom(dos_rom, serial_rom)
-            self.iec_bus.attach_device(drive)
-            self.iec_drives[device] = drive
-        
+
+        if tcp_drives:
+            for device, addr in tcp_drives.items():
+                self.attach_tcp_drive(device, addr)
+
         self.use_iec_bus = True
         self.cpu.kernal_disk_hook_vectors = False
-        self.memory.iec_disk_full_impl = getattr(self, "_iec_disk_full_impl", False)
+        self.memory.iec_disk_full_impl = False
         if self.interface:
-            self.interface.add_debug_log("✓ IEC serial bus initialized with 1541 ROM emulation")
+            n = len(self.iec_drives)
+            self.interface.add_debug_log(
+                f"✓ IEC serial bus initialized ({n} TCP drive(s) attached)"
+            )
+        self._sync_iec_kernal_tap()
         return True
+
+    def _sync_iec_kernal_tap(self) -> None:
+        """Install :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives are attached."""
+        m = self.memory
+        if not getattr(self, "use_iec_bus", False) or self.iec_bus is None:
+            m.iec_kernal_tap = None
+            return
+        has_tcp = any(isinstance(d, TcpDriveClient) for d in self.iec_drives.values())
+        if has_tcp:
+            if m.iec_kernal_tap is None:
+                from .iec_kernal_bridge import KernalIecTap
+
+                m.iec_kernal_tap = KernalIecTap()
+        else:
+            m.iec_kernal_tap = None
+
+    def attach_tcp_drive(self, device: int, addr: str) -> bool:
+        """Attach a TCP drive client for ``device`` at ``host:port``.
+
+        Creates a :class:`TcpDriveClient`, attempts to connect, and registers
+        it on the :class:`IECBus`.  The IEC bus must have been created first
+        (call :meth:`initialize_iec_bus` without arguments if needed).
+
+        Args:
+            device: IEC device number (8–11).
+            addr:   ``"host:port"`` string, e.g. ``"localhost:6408"``.
+
+        Returns:
+            True if the connection succeeded.
+        """
+        if self.iec_bus is None:
+            self.initialize_iec_bus()
+
+        if ":" not in addr:
+            raise ValueError(f"addr must be 'host:port', got: {addr!r}")
+        host, port_str = addr.rsplit(":", 1)
+        port = int(port_str)
+
+        # Detach any existing client for this device first.
+        existing = self.iec_drives.get(device)
+        if existing is not None and isinstance(existing, TcpDriveClient):
+            existing.disconnect()
+            self.iec_bus.detach_device(existing)
+
+        client = TcpDriveClient(device_number=device, host=host, port=port)
+        ok = client.connect()
+        self.iec_bus.attach_device(client)
+        self.iec_drives[device] = client
+        if self.interface:
+            status = "connected" if ok else "pending (server not yet reachable)"
+            self.interface.add_debug_log(
+                f"💾 Drive {device} → {addr} [{status}]"
+            )
+        self._sync_iec_kernal_tap()
+        return ok
+
+    def _spawn_local_drive(self, disk_path: Optional[str], device: int = 8,
+                           tier: str = "fast",
+                           dos_rom_path: Optional[str] = None) -> str:
+        """Launch a headless c1541_emulator subprocess and connect to it.
+
+        Returns the "host:port" string that was attached. Tracks the child in
+        ``self._spawned_drives`` so it can be cleaned up on emulator shutdown.
+        """
+        import socket as _socket
+        import subprocess
+        import time
+        import atexit
+
+        if not hasattr(self, "_spawned_drives"):
+            self._spawned_drives: list = []
+            atexit.register(self._terminate_spawned_drives)
+
+        # Pick an ephemeral free port.
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        import sys as _sys
+        cmd = [
+            _sys.executable,
+            "-m", "c64py.drives.c1541_emulator",
+            "--interface", "headless",
+            "--emulation", tier,
+            "--device", str(device),
+            "--port", str(port),
+        ]
+        if disk_path:
+            cmd += ["--disk", disk_path]
+        if dos_rom_path:
+            cmd += ["--dos-rom", dos_rom_path]
+        proc = subprocess.Popen(cmd)
+        self._spawned_drives.append(proc)
+
+        # Wait for the port to accept connections.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                with _socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            proc.terminate()
+            raise RuntimeError(f"drive subprocess did not open port {port}")
+
+        addr = f"localhost:{port}"
+        self.attach_tcp_drive(device, addr)
+        return addr
+
+    def _terminate_spawned_drives(self) -> None:
+        """Terminate all auto-spawned drive subprocesses."""
+        for proc in getattr(self, "_spawned_drives", []):
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
 
     def _kernal_hook_rts_return(self) -> None:
         """Pop return address from stack like RTS after a simulated KERNAL vector call."""
@@ -863,47 +1035,13 @@ class C64:
         self.cpu.state.pc = (ret_addr + 1) & 0xFFFF
         self.cpu.state.sp = (sp + 2) & 0xFF
 
-    def _handle_kernal_load_iec_stub(self) -> bool:
-        """Until full IEC/1541 is implemented, complete LOAD with a visible error (no hang)."""
-        device = self.memory.read(0xBA)
-        drive = self.get_drive(device)
-        if not drive or not drive.has_disk():
-            return False
-        filename_len = self.memory.read(0xB7)
-        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
-        filename_bytes = []
-        for i in range(filename_len):
-            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
-        filename = "".join(chr(b) if 32 <= b < 127 else "?" for b in filename_bytes)
-
-        # KERNAL-style order: newline after the LOAD line, then SEARCHING FOR <name>, then error.
-        # Status byte $90 is set after messages (same idea as real I/O completion).
-        self.cpu.apply_chrout_petscii(0x0D)
-        for ch in f"SEARCHING FOR {filename}":
-            self.cpu.apply_chrout_petscii(ord(ch))
-        self.cpu.apply_chrout_petscii(0x0D)
-        for ch in "ERROR: NOT IMPLEMENTED YET":
-            self.cpu.apply_chrout_petscii(ord(ch))
-        self.cpu.apply_chrout_petscii(0x0D)
-
-        if self.interface:
-            self.interface.add_debug_log(
-                f"IEC disk LOAD not implemented yet (device={device} file={filename!r}) — stub error"
-            )
-
-        self.memory.write(0x90, 0x40)
-        self.cpu.state.p |= 0x01
-        self._kernal_hook_rts_return()
-        return True
-
     def _handle_kernal_load(self) -> bool:
-        """Handle KERNAL LOAD operation for virtual disk drives.
-        
-        This intercepts LOAD calls when PC is at $FFD5 and device is 8-11.
-        When :attr:`use_iec_bus` is True and full IEC disk I/O is not implemented yet,
-        :meth:`_handle_kernal_load_iec_stub` prints a stub message and returns with error.
-        Returns True if LOAD was handled, False otherwise.
-        
+        """Handle KERNAL LOAD operation via TCP fast_load RPC.
+
+        Intercepts PC=$FFD5 for disk devices (8-11), forwards to the connected
+        TcpDriveClient, writes file bytes directly into C64 RAM, and returns via
+        synthetic RTS.  Returns True if the call was handled (even on error).
+
         KERNAL LOAD calling convention:
         - A: 0 = LOAD, 1 = VERIFY
         - X: Load address low byte (if secondary address = 0)
@@ -913,114 +1051,120 @@ class C64:
         - $BA: Device number
         - $B9: Secondary address (0 = use address in X/Y, 1 = use address from file)
         """
-        if self.use_iec_bus:
-            if self.cpu.state.pc != 0xFFD5:
-                return False
-            if getattr(self, "_iec_disk_full_impl", False):
-                return False
-            device = self.memory.read(0xBA)
-            if device < 8 or device > 11:
-                return False
-            return self._handle_kernal_load_iec_stub()
-        # Check if we're at the LOAD entry point
+        if not self.kernal_load_shortcut_enabled:
+            return False
         if self.cpu.state.pc != 0xFFD5:
             return False
-        
-        # Get device number from zero page
         device = self.memory.read(0xBA)
-        
-        # Only handle disk devices (8-11)
         if device < 8 or device > 11:
             return False
-        
-        # Check if we have a drive attached for this device
-        drive = self.get_drive(device)
-        if not drive or not drive.has_disk():
-            # No disk attached - show "DEVICE NOT PRESENT" error
-            if self.interface:
-                self.interface.add_debug_log(f"❌ No disk in drive {device}")
-            # Set error status
-            self.memory.write(0x90, 0x80)  # Status byte: device not present
-            # Set carry flag to indicate error
-            self.cpu.state.p |= 0x01
-            self._kernal_hook_rts_return()
-            return True
-        
-        # Get LOAD parameters
-        verify = self.cpu.state.a != 0  # A=0 for LOAD, A=1 for VERIFY
+
+        verify = self.cpu.state.a != 0
         secondary_addr = self.memory.read(0xB9)
         filename_len = self.memory.read(0xB7)
         filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
-        
-        # Read filename from memory
-        filename_bytes = []
-        for i in range(filename_len):
-            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
+        filename_bytes = [self.memory.read((filename_ptr + i) & 0xFFFF)
+                          for i in range(filename_len)]
         filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
-        
-        if self.interface:
-            self.interface.add_debug_log(f"🔧 KERNAL LOAD intercepted: device={device}, file='{filename}', verify={verify}")
-        
-        # Load file from virtual disk
-        file_data = drive.load_file(filename, secondary_addr)
-        
-        if file_data is None:
+
+        client = self.get_drive(device)
+        if client is None:
             if self.interface:
-                self.interface.add_debug_log(f"❌ File not found: '{filename}'")
-            # Set error: FILE NOT FOUND
-            self.memory.write(0x90, 0x40)  # Status byte: error
-            # Set carry flag to indicate error
+                self.interface.add_debug_log(f"❌ No drive client for device {device}")
+            self.cpu.state.a = 5           # BASIC 5 = DEVICE NOT PRESENT
+            self.memory.write(0x90, 0x00)
             self.cpu.state.p |= 0x01
             self._kernal_hook_rts_return()
             return True
-        
-        # Get load address
-        if secondary_addr == 0:
-            # Use address from X/Y registers
-            load_addr = self.cpu.state.x | (self.cpu.state.y << 8)
-        else:
-            # Use address from file (first 2 bytes)
-            if len(file_data) >= 2:
-                load_addr = file_data[0] | (file_data[1] << 8)
-                file_data = file_data[2:]  # Skip load address bytes
-            else:
-                load_addr = 0x0801  # Default to BASIC start
-        
-        # Write file data to memory (skip if VERIFY)
-        if not verify:
-            for i, byte_val in enumerate(file_data):
-                addr = (load_addr + i) & 0xFFFF
-                self.memory.write(addr, byte_val)
-        
-        end_addr = (load_addr + len(file_data)) & 0xFFFF
-        
+
         if self.interface:
             self.interface.add_debug_log(
-                f"✅ {'Verified' if verify else 'Loaded'} {len(file_data)} bytes "
-                f"at ${load_addr:04X}-${end_addr:04X}"
+                f"🔧 KERNAL LOAD: device={device}, file='{filename}', verify={verify}"
             )
-        
-        # Set end address in X/Y registers
+
+        file_data, err, dos_ft = client.fast_load(filename, secondary_addr)
+        dos_ft = dos_ft if dos_ft is not None else 2
+
+        if err is not None:
+            drive_code = err[0] if err else 74
+            drive_msg  = err[1] if err else "DRIVE NOT READY"
+            if self.interface:
+                self.interface.add_debug_log(
+                    f"❌ LOAD '{filename}' failed: {drive_code},{drive_msg}"
+                )
+            # Map 1541 DOS error codes to BASIC/KERNAL error codes:
+            #   BASIC 4 = FILE NOT FOUND
+            #   BASIC 5 = DEVICE NOT PRESENT
+            # (BASIC 8 = MISSING FILE NAME — do NOT use for disk errors)
+            kernal_err = 4 if drive_code in (62, 63, 64) else 5
+            self.cpu.state.a = kernal_err
+            self.memory.write(0x90, 0x00)  # clear ST — error is in A/carry
+            self.cpu.state.p |= 0x01       # carry set = error
+            self._kernal_hook_rts_return()
+            return True
+
+        if secondary_addr == 1:
+            # Force-load: caller supplies the load address via X/Y registers.
+            load_addr = self.cpu.state.x | (self.cpu.state.y << 8)
+            # PRG: first two bytes of file are load address and are skipped.
+            # SEQ / USR / REL: entire payload goes to the caller's address.
+            if dos_ft in (1, 3, 4):
+                data = bytes(file_data)
+            else:
+                data = bytes(file_data[2:]) if len(file_data) >= 2 else bytes(file_data)
+        elif dos_ft == 4 and len(file_data) >= 2:
+            load_addr = file_data[0] | (file_data[1] << 8)
+            data = bytes(file_data[2:])
+        else:
+            # Normal load (secondary 0 or 2): load address comes from first 2
+            # bytes of the PRG, matching real KERNAL behaviour.
+            if len(file_data) >= 2:
+                load_addr = file_data[0] | (file_data[1] << 8)
+                data = bytes(file_data[2:])
+            else:
+                load_addr = 0x0801
+                data = bytes(file_data)
+
+        if verify:
+            mismatch = False
+            for i, byte_val in enumerate(data):
+                if self.memory.read((load_addr + i) & 0xFFFF) != byte_val:
+                    mismatch = True
+                    break
+            if mismatch:
+                if self.interface:
+                    self.interface.add_debug_log(
+                        f"❌ VERIFY '{filename}' mismatch at offset {i}"
+                    )
+                self.cpu.state.a = 28  # BASIC BAD DATA (VERIFY failed)
+                self.memory.write(0x90, 0x01)
+                self.cpu.state.p |= 0x01
+                self._kernal_hook_rts_return()
+                return True
+        else:
+            for i, byte_val in enumerate(data):
+                self.memory.write((load_addr + i) & 0xFFFF, byte_val)
+
+        end_addr = (load_addr + len(data)) & 0xFFFF
         self.cpu.state.x = end_addr & 0xFF
         self.cpu.state.y = (end_addr >> 8) & 0xFF
-        
-        # Clear carry flag to indicate success
         self.cpu.state.p &= ~0x01
-        
-        # Clear status byte
         self.memory.write(0x90, 0x00)
-        
-        # If loading directory, update BASIC pointers
+
         if filename == "$" and load_addr == 0x0801:
-            # Update BASIC end pointer ($2D/$2E)
             self.memory.write(0x002D, end_addr & 0xFF)
             self.memory.write(0x002E, (end_addr >> 8) & 0xFF)
-            # Update variable pointers
             self.memory.write(0x002F, end_addr & 0xFF)
             self.memory.write(0x0030, (end_addr >> 8) & 0xFF)
             self.memory.write(0x0031, end_addr & 0xFF)
             self.memory.write(0x0032, (end_addr >> 8) & 0xFF)
-        
+
+        if self.interface:
+            self.interface.add_debug_log(
+                f"✅ {'Verified' if verify else 'Loaded'} {len(data)} bytes "
+                f"at ${load_addr:04X}-${end_addr:04X}"
+            )
+
         self._kernal_hook_rts_return()
         return True
 
@@ -1040,89 +1184,66 @@ class C64:
         - $BA: Device number
         - $AE-$AF: End address + 1
         """
-        if self.use_iec_bus:
+        if not self.kernal_load_shortcut_enabled:
             return False
-        # Check if we're at the SAVE entry point
         if self.cpu.state.pc != 0xFFD8:
             return False
-        
-        # Get device number from zero page
         device = self.memory.read(0xBA)
-        
-        # Only handle disk devices (8-11)
         if device < 8 or device > 11:
             return False
-        
-        # Check if we have a drive attached for this device
-        drive = self.get_drive(device)
-        if not drive or not drive.has_disk():
-            # No disk attached - show error
+
+        filename_len = self.memory.read(0xB7)
+        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
+        filename_bytes = [self.memory.read((filename_ptr + i) & 0xFFFF)
+                          for i in range(filename_len)]
+        filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
+
+        client = self.get_drive(device)
+        if client is None:
             if self.interface:
-                self.interface.add_debug_log(f"❌ No disk in drive {device}")
-            # Set error status
-            self.memory.write(0x90, 0x80)
-            # Set carry flag to indicate error
+                self.interface.add_debug_log(f"❌ No drive client for device {device}")
+            self.cpu.state.a = 5           # BASIC 5 = DEVICE NOT PRESENT
+            self.memory.write(0x90, 0x00)
             self.cpu.state.p |= 0x01
             self._kernal_hook_rts_return()
             return True
-        
-        # Get SAVE parameters
-        filename_len = self.memory.read(0xB7)
-        filename_ptr = self.memory.read(0xBB) | (self.memory.read(0xBC) << 8)
-        
-        # Read filename from memory
-        filename_bytes = []
-        for i in range(filename_len):
-            filename_bytes.append(self.memory.read((filename_ptr + i) & 0xFFFF))
-        filename = ''.join(chr(b) if 32 <= b < 127 else '?' for b in filename_bytes)
-        
-        # Get start and end addresses
+
         start_addr = self.cpu.state.x | (self.cpu.state.y << 8)
         end_addr = self.memory.read(0xAE) | (self.memory.read(0xAF) << 8)
-        
+
         if self.interface:
             self.interface.add_debug_log(
-                f"🔧 KERNAL SAVE intercepted: device={device}, file='{filename}', "
+                f"🔧 KERNAL SAVE: device={device}, file='{filename}', "
                 f"${start_addr:04X}-${end_addr:04X}"
             )
-        
-        # Read data from memory
-        data_len = end_addr - start_addr
-        file_data = bytearray()
-        
-        # Add load address (first 2 bytes of PRG file)
-        file_data.append(start_addr & 0xFF)
-        file_data.append((start_addr >> 8) & 0xFF)
-        
-        # Read the actual data
+
+        file_data = bytearray([start_addr & 0xFF, (start_addr >> 8) & 0xFF])
         for addr in range(start_addr, end_addr):
             file_data.append(self.memory.read(addr & 0xFFFF))
-        
-        # Try to save file to disk
-        try:
-            success = drive.save_file(filename, bytes(file_data))
-            if success:
-                if self.interface:
-                    self.interface.add_debug_log(f"✅ Saved {len(file_data)} bytes to '{filename}'")
-                # Clear carry flag to indicate success
-                self.cpu.state.p &= ~0x01
-                # Clear status byte
-                self.memory.write(0x90, 0x00)
-            else:
-                if self.interface:
-                    self.interface.add_debug_log(f"❌ Failed to save '{filename}'")
-                # Set error status
-                self.memory.write(0x90, 0x40)
-                # Set carry flag to indicate error
-                self.cpu.state.p |= 0x01
-        except Exception as e:
+
+        ok, err = client.fast_save(filename, bytes(file_data))
+        if ok:
             if self.interface:
-                self.interface.add_debug_log(f"❌ Save error: {e}")
-            # Set error status
-            self.memory.write(0x90, 0x40)
-            # Set carry flag to indicate error
-            self.cpu.state.p |= 0x01
-        
+                self.interface.add_debug_log(
+                    f"✅ Saved {len(file_data)} bytes to '{filename}'"
+                )
+            self.cpu.state.p &= ~0x01
+            self.memory.write(0x90, 0x00)
+        else:
+            drive_code = err[0] if err else 74
+            drive_msg  = err[1] if err else "DRIVE NOT READY"
+            if self.interface:
+                self.interface.add_debug_log(
+                    f"❌ SAVE '{filename}' failed: {drive_code},{drive_msg}"
+                )
+            # Map 1541 DOS error codes to BASIC/KERNAL error codes:
+            #   BASIC 4 = FILE NOT FOUND   (62 FILE NOT FOUND)
+            #   BASIC 5 = DEVICE NOT PRESENT (74 DRIVE NOT READY, 72 DISK FULL, etc.)
+            kernal_err = 4 if drive_code in (62, 63) else 5
+            self.cpu.state.a = kernal_err
+            self.memory.write(0x90, 0x00)  # clear ST — error is in A/carry
+            self.cpu.state.p |= 0x01       # carry set = error
+
         self._kernal_hook_rts_return()
         return True
 
@@ -1134,21 +1255,21 @@ class C64:
         """
         if not self.use_iec_bus:
             return
-        # Current accurate-disk mode is a KERNAL LOAD/SAVE stub unless full IEC is enabled.
-        # In stub mode, stepping four Python 1541 CPUs every host quantum destroys throughput.
-        if not getattr(self, "_iec_disk_full_impl", False):
-            return
         n = max(1, int(host_cycles))
         for d in self.iec_drives.values():
             d.step(n)
 
-    def run_cpu_instruction_quantum(self, cycles_before: int) -> int:
+    def run_cpu_instruction_quantum(
+        self, cycles_before: int, max_cycles: Optional[int] = None
+    ) -> int:
         """Run one logical CPU step: KERNAL disk hooks, then batch or :meth:`CPU6502.step`."""
         if self._handle_kernal_load():
             return 0
         if self._handle_kernal_save():
             return 0
-        return self.cpu.cpu_step_quantum(self.udp_debug, self.vice_trace, cycles_before)
+        return self.cpu.cpu_step_quantum(
+            self.udp_debug, self.vice_trace, cycles_before, max_cycles
+        )
 
     def _screen_update_worker(self) -> None:
         """Worker to update screen at ~60Hz (NTSC C64 rate)."""
@@ -1175,7 +1296,10 @@ class C64:
         """Run the emulator"""
         self.running = True
         self.reset_speed_throttle()
-        cycles = 0
+        # Resume absolute cycle count from the current state. Fresh runs have
+        # current_cycles == 0, so this is a no-op; snapshot loads keep moving
+        # forward from the restored cycle count and --max-cycles stays absolute.
+        cycles = int(self.current_cycles)
         last_pc = None
         stuck_count = 0
         pc_history = []  # Track recent PCs for debugging
@@ -1238,6 +1362,19 @@ class C64:
                             self.interface.add_debug_log(f"❌ Failed to attach disk: {e}")
                         self.disk_image_path = None  # Clear path even on error
 
+            # Auto-spawned drive: disk is already in the remote process;
+            # just inject LOAD"$",8 after BASIC boot to list the directory.
+            if (hasattr(self, '_auto_spawned_drive_device')
+                    and not hasattr(self, '_auto_spawned_dir_injected')
+                    and cycles > BASIC_BOOT_CYCLES):
+                device = self._auto_spawned_drive_device
+                self._inject_load_directory_command(device=device)
+                self._auto_spawned_dir_injected = True
+                if self.interface:
+                    self.interface.add_debug_log(
+                        f"💾 Auto-spawned drive {device}: injected LOAD\"$\",{device}"
+                    )
+
             cmd_queue = self._monitor_cmd_queue
             if cmd_queue is not None:
                 try:
@@ -1253,7 +1390,7 @@ class C64:
                 except queue.Empty:
                     pass
 
-            step_cycles = self.run_cpu_instruction_quantum(cycles)
+            step_cycles = self.run_cpu_instruction_quantum(cycles, max_cycles)
             reply_queue = self._monitor_reply_queue
             if reply_queue is not None and self._monitor_pending_step_ack:
                 self._monitor_pending_step_ack = False
@@ -1274,6 +1411,7 @@ class C64:
             self._process_scheduled_inject_keys(
                 cycles, time.perf_counter() - inject_wall_t0
             )
+            self._service_snapshot_requests()
             self.throttle_emulation_if_needed(cycles)
 
             # Check if we've reached max cycles
@@ -1299,10 +1437,13 @@ class C64:
             # Detect if we're stuck (but ignore if CPU is stopped - that's expected)
             if self.cpu.state.stopped:
                 # CPU is stopped (KIL instruction) - this is expected, just break
+                debug_msg = f"PC stuck at ${self.cpu.state.pc:04X} (KIL instruction) - stopping"
                 if self.debug:
-                    debug_msg = f"🛑 CPU stopped at PC=${self.cpu.state.pc:04X} (KIL instruction)"
+                    debug_msg_full = f"🛑 CPU stopped at PC=${self.cpu.state.pc:04X} (KIL instruction)"
                     if self.rich_interface:
-                        self.rich_interface.add_debug_log(debug_msg)
+                        self.rich_interface.add_debug_log(debug_msg_full)
+                # Always print to stdout for consistency with Textual mode
+                print(debug_msg, flush=True)
                 break
             elif self.cpu.state.pc == last_pc:
                 # Check if we're in a graphics mode wait loop
@@ -1333,12 +1474,15 @@ class C64:
                         stuck_count += 1
                     
                     if stuck_count > 1000:
+                        debug_msg1 = f"PC stuck at ${self.cpu.state.pc:04X} for {stuck_count} steps - stopping"
                         if self.debug:
-                            debug_msg1 = f"⚠️ PC stuck at ${self.cpu.state.pc:04X} (opcode ${opcode:02X}) for {stuck_count} steps"
                             debug_msg2 = "  This usually means an opcode is not implemented or not advancing PC correctly"
-                            if self.rich_interface:
-                                self.rich_interface.add_debug_log(debug_msg1)
+                        if self.rich_interface:
+                            self.rich_interface.add_debug_log(debug_msg1)
+                            if self.debug:
                                 self.rich_interface.add_debug_log(debug_msg2)
+                        # Always print stuck message to stdout
+                        print(debug_msg1, flush=True)
                         # Don't try to advance - this masks the real problem
                         # Instead, stop execution to prevent infinite loops
                         self.running = False
@@ -1466,6 +1610,28 @@ class C64:
 
         # Final screen update
         self._update_text_screen()
+
+        self.service_exit_snapshot(stop_reason)
+
+    def service_exit_snapshot(self, stop_reason: str = "unknown") -> None:
+        """Write the ``--save-snapshot-at-exit`` file if one was requested.
+
+        Safe to call multiple times; second call is a no-op once the
+        ``_snapshot_at_exit`` slot has been consumed. Called by every run
+        loop that can stop the emulator (CPU KIL, stuck-PC detection,
+        max-cycles, autoquit), so the snapshot is produced regardless of
+        which UI path (``C64.run()``, ``GraphicsUI``, ``RichUI``) is
+        driving the CPU thread.
+        """
+        at_exit = getattr(self, "_snapshot_at_exit", None)
+        if at_exit is None:
+            return
+        path, note = at_exit
+        self._snapshot_at_exit = None
+        try:
+            self.save_snapshot(path, note=note or f"at_exit reason={stop_reason}")
+        except Exception as exc:
+            print(f"❌ Exit snapshot failed: {exc}", flush=True)
 
     def _petscii_to_screen_code(self, petscii_char: int) -> int:
         """Convert PETSCII character to C64 screen code"""

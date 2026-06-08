@@ -16,6 +16,13 @@ class CPUState:
     p: int = 0x04  # Processor status (I=4 flag set by default on reset, like JSC64)
     cycles: int = 0
     stopped: bool = False
+    # Canonical 6502 CLI/SEI/PLP 1-instruction IRQ-poll delay. The flag is set
+    # by those opcodes AFTER updating ``p``; the *next* post-instruction IRQ
+    # poll uses :attr:`pre_i_flag` (the value effective *before* the
+    # instruction touched the I bit) and then clears the flag. See
+    # ``test/test_cli_irq_delay.py`` for the canonical regression cases.
+    cli_sei_delay: bool = False
+    pre_i_flag: int = 0
 
 
 @dataclass

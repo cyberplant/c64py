@@ -1,0 +1,21 @@
+.git
+.github
+.windsurf
+.cursor
+.venv
+.newenv
+rust/target
+target
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+test_results
+vic_matrix_snapshots
+snapshots
+out
+logs
+.c64py_ram_cache
+*.snap
+
+# Dev-only TOML (accurate-rust / per-cycle defaults); use --config mount at runtime.
+c64py.toml

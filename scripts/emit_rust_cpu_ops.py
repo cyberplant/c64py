@@ -81,6 +81,8 @@ def xlat_block(body: str) -> str:
         s = re.sub(r"self\.state\.sp", "cpu.sp", s)
         s = re.sub(r"self\.state\.p", "cpu.p", s)
         s = re.sub(r"self\.state\.stopped", "cpu.stopped", s)
+        s = re.sub(r"self\.state\.cli_sei_delay", "cpu.cli_sei_delay", s)
+        s = re.sub(r"self\.state\.pre_i_flag", "cpu.pre_i_flag", s)
         s = re.sub(r"0x100 \+ cpu\.sp", "0x0100u16.wrapping_add(cpu.sp as u16)", s)
         s = re.sub(r"0x100\+cpu\.sp", "0x0100u16.wrapping_add(cpu.sp as u16)", s)
         s = re.sub(r"self\._mr\(", "mr(mem, cpu, ", s)
@@ -219,11 +221,13 @@ METHODS = [
         "_sta_indy",
         "_stx_zp",
         "_stx_abs",
+        "_stx_zpy",
         "_sty_zp",
         "_sty_abs",
         "_sty_zpx",
         "_adc_imm",
         "_adc_zp",
+        "_adc_zpx",
         "_adc_indx",
         "_adc_indy",
         "_adc_abs",
@@ -234,16 +238,24 @@ METHODS = [
         "_sbc_abs",
         "_and_imm",
         "_and_zp",
+        "_and_zpx",
+        "_and_indx",
+        "_and_indy",
         "_and_abs",
         "_and_absx",
         "_and_absy",
         "_ora_imm",
         "_ora_zp",
+        "_ora_zpx",
+        "_ora_indx",
+        "_ora_indy",
         "_ora_abs",
         "_ora_absy",
         "_ora_absx",
         "_eor_imm",
         "_eor_zp",
+        "_eor_zpx",
+        "_eor_indx",
         "_eor_abs",
         "_eor_absx",
         "_eor_absy",
@@ -278,6 +290,7 @@ METHODS = [
         "_lsr_zpx",
         "_rol_acc",
         "_rol_zp",
+        "_rol_zpx",
         "_rol_abs",
         "_rol_absx",
         "_ror_acc",

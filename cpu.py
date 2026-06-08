@@ -7,14 +7,14 @@ from __future__ import annotations
 import os
 import sys
 
-from typing import Optional, TYPE_CHECKING, Sequence, Union
+from typing import List, Optional, TYPE_CHECKING, Sequence, Union
 
 from .vicii_cycle import ViciiCycleEngine
 
 try:
-    from .debug import OPCODE_SIZES
+    from .debug import OPCODE_SIZES, ViceTraceLogger
 except ImportError:
-    from debug import OPCODE_SIZES
+    from debug import OPCODE_SIZES, ViceTraceLogger
 
 from .constants import (
     SCREEN_MEM,
@@ -103,6 +103,7 @@ class CPU6502:
         self.vic = ViciiCycleEngine()
         # Last (D011, D012, D015) shadow tuple applied to ViciiCycleEngine (hot path).
         self._vic_shadow_tuple: Optional[tuple[int, int, int]] = None
+        self._vic_sprite_shadow_tuple: Optional[tuple[int, ...]] = None
         self.apply_video_standard_geometry()
 
     def apply_video_standard_geometry(self) -> None:
@@ -128,13 +129,22 @@ class CPU6502:
     def _vic_sync_engine_shadow_regs(self) -> None:
         """Apply MemoryMap VIC shadow regs to ViciiCycleEngine only when they change."""
         t = self.memory.vic_stored_regs_d011_d012_d015()
-        if t == self._vic_shadow_tuple:
-            return
-        self._vic_shadow_tuple = t
-        r11, r12, sp = t
-        self.vic.set_d011(r11, 0)
-        self.vic.set_d012(r12)
-        self.vic.sprite_enable_mask = sp
+        if t != self._vic_shadow_tuple:
+            self._vic_shadow_tuple = t
+            r11, r12, sp = t
+            self.vic.set_d011(r11, 0)
+            self.vic.set_d012(r12)
+            self.vic.sprite_enable_mask = sp
+        # Sprite state (Y positions + $D017) feeds the VICE-style sprite_dma
+        # state machine. Sync lazily via tuple comparison to stay O(1) on the
+        # hot path.
+        st = self.memory.vic_stored_sprite_state()
+        if st != self._vic_sprite_shadow_tuple:
+            self._vic_sprite_shadow_tuple = st
+            self.vic.sprite_y_expand_mask = st[0]
+            ys = self.vic.sprite_y
+            ys[0] = st[1]; ys[1] = st[2]; ys[2] = st[3]; ys[3] = st[4]
+            ys[4] = st[5]; ys[5] = st[6]; ys[6] = st[7]; ys[7] = st[8]
 
     def _advance_raster(self, cycles: int) -> None:
         """Coarse raster advance used by fast VIC mode."""
@@ -142,10 +152,15 @@ class CPU6502:
         cycles_per_line = 63 if self.memory.video_standard == "pal" else 65
         step_cycles = max(1, cycles)
         self.memory.raster_cycles += step_cycles
+        # Compute raster IRQ compare line from stored VIC registers
+        raster_irq_line = (self.memory._vic_regs[0x12] & 0xFF) | ((self.memory._vic_regs[0x11] & 0x80) << 1)
         while self.memory.raster_cycles >= cycles_per_line:
             self.memory.raster_cycles -= cycles_per_line
             self.memory.raster_line = (self.memory.raster_line + 1) % raster_max
             self.memory.beam_capture_raster_line(self.memory.raster_line)
+            # Trigger raster IRQ when line advances to the compare line
+            if self.memory.raster_line == raster_irq_line:
+                self.memory.trigger_vic_irq(0x01)
             if self.memory.raster_line == 0 and self.memory.vic_snapshot_each_emulated_frame:
                 self.memory.snapshot_vic_render_state()
 
@@ -410,6 +425,29 @@ class CPU6502:
         self.state.a = r
         self._update_flags(self.state.a)
 
+    def _irq_should_dispatch(self) -> bool:
+        """Post-instruction IRQ poll with canonical CLI/SEI/PLP 1-cycle delay.
+
+        Real 6502 polls the IRQ line **during** each instruction (around the
+        penultimate cycle). CLI/SEI/PLP modify the I flag in their *last*
+        cycle, so the poll that happens inside those instructions still uses
+        the *old* I value. Net effect: the flag change is observable by IRQ
+        logic only on the following instruction.
+
+        We approximate this at instruction granularity: when an opcode has
+        set :attr:`CPUState.cli_sei_delay`, the next poll uses
+        :attr:`CPUState.pre_i_flag` (the I bit as it was *before* the
+        opcode) and then consumes the delay. Critical for raster-IRQ
+        dispatch where games place a CLI immediately before a $D012
+        write to a value the beam has just passed.
+        """
+        if self.state.cli_sei_delay:
+            i_masked = (self.state.pre_i_flag & 0x04) != 0
+            self.state.cli_sei_delay = False
+        else:
+            i_masked = (self.state.p & 0x04) != 0
+        return self.memory.pending_irq and not i_masked
+
     def _advance_time(self, cycles: int, udp_debug: Optional['UdpDebugLogger'] = None) -> None:
         """Advance timers/video/IRQs even if CPU is 'blocked'."""
         if self.accurate_vic:
@@ -425,8 +463,7 @@ class CPU6502:
             self._advance_raster(cycles)
         self.memory.recompute_pending_irq()
 
-        # Check for pending IRQ (only if interrupts are enabled)
-        if self.memory.pending_irq and not self._get_flag(0x04):  # I flag clear
+        if self._irq_should_dispatch():
             self._handle_irq()  # Let KERNAL handle IRQ (cursor blink, keyboard, etc.)
 
     def _step_cycles(self, cycles: int) -> None:
@@ -443,7 +480,7 @@ class CPU6502:
             self._update_cia_timers(cycles)
             self._advance_raster(cycles)
         self.memory.recompute_pending_irq()
-        if self.memory.pending_irq and not self._get_flag(0x04):
+        if self._irq_should_dispatch():
             self._handle_irq()
 
     def _maybe_apply_debug_inject(self) -> None:
@@ -519,7 +556,28 @@ class CPU6502:
             cursor_addr = SCREEN_MEM
         else:
             if SCREEN_MEM <= cursor_addr < SCREEN_MEM + 1000:
-                self.memory.write(cursor_addr, char)
+                # Convert PETSCII to C64 screen code before storing in screen RAM.
+                # Standard mapping (matches KERNAL BSOUT at $E716):
+                #   $20-$3F → $20-$3F  (space, punctuation, digits — identity)
+                #   $40-$5F → $00-$1F  (@, A-Z, [\]↑← — subtract $40)
+                #   $60-$7F → $40-$5F  (subtract $20)
+                #   $A0-$BF → $60-$7F  (subtract $40)
+                #   $C0-$FE → $80-$BE  (subtract $40)
+                #   $FF     → $5E
+                c = char & 0xFF
+                if 0x40 <= c <= 0x5F:
+                    screen_code = c - 0x40
+                elif 0x60 <= c <= 0x7F:
+                    screen_code = c - 0x20
+                elif 0xA0 <= c <= 0xBF:
+                    screen_code = c - 0x40
+                elif 0xC0 <= c <= 0xFE:
+                    screen_code = c - 0x40
+                elif c == 0xFF:
+                    screen_code = 0x5E
+                else:
+                    screen_code = c
+                self.memory.write(cursor_addr, screen_code)
                 current_color = self.memory.read(0x0286) & 0x0F
                 self.memory.write(COLOR_MEM + (cursor_addr - SCREEN_MEM), current_color)
                 cursor_addr += 1
@@ -544,6 +602,7 @@ class CPU6502:
         if self.state.stopped:
             # If CPU is stopped (KIL), don't execute anything
             # Return 1 cycle to prevent infinite loops in the run loop
+            self._step_cycles(1)
             return 1
 
         self._maybe_apply_debug_inject()
@@ -611,12 +670,12 @@ class CPU6502:
             try:
                 self.memory.poke_vic(0x20, 0x0E)  # border
                 self.memory.poke_vic(0x21, 0x06)  # background
-                self.memory.poke_vic(0x18, 0x10)  # screen/charset layout
+                self.memory.poke_vic(0x18, 0x15)  # screen at $0400, chars at char ROM ($1000)
             except Exception:
                 # If VIC helpers aren't available for some reason, fall back to I/O writes.
                 self.memory.write(0xD020, 0x0E)
                 self.memory.write(0xD021, 0x06)
-                self.memory.write(0xD018, 0x10)
+                self.memory.write(0xD018, 0x15)
 
             # Current text/cursor color (POKE 646 and cursor color)
             self.memory.write(0x0286, 0x0E)
@@ -642,6 +701,7 @@ class CPU6502:
             # Simulate CINT completing by setting PC to FCFE, adjust stack
             self.state.pc = 0xFCFE  # Return to CLI instruction
             self.state.sp += 2  # Pop the return address from stack
+            self._step_cycles(1)
             return 1  # Minimal cycles
 
 
@@ -780,6 +840,7 @@ class CPU6502:
                     })
                 # Don't jump to $0000 - instead stop CPU or use a safe address
                 self.state.stopped = True
+                self._step_cycles(20)
                 return 20
 
             if udp_debug and udp_debug.enabled:
@@ -789,6 +850,7 @@ class CPU6502:
                     'kb_buf_len': kb_buf_len
                 })
 
+            self._step_cycles(20)
             return 20  # Approximate cycles for CHRIN
 
         # CHROUT ($FFD2) - Output character to screen
@@ -841,6 +903,7 @@ class CPU6502:
                         'stack_high': pc_high
                     })
                 self.state.stopped = True
+                self._step_cycles(20)
                 return 20
 
             if udp_debug and udp_debug.enabled:
@@ -856,6 +919,7 @@ class CPU6502:
                     'pc': self.state.pc
                 })
 
+            self._step_cycles(20)
             return 20  # Approximate cycles for CHROUT
 
         # Pre-instruction state for bus-phase refinement (branches, indexed modes).
@@ -889,7 +953,7 @@ class CPU6502:
                         break
 
             self.memory.recompute_pending_irq()
-            if self.memory.pending_irq and not self._get_flag(0x04):
+            if self._irq_should_dispatch():
                 self._handle_irq()
             return elapsed
 
@@ -903,7 +967,7 @@ class CPU6502:
             self.memory.sid_tick_cpu_cycles(cycles)
             self._update_cia_timers(cycles, recompute_irq=False)
         self.memory.recompute_pending_irq()
-        if self.memory.pending_irq and not self._get_flag(0x04):
+        if self._irq_should_dispatch():
             # Coarse mode: follow historical behavior and service CIA-driven IRQ path.
             if self.memory.cia1_icr & 0x80:
                 self._handle_irq()
@@ -921,8 +985,7 @@ class CPU6502:
         hybrid_vic = self._rust_hybrid_vic_effective()
         if self.accurate_vic and not hybrid_vic:
             return False
-        if self.trace_enabled:
-            return False
+        # Note: trace_enabled no longer blocks Rust batch - Rust handles tracing internally
         if self._trace_sync_pc is not None:
             return False
         if self.debug_inject_at_cycle is not None or self.debug_inject_writes:
@@ -983,7 +1046,7 @@ class CPU6502:
         return self._python_only_stop_cache
 
     def step_fast_batch(
-        self, max_instructions: int, stop_pcs: Optional[Sequence[int]] = None
+        self, max_instructions: int, stop_pcs: Optional[Sequence[int]] = None, trace_path: Optional[str] = None
     ) -> tuple[int, int]:
         """Run up to ``max_instructions`` instructions.
 
@@ -1025,7 +1088,7 @@ class CPU6502:
             resid_lib_path = sid.find_resid_lib()
             use_rust_resid = bool(resid_ptr and resid_lib_path)
 
-        def _run_batch():
+        def _run_batch(trace_path: Optional[str] = None):
             return _core.run_fast_batch(
                 self.memory,
                 max_instructions=max_instructions,
@@ -1045,9 +1108,10 @@ class CPU6502:
                 vic_engine=self.vic if hybrid_vic else None,
                 resid_lib_path=resid_lib_path if use_rust_resid else None,
                 resid_ptr=resid_ptr if use_rust_resid else None,
+                trace_path=trace_path,
             )
 
-        ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped = _run_batch()
+        ins, cyc, opc, oa, ox, oy, osp, op, ocycles, ostopped = _run_batch(trace_path=trace_path)
         self.state.pc = opc
         self.state.a = oa
         self.state.x = ox
@@ -1060,21 +1124,64 @@ class CPU6502:
             self.memory.sid_tick_cpu_cycles(cyc)
         return ins, cyc
 
+    def _rust_vice_trace_path(self) -> Optional[str]:
+        p = os.environ.get("C64PY_RUST_VICE_TRACE", "").strip()
+        return p or None
+
+    def _ensure_rust_vice_trace_logger(self) -> Optional[ViceTraceLogger]:
+        path = self._rust_vice_trace_path()
+        if not path:
+            return None
+        lg: Optional[ViceTraceLogger] = getattr(self, "_rust_vice_trace_logger_obj", None)
+        if lg is None:
+            lg = ViceTraceLogger(path)
+            lg.enable()
+            self._rust_vice_trace_logger_obj = lg
+        return lg
+
+    def _fetch_instr_bytes_for_trace(self, pc: int) -> tuple[int, List[int]]:
+        """Opcode and operand bytes at *pc* before executing the instruction (for trace lines)."""
+        pc &= 0xFFFF
+        opcode = self.memory.read(pc)
+        size = OPCODE_SIZES.get(opcode, 1)
+        operand_bytes = [self.memory.read((pc + i) & 0xFFFF) for i in range(1, size)]
+        return opcode, operand_bytes
+
     def cpu_step_quantum(
         self,
         udp_debug: Optional['UdpDebugLogger'],
         vice_trace,
         current_cycles: int,
+        max_cycles: Optional[int] = None,
     ) -> int:
         """One logical instruction: Rust batch when safe, else :meth:`step`."""
         if udp_debug and udp_debug.enabled:
             return self.step(udp_debug, current_cycles, vice_trace)
-        if vice_trace and vice_trace.enabled:
-            return self.step(udp_debug, current_cycles, vice_trace)
+        # When vice_trace is enabled, use Rust batch with internal tracing (keeps batch performance)
+        # rather than falling back to Python step mode which kills performance.
         if (self.state.pc & 0xFFFF) in self._python_only_step_pcs():
             return self.step(udp_debug, current_cycles, vice_trace)
-        if not self._rust_fast_batch_usable():
+        # When full IEC + 1541 stepping is active we must run in lockstep with
+        # the Python interpreter so every $DD00 write is pushed to IECBus and
+        # the drive's VIA1 sees each bit-level edge. The Rust core only
+        # snapshots peer IEC state at batch start, so batching here would
+        # starve the drive mid-handshake. Disk operations are infrequent
+        # enough that the per-instruction overhead is acceptable for the
+        # opt-in accurate disk tier path.
+        if getattr(self.memory, "iec_disk_full_impl", False):
             return self.step(udp_debug, current_cycles, vice_trace)
+        if not self._rust_fast_batch_usable():
+            # Only fall back to Python step if Rust is truly unavailable
+            return self.step(udp_debug, current_cycles, vice_trace)
+        # Determine trace path: prefer --vice-trace FILE over C64PY_RUST_VICE_TRACE env var
+        # Note: we use the filename even if not yet enabled - Rust will write directly
+        rust_trace_path: Optional[str] = None
+        if vice_trace and vice_trace.filename:
+            rust_trace_path = vice_trace.filename
+        else:
+            rust_trace_path = self._rust_vice_trace_path()
+        
+
         try:
             batch_n = int(os.environ.get("C64PY_RUST_BATCH", "64"))
         except ValueError:
@@ -1082,8 +1189,22 @@ class CPU6502:
         batch_n = max(1, min(batch_n, 10_000))
         if getattr(self, "_monitor_force_single", False):
             batch_n = 1
+        # Avoid running a full Rust batch past max_cycles: that can overshoot by dozens of
+        # instructions vs Python, shifting IRQ/jiffy/stack (see vic snapshot diffs).
+        if max_cycles is not None:
+            remaining = max_cycles - int(current_cycles)
+            if remaining > 0:
+                # Worst-case cycles per opcode on the Rust path (no BA steals); keep a margin.
+                _worst = 8
+                cap = max(1, remaining // _worst)
+                batch_n = min(batch_n, cap)
+
         stops = self._rust_delegate_stop_pcs()
-        ins, cyc = self.step_fast_batch(batch_n, stop_pcs=stops)
+        # Flush Python's buffered trace writes before Rust appends to the same file,
+        # otherwise Python's deferred writes end up after Rust's entries.
+        if rust_trace_path and vice_trace and vice_trace.file:
+            vice_trace.file.flush()
+        ins, cyc = self.step_fast_batch(batch_n, stop_pcs=stops, trace_path=rust_trace_path)
         if ins == 0:
             return self.step(udp_debug, current_cycles, vice_trace)
         return cyc
@@ -1302,6 +1423,8 @@ class CPU6502:
             return self._stx_zp()
         elif opcode == 0x8E:  # STX abs
             return self._stx_abs()
+        elif opcode == 0x96:  # STX zp,Y
+            return self._stx_zpy()
         elif opcode == 0x84:  # STY zp
             return self._sty_zp()
         elif opcode == 0x8C:  # STY abs
@@ -1340,6 +1463,8 @@ class CPU6502:
             return self._adc_indx()
         elif opcode == 0x65:  # ADC zp
             return self._adc_zp()
+        elif opcode == 0x75:  # ADC zp,X
+            return self._adc_zpx()
         elif opcode == 0x6D:  # ADC abs
             return self._adc_abs()
         elif opcode == 0x79:  # ADC abs,Y
@@ -1425,32 +1550,48 @@ class CPU6502:
             return self._and_imm()
         elif opcode == 0x25:  # AND zp
             return self._and_zp()
+        elif opcode == 0x35:  # AND zp,X
+            return self._and_zpx()
         elif opcode == 0x2D:  # AND abs
             return self._and_abs()
         elif opcode == 0x3D:  # AND abs,X
             return self._and_absx()
         elif opcode == 0x39:  # AND abs,Y
             return self._and_absy()
+        elif opcode == 0x21:  # AND (zp,X)
+            return self._and_indx()
+        elif opcode == 0x31:  # AND (zp),Y
+            return self._and_indy()
         elif opcode == 0x09:  # ORA imm
             return self._ora_imm()
         elif opcode == 0x05:  # ORA zp
             return self._ora_zp()
+        elif opcode == 0x15:  # ORA zp,X
+            return self._ora_zpx()
         elif opcode == 0x0D:  # ORA abs
             return self._ora_abs()
         elif opcode == 0x1D:  # ORA abs,X
             return self._ora_absx()
         elif opcode == 0x19:  # ORA abs,Y
             return self._ora_absy()
+        elif opcode == 0x01:  # ORA (zp,X)
+            return self._ora_indx()
+        elif opcode == 0x11:  # ORA (zp),Y
+            return self._ora_indy()
         elif opcode == 0x49:  # EOR imm
             return self._eor_imm()
         elif opcode == 0x45:  # EOR zp
             return self._eor_zp()
+        elif opcode == 0x55:  # EOR zp,X
+            return self._eor_zpx()
         elif opcode == 0x4D:  # EOR abs
             return self._eor_abs()
         elif opcode == 0x5D:  # EOR abs,X
             return self._eor_absx()
         elif opcode == 0x59:  # EOR abs,Y
             return self._eor_absy()
+        elif opcode == 0x41:  # EOR (zp,X)
+            return self._eor_indx()
         elif opcode == 0x51:  # EOR (zp),Y
             return self._eor_indy()
 
@@ -1585,6 +1726,8 @@ class CPU6502:
             return self._rol_acc()
         elif opcode == 0x26:  # ROL zp
             return self._rol_zp()
+        elif opcode == 0x36:  # ROL zp,X
+            return self._rol_zpx()
         elif opcode == 0x2E:  # ROL abs
             return self._rol_abs()
         elif opcode == 0x3E:  # ROL abs,X
@@ -1735,12 +1878,21 @@ class CPU6502:
             self.state.pc = (self.state.pc + 1) & 0xFFFF
             return 2
         elif opcode == 0x58:  # CLI
-            # Enable interrupts - if there's a pending IRQ, it will trigger on next cycle
+            # Canonical 6502: clearing I takes effect at end of CLI, but the
+            # IRQ poll inside CLI still uses the old I=1 value — a pending IRQ
+            # is dispatched only AFTER the following instruction completes.
+            self.state.pre_i_flag = self.state.p & 0x04
             self._set_flag(0x04, False)
+            self.state.cli_sei_delay = True
             self.state.pc = (self.state.pc + 1) & 0xFFFF
             return 2
         elif opcode == 0x78:  # SEI
+            # Canonical 6502: setting I takes effect at end of SEI. An IRQ
+            # pending when SEI began is still serviced on the next
+            # instruction boundary (a.k.a. the "SEI delay" behavior).
+            self.state.pre_i_flag = self.state.p & 0x04
             self._set_flag(0x04, True)
+            self.state.cli_sei_delay = True
             self.state.pc = (self.state.pc + 1) & 0xFFFF
             return 2
         elif opcode == 0xD8:  # CLD
@@ -2034,6 +2186,13 @@ class CPU6502:
         self.state.pc = (self.state.pc + 3) & 0xFFFF
         return 4
 
+    def _stx_zpy(self) -> int:
+        """STX zero page,Y — opcode $96 (documented)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.y) & 0xFF
+        self._mw(zp_addr, self.state.x)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 4
+
     def _sty_zp(self) -> int:
         zp_addr = self._mr(self.state.pc + 1)
         self._mw(zp_addr, self.state.y)
@@ -2072,6 +2231,17 @@ class CPU6502:
         self._adc_finish(old_a, value, result)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
+
+    def _adc_zpx(self) -> int:
+        """ADC zero page,X — opcode $75 (documented)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        value = self._mr(zp_addr)
+        old_a = self.state.a
+        carry = 1 if self._get_flag(0x01) else 0
+        result = old_a + value + carry
+        self._adc_finish(old_a, value, result)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 4
 
     def _adc_indx(self) -> int:
         """ADC ($zp,X) — indexed indirect"""
@@ -2186,6 +2356,37 @@ class CPU6502:
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
+    def _and_zpx(self) -> int:
+        """AND zero page,X — opcode $35 (documented)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self.state.a &= self._mr(zp_addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 4
+
+    def _and_indx(self) -> int:
+        """AND ($zp,X) — opcode $21 (documented, indexed indirect)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        addr_low = self._mr(zp_addr)
+        addr_high = self._mr((zp_addr + 1) & 0xFF)
+        addr = addr_low | (addr_high << 8)
+        self.state.a &= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6
+
+    def _and_indy(self) -> int:
+        """AND ($zp),Y — opcode $31 (documented, indirect indexed, +1 if page cross)."""
+        zp_ptr = self._mr(self.state.pc + 1)
+        addr_low = self._mr(zp_ptr)
+        addr_high = self._mr((zp_ptr + 1) & 0xFF)
+        base = addr_low | (addr_high << 8)
+        addr = (base + self.state.y) & 0xFFFF
+        self.state.a &= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6 if self._page_crossed(base, self.state.y) else 5
+
     def _and_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
         self.state.a &= self._mr(addr)
@@ -2222,6 +2423,37 @@ class CPU6502:
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
 
+    def _ora_zpx(self) -> int:
+        """ORA zero page,X — opcode $15 (documented)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self.state.a |= self._mr(zp_addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 4
+
+    def _ora_indx(self) -> int:
+        """ORA ($zp,X) — opcode $01 (documented, indexed indirect)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        addr_low = self._mr(zp_addr)
+        addr_high = self._mr((zp_addr + 1) & 0xFF)
+        addr = addr_low | (addr_high << 8)
+        self.state.a |= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6
+
+    def _ora_indy(self) -> int:
+        """ORA ($zp),Y — opcode $11 (documented, indirect indexed, +1 if page cross)."""
+        zp_ptr = self._mr(self.state.pc + 1)
+        addr_low = self._mr(zp_ptr)
+        addr_high = self._mr((zp_ptr + 1) & 0xFF)
+        base = addr_low | (addr_high << 8)
+        addr = (base + self.state.y) & 0xFFFF
+        self.state.a |= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6 if self._page_crossed(base, self.state.y) else 5
+
     def _ora_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
         self.state.a |= self._mr(addr)
@@ -2257,6 +2489,25 @@ class CPU6502:
         self._update_flags(self.state.a)
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 3
+
+    def _eor_zpx(self) -> int:
+        """EOR zero page,X — opcode $55 (documented)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        self.state.a ^= self._mr(zp_addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 4
+
+    def _eor_indx(self) -> int:
+        """EOR ($zp,X) — opcode $41 (documented, indexed indirect)."""
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        addr_low = self._mr(zp_addr)
+        addr_high = self._mr((zp_addr + 1) & 0xFF)
+        addr = addr_low | (addr_high << 8)
+        self.state.a ^= self._mr(addr)
+        self._update_flags(self.state.a)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6
 
     def _eor_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
@@ -2580,6 +2831,18 @@ class CPU6502:
         self.state.pc = (self.state.pc + 2) & 0xFFFF
         return 5
 
+    def _rol_zpx(self) -> int:
+        zp_addr = (self._mr(self.state.pc + 1) + self.state.x) & 0xFF
+        value = self._mr(zp_addr)
+        carry = 1 if self._get_flag(0x01) else 0
+        new_carry = (value & 0x80) != 0
+        value = ((value << 1) | carry) & 0xFF
+        self._mw(zp_addr, value)
+        self._set_flag(0x01, new_carry)
+        self._update_flags(value)
+        self.state.pc = (self.state.pc + 2) & 0xFFFF
+        return 6
+
     def _rol_abs(self) -> int:
         addr = self._read_word(self.state.pc + 1)
         value = self._mr(addr)
@@ -2740,9 +3003,15 @@ class CPU6502:
         return 3
 
     def _plp(self) -> int:
+        # Like CLI/SEI, PLP's I-flag update has a one-instruction IRQ-poll
+        # delay: the poll that runs at the end of PLP uses the I value
+        # EFFECTIVE BEFORE the pull, so a pending IRQ unmasked by PLP is
+        # dispatched only after the following instruction.
+        self.state.pre_i_flag = self.state.p & 0x04
         self.state.sp = (self.state.sp + 1) & 0xFF
         # Full P from stack (incl. B and bit 5); matches VICE trace NV-BDIZC after PLP/RTI.
         self.state.p = self._mr(0x100 + self.state.sp) & 0xFF
+        self.state.cli_sei_delay = True
         self.state.pc = (self.state.pc + 1) & 0xFFFF
         return 4
 

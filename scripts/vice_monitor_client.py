@@ -189,7 +189,8 @@ def build_setup_commands(setup: str, watch_mode: str) -> list[str]:
             "watch store 002f 0030",
             "watch store c200 c3ff",
         ],
-        # Bruce Lee–style: first $E5F0 hit is often $0849; second is $00FA (STA ($2D),Y).
+        # Loader-style watchpoint: first $E5F0 hit is often the inner copy; second is the
+        # outer STA ($2D),Y at $00FA. Useful for skipping the first noise hit.
         "e5f0_second": ["delete", "watch store e5f0 e5f0"],
     }
     commands = list(presets[watch_mode])
@@ -703,8 +704,8 @@ def main() -> None:
     )
     ap.add_argument(
         "--x64sc-prg",
-        default="programs/BruceLee.prg",
-        help="PRG passed to x64sc -autostart (default: programs/BruceLee.prg).",
+        default=None,
+        help="PRG passed to x64sc -autostart (required if not supplying a -8/disk argument via --x64sc-extra-args).",
     )
     ap.add_argument(
         "--x64sc-extra-args",

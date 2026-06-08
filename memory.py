@@ -60,6 +60,17 @@ class MemoryMap:
     joy_inject2_clear: int = 0
     joy_inject1_until: Optional[int] = None
     joy_inject2_until: Optional[int] = None
+    joy_held1_clear: int = 0
+    joy_held2_clear: int = 0
+    # CIA1 keyboard matrix model (8 rows x 8 cols). A bit set = key held in (row, col).
+    # Active-low semantics are applied at scan time, not in storage.
+    keyboard_matrix: bytearray = field(default_factory=lambda: bytearray(8))
+    # CIA1 PRA/PRB output latches and DDR direction registers ($DC00-$DC03).
+    # Defaults match KERNAL post-init: PRA = output (column drive), PRB = input (row read).
+    cia1_pra: int = 0xFF
+    cia1_prb: int = 0xFF
+    cia1_ddra: int = 0xFF
+    cia1_ddrb: int = 0x00
     # Instruction context for optional debug hooks (UDP, accurate-VIC bus phases).
     debug_last_pc: int = 0
     debug_last_cycles: int = 0
@@ -81,6 +92,8 @@ class MemoryMap:
     beam_cia2_flat: Optional[bytearray] = None
     # True after buffers are filled from current VIC shadow (avoids an all-black first frame).
     beam_snapshots_primed: bool = False
+    # Optional :class:`~c64py.iec_kernal_bridge.KernalIecTap` when TCP drives need KERNAL line tracing.
+    iec_kernal_tap: Optional[object] = field(default=None, repr=False)
     # Cached 6510 $01 effective value for MemoryMap.read() hot path (invalidated on $00/$01 writes).
     _port01_read_cache_valid: bool = field(default=False, init=False, repr=False)
     _port01_read_cache_value: int = field(default=0, init=False, repr=False)
@@ -145,6 +158,21 @@ class MemoryMap:
         """Single read of shadow bytes for ViciiCycleEngine (hot path; no composite bits)."""
         m = self._vic_regs
         return (m[0x11], m[0x12], m[0x15] & 0xFF)
+
+    def vic_stored_sprite_state(self) -> tuple[int, int, int, int, int, int, int, int, int]:
+        """Shadow-tuple of sprite state needed by the cycle engine (hot path).
+
+        Returns (y_expand_mask, y0, y1, y2, y3, y4, y5, y6, y7) — one byte each,
+        from $D017 and the 8 odd sprite-Y registers $D001..$D00F. Used by the
+        cycle engine to detect $D015/$D017/Y coordinate changes without
+        per-tick ``peek_vic`` calls.
+        """
+        m = self._vic_regs
+        return (
+            m[0x17] & 0xFF,
+            m[0x01], m[0x03], m[0x05], m[0x07],
+            m[0x09], m[0x0B], m[0x0D], m[0x0F],
+        )
 
     def poke_vic(self, reg: int, value: int) -> None:
         """Update VIC-II register state, bypassing 6510 banking.
@@ -388,6 +416,16 @@ class MemoryMap:
             return value
         elif reg == 0x1A:  # VIC interrupt enable register
             return self._vic_regs[0x1A] & 0x0F
+        elif reg == 0x1E:  # Sprite-sprite collision (cleared on read)
+            value = self._vic_regs[0x1E] if 0x1E < len(self._vic_regs) else 0
+            if 0x1E < len(self._vic_regs):
+                self._vic_regs[0x1E] = 0
+            return value
+        elif reg == 0x1F:  # Sprite-bg collision (cleared on read)
+            value = self._vic_regs[0x1F] if 0x1F < len(self._vic_regs) else 0
+            if 0x1F < len(self._vic_regs):
+                self._vic_regs[0x1F] = 0
+            return value
         elif reg == 0x20:  # Border color ($D020)
             return (self._vic_regs[0x20] if 0x20 < len(self._vic_regs) else 0x0E) & 0x0F  # Default light blue
         elif reg == 0x21:  # Background color 0 ($D021)
@@ -409,6 +447,8 @@ class MemoryMap:
             self._vic_regs[0x1A] = value & 0x0F
         elif reg == 0x12:  # Raster compare low byte
             self._vic_regs[0x12] = value & 0xFF
+            # Clear raster IRQ pending when compare line changes (real C64 resets edge detect).
+            self.vic_interrupt_state &= ~0x01
 
         self.recompute_pending_irq()
 
@@ -437,14 +477,113 @@ class MemoryMap:
                 until_cycle if prev is None else max(prev, until_cycle)
             )
 
+    def press_matrix_key(self, row: int, col: int) -> None:
+        """Hold a C64 key in the matrix (row 0..7, col 0..7)."""
+        if 0 <= row < 8 and 0 <= col < 8:
+            self.keyboard_matrix[row] |= (1 << col) & 0xFF
+
+    def release_matrix_key(self, row: int, col: int) -> None:
+        """Release a previously-held C64 key."""
+        if 0 <= row < 8 and 0 <= col < 8:
+            self.keyboard_matrix[row] &= (~(1 << col)) & 0xFF
+
+    def release_all_keys(self) -> None:
+        """Drop every held matrix key (e.g. on focus loss)."""
+        for i in range(8):
+            self.keyboard_matrix[i] = 0
+
+    def set_joystick_dir(self, port: int, mask: int) -> None:
+        """OR ``mask`` (5 bits: up/down/left/right/fire = 0x01/0x02/0x04/0x08/0x10)
+        into the held-while-pressed joystick clear-mask for ``port`` (1 or 2).
+        Hardware: joystick lines share the CIA1 matrix wires, so a held joystick
+        bit pulls the corresponding PRA (port 2) / PRB (port 1) bit low.
+        """
+        mask &= 0x1F
+        if port == 2:
+            self.joy_held2_clear |= mask
+        elif port == 1:
+            self.joy_held1_clear |= mask
+
+    def clear_joystick_dir(self, port: int, mask: int) -> None:
+        """Clear ``mask`` bits from the held-while-pressed joystick mask."""
+        mask &= 0x1F
+        if port == 2:
+            self.joy_held2_clear &= (~mask) & 0xFF
+        elif port == 1:
+            self.joy_held1_clear &= (~mask) & 0xFF
+
+    def release_all_joystick(self) -> None:
+        """Clear both held-joystick masks (e.g. on focus loss)."""
+        self.joy_held1_clear = 0
+        self.joy_held2_clear = 0
+
+    def _scan_keyboard(self) -> tuple:
+        """Compute (PRA, PRB) reads for the CIA1 keyboard/joystick matrix.
+
+        Convention (matches the C64 Programmer's Reference Guide and the
+        matrix table in ``docs/input_config_plan.md``): each held key has
+        coordinates ``(row, col)`` where ``row`` is the ``$DC00`` (PA) bit
+        the KERNAL drives low and ``col`` is the ``$DC01`` (PB) bit that
+        reads back low when that row is selected. ``keyboard_matrix[row]``
+        stores held columns as bits.
+
+        Active-low semantics: a held key in (row r, col c) shorts PA bit r
+        to PB bit c. Output bits read back the latch; input bits are pulled
+        high (1) unless a held key + a CPU-driven counterpart pulls them low.
+        Both standard scans (CPU drives PRA, reads PRB) and inverse scans
+        (CPU drives PRB, reads PRA) are honored.
+        """
+        pra_lat = self.cia1_pra & 0xFF
+        prb_lat = self.cia1_prb & 0xFF
+        ddra = self.cia1_ddra & 0xFF
+        ddrb = self.cia1_ddrb & 0xFF
+        # Bits the CPU is driving low on each port (output direction + 0 latch).
+        pa_drive_low = (~pra_lat) & ddra & 0xFF  # rows the CPU selects
+        pb_drive_low = (~prb_lat) & ddrb & 0xFF  # cols the CPU selects (inverse)
+        pra_pull_low = 0
+        prb_pull_low = 0
+        for r in range(8):
+            held = self.keyboard_matrix[r]
+            if not held:
+                continue
+            # Standard scan: CPU drives PA bit r low → every held col in row r
+            # gets pulled low on PB.
+            if pa_drive_low & (1 << r):
+                prb_pull_low |= held
+            # Inverse scan: CPU drives PB bit c low → if row r holds col c, PA
+            # bit r is pulled low.
+            if held & pb_drive_low:
+                pra_pull_low |= (1 << r)
+        # Output bits read latch; input bits read high unless pulled low above.
+        pra_input_high = (~ddra) & 0xFF
+        prb_input_high = (~ddrb) & 0xFF
+        pra = ((pra_lat & ddra) | (pra_input_high & ((~pra_pull_low) & 0xFF))) & 0xFF
+        prb = ((prb_lat & ddrb) | (prb_input_high & ((~prb_pull_low) & 0xFF))) & 0xFF
+        # Joystick lines share the matrix wires; --inject-keys masks pull bits low.
+        # Joystick lines share the matrix wires; --inject-keys masks pull bits
+        # low (time-windowed); host-key joystick mappings (item C) layer on top.
+        pra &= (~self.joy_inject2_clear) & 0xFF
+        prb &= (~self.joy_inject1_clear) & 0xFF
+        pra &= (~self.joy_held2_clear) & 0xFF
+        prb &= (~self.joy_held1_clear) & 0xFF
+        return pra, prb
+
     def _read_cia1(self, reg: int) -> int:
         """Read CIA1 register"""
-        # Port A (directly connected to keyboard columns and joystick 2)
+        # Port A (keyboard columns + joystick port 2)
         if reg == 0x00:
-            return 0xFF & ~self.joy_inject2_clear
-        # Port B (keyboard rows and joystick 1)
+            pra, _ = self._scan_keyboard()
+            return pra
+        # Port B (keyboard rows + joystick port 1)
         elif reg == 0x01:
-            return 0xFF & ~self.joy_inject1_clear
+            _, prb = self._scan_keyboard()
+            return prb
+        # Data direction A
+        elif reg == 0x02:
+            return self.cia1_ddra & 0xFF
+        # Data direction B
+        elif reg == 0x03:
+            return self.cia1_ddrb & 0xFF
         # Timer A low byte
         elif reg == 0x04:
             return self.cia1_timer_a.counter & 0xFF
@@ -489,6 +628,23 @@ class MemoryMap:
 
     def _write_cia1(self, reg: int, value: int) -> None:
         """Write CIA1 register"""
+        value &= 0xFF
+        # Port A latch (keyboard column drive / joystick 2)
+        if reg == 0x00:
+            self.cia1_pra = value
+            return
+        # Port B latch (keyboard row drive / joystick 1)
+        if reg == 0x01:
+            self.cia1_prb = value
+            return
+        # Data direction A
+        if reg == 0x02:
+            self.cia1_ddra = value
+            return
+        # Data direction B
+        if reg == 0x03:
+            self.cia1_ddrb = value
+            return
         # Timer A latch low byte
         if reg == 0x04:
             self.cia1_timer_a.latch = (self.cia1_timer_a.latch & 0xFF00) | value
@@ -550,14 +706,24 @@ class MemoryMap:
             self.cia1_timer_b.input_mode = (value >> 5) & 0x03
 
     def apply_cia2_port_a_to_iec_bus(self) -> None:
-        """Apply current ``cia2_pra`` to the IEC bus (same as a write to CIA2 port A)."""
+        """Apply current ``cia2_pra`` to the IEC bus (same as a write to CIA2 port A).
+        
+        CIA2 PRA output bits (real C64 wiring):
+          bit 3 = ATN OUT  (1 → pull ATN low)
+          bit 4 = CLOCK OUT (1 → pull CLOCK low)
+          bit 5 = DATA OUT  (1 → pull DATA low)
+        IECBus line state convention: ``True`` = released/high, ``False`` = asserted/low.
+        """
         if self.iec_bus is None:
             return
         v = self.cia2_pra & 0xFF
-        atn_state = (v & 0x08) != 0
-        self.iec_bus.set_atn(atn_state)
-        self.iec_bus.set_clk("c64", (v & 0x10) != 0)
-        self.iec_bus.set_data("c64", (v & 0x20) != 0)
+        # Invert: bit set on CIA2 means "pull low" → bus state False.
+        self.iec_bus.set_atn((v & 0x08) == 0)
+        self.iec_bus.set_clk("c64", (v & 0x10) == 0)
+        self.iec_bus.set_data("c64", (v & 0x20) == 0)
+        tap = self.iec_kernal_tap
+        if tap is not None:
+            tap.after_cia2_applied(self)
 
     def ensure_beam_buffers(self) -> None:
         """Allocate per-line VIC/CIA2 snapshot arrays for the current video standard."""
@@ -626,13 +792,16 @@ class MemoryMap:
             result = self.cia2_pra
             # If IEC bus is attached, read actual bus state
             if self.iec_bus is not None:
-                # Bits 6-7 are inputs (CLK IN, DATA IN)
-                # Clear input bits
+                # Bits 6-7 are direct inputs (CLK IN, DATA IN). The 7406
+                # inverters on the serial interface drive only the output
+                # lines (PA3/PA4/PA5). The input lines PA6/PA7 reach CIA2
+                # directly from the bus connector:
+                #   bit set (=1) → line is HIGH (released)
+                #   bit clear (=0) → line is LOW (asserted)
                 result &= 0x3F
-                # Set based on actual bus state
-                if self.iec_bus.clk:  # CLK released (high)
+                if self.iec_bus.clk:   # CLK high (released)
                     result |= 0x40
-                if self.iec_bus.data:  # DATA released (high)
+                if self.iec_bus.data:  # DATA high (released)
                     result |= 0x80
             return result
         elif reg == 0x02:  # Data direction register A

@@ -40,6 +40,10 @@ fn rust_core_version() -> &'static str {
     pending_irq,
     cia1_icr,
     cia2_pra, cia2_ddra,
+    cia1_pra, cia1_prb, cia1_ddra, cia1_ddrb,
+    kbd_matrix,
+    joy_inject1_clear, joy_inject2_clear,
+    joy_held1_clear, joy_held2_clear,
     ta_latch, ta_counter, ta_running, ta_irq_en, ta_oneshot, ta_input,
     tb_latch, tb_counter, tb_running, tb_irq_en,     tb_oneshot, tb_input,
     basic_rom=None, kernal_rom=None, char_rom=None, stop_pcs=None,
@@ -48,10 +52,15 @@ fn rust_core_version() -> &'static str {
     v_ysmooth=0, v_den=false, v_raster_irq_line=0, v_raster_irq_triggered=false,
     v_prefetch_cycles=0, v_first_dma_line=48, v_last_dma_line=247,
     v_sprite_enable_mask=0,     v_cycles_per_line=63, v_num_raster_lines=312,
+    v_sprite_dma_mask=0, v_sprite_exp_flop=0xFF, v_sprite_y_expand_mask=0,
+    v_sprite_y_lo=0, v_sprite_y_hi=0,
+    v_sprite_mc_lo=0, v_sprite_mc_hi=0,
+    v_sprite_mcbase_lo=0, v_sprite_mcbase_hi=0,
     resid_lib_path=None, resid_ptr=None,
     iec_enabled=false, iec_peer_clk_high=true, iec_peer_data_high=true,
     beam_render_enabled=false, beam_nlines=0u16,
     beam_vic_flat=None, beam_cia2_flat=None,
+    trace_path=None,
 ))]
 fn run_fast_batch_py<'py>(
     py: Python<'py>,
@@ -74,6 +83,15 @@ fn run_fast_batch_py<'py>(
     cia1_icr: u8,
     cia2_pra: u8,
     cia2_ddra: u8,
+    cia1_pra: u8,
+    cia1_prb: u8,
+    cia1_ddra: u8,
+    cia1_ddrb: u8,
+    kbd_matrix: [u8; 8],
+    joy_inject1_clear: u8,
+    joy_inject2_clear: u8,
+    joy_held1_clear: u8,
+    joy_held2_clear: u8,
     ta_latch: u16,
     ta_counter: i32,
     ta_running: bool,
@@ -105,6 +123,15 @@ fn run_fast_batch_py<'py>(
     v_sprite_enable_mask: u32,
     v_cycles_per_line: u32,
     v_num_raster_lines: u16,
+    v_sprite_dma_mask: u32,
+    v_sprite_exp_flop: u32,
+    v_sprite_y_expand_mask: u32,
+    v_sprite_y_lo: u32,
+    v_sprite_y_hi: u32,
+    v_sprite_mc_lo: u32,
+    v_sprite_mc_hi: u32,
+    v_sprite_mcbase_lo: u32,
+    v_sprite_mcbase_hi: u32,
     resid_lib_path: Option<String>,
     resid_ptr: Option<u64>,
     iec_enabled: bool,
@@ -114,6 +141,7 @@ fn run_fast_batch_py<'py>(
     beam_nlines: u16,
     beam_vic_flat: Option<Bound<'py, PyByteArray>>,
     beam_cia2_flat: Option<Bound<'py, PyByteArray>>,
+    trace_path: Option<String>,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let vs = if video_standard.eq_ignore_ascii_case("ntsc") {
         1u8
@@ -158,6 +186,11 @@ fn run_fast_batch_py<'py>(
         bool,
         bool,
         u8,
+        // CIA1 PRA/PRB/DDRA/DDRB after batch (host keeps Python-side latches in sync).
+        u8,
+        u8,
+        u8,
+        u8,
     );
     // PAL (vs==0) or NTSC (vs==1): Rust hybrid VIC uses the matching cycle table.
     let hybrid_effective = hybrid_vic_pal;
@@ -177,14 +210,23 @@ fn run_fast_batch_py<'py>(
             v_sprite_enable_mask,
             v_cycles_per_line,
             v_num_raster_lines,
+            v_sprite_dma_mask,
+            v_sprite_exp_flop,
+            v_sprite_y_expand_mask,
+            v_sprite_y_lo,
+            v_sprite_y_hi,
+            v_sprite_mc_lo,
+            v_sprite_mc_hi,
+            v_sprite_mcbase_lo,
+            v_sprite_mcbase_hi,
         ))
     } else {
         None
     };
 
-    // Beam: copy Python bytearrays into Rust-owned buffers before releasing the GIL.
-    let mut beam_vic_backing: Option<Vec<u8>> = None;
-    let mut beam_cia2_backing: Option<Vec<u8>> = None;
+    // Beam: raw pointers into Python-owned bytearrays (valid while buffer is not resized).
+    let mut beam_vic_ptr_usize: usize = 0;
+    let mut beam_cia2_ptr_usize: usize = 0;
     let mut beam_capture_active = false;
     if beam_render_enabled {
         let n = beam_nlines as usize;
@@ -203,27 +245,29 @@ fn run_fast_batch_py<'py>(
                 "beam_cia2_flat is required when beam_render_enabled",
             ));
         };
-        let (vs, cs) = unsafe {
-            (bv.as_bytes().to_vec(), bc.as_bytes().to_vec())
-        };
-        if vs.len() != n * 64 || cs.len() != n {
-            return Err(PyValueError::new_err(format!(
-                "beam buffers must be {} and {} bytes, got {} and {}",
-                n * 64,
-                n,
-                vs.len(),
-                cs.len()
-            )));
+        unsafe {
+            let vs = bv.as_bytes_mut();
+            let cs = bc.as_bytes_mut();
+            if vs.len() != n * 64 || cs.len() != n {
+                return Err(PyValueError::new_err(format!(
+                    "beam buffers must be {} and {} bytes, got {} and {}",
+                    n * 64,
+                    n,
+                    vs.len(),
+                    cs.len()
+                )));
+            }
+            let vp = vs.as_mut_ptr();
+            let cp = cs.as_mut_ptr();
+            beam_vic_ptr_usize = vp as usize;
+            beam_cia2_ptr_usize = cp as usize;
+            beam_capture_active = true;
         }
-        beam_vic_backing = Some(vs);
-        beam_cia2_backing = Some(cs);
-        beam_capture_active = true;
     }
 
     // Run the heavy batch outside the GIL so Python-side audio/UI threads can run.
-    // Safe: RAM and beam buffers are copied into Rust-owned Vecs; no Python objects are
-    // touched inside the detached closure. Beam results are copied back after detach.
-    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 14], Option<Vec<u8>>, Option<Vec<u8>>), String> =
+    // Safe: we copied the bytearray into `backing` and do not touch Python objects inside.
+    let result: Result<(OutTuple, Vec<u8>, Vec<u8>, [u32; 22]), String> =
         py.detach(move || (move || {
         let ram_arr: &mut [u8; 65536] = backing
             .as_mut_slice()
@@ -239,6 +283,15 @@ fn run_fast_batch_py<'py>(
         mem.cia1_icr = cia1_icr;
         mem.cia2_pra = cia2_pra;
         mem.cia2_ddra = cia2_ddra;
+        mem.cia1_pra = cia1_pra;
+        mem.cia1_prb = cia1_prb;
+        mem.cia1_ddra = cia1_ddra;
+        mem.cia1_ddrb = cia1_ddrb;
+        mem.kbd_matrix = kbd_matrix;
+        mem.joy_inject1_clear = joy_inject1_clear;
+        mem.joy_inject2_clear = joy_inject2_clear;
+        mem.joy_held1_clear = joy_held1_clear;
+        mem.joy_held2_clear = joy_held2_clear;
         mem.iec_merge_cia2 = iec_enabled;
         mem.iec_peer_clk_high = iec_peer_clk_high;
         mem.iec_peer_data_high = iec_peer_data_high;
@@ -266,12 +319,8 @@ fn run_fast_batch_py<'py>(
         if beam_capture_active {
             mem.beam_enabled = true;
             mem.beam_nlines = beam_nlines;
-            if let Some(ref mut bv) = beam_vic_backing {
-                mem.beam_vic_ptr = bv.as_mut_ptr();
-            }
-            if let Some(ref mut bc) = beam_cia2_backing {
-                mem.beam_cia2_ptr = bc.as_mut_ptr();
-            }
+            mem.beam_vic_ptr = beam_vic_ptr_usize as *mut u8;
+            mem.beam_cia2_ptr = beam_cia2_ptr_usize as *mut u8;
         }
 
         let mut resid_box: Option<Box<ResidSession>> =
@@ -294,6 +343,11 @@ fn run_fast_batch_py<'py>(
             p,
             cycles,
             stopped,
+            // Fresh batch: no CLI/SEI/PLP in flight, so no delay active.
+            // (The Python caller re-enters Rust at instruction boundaries, so
+            // any in-flight delay would already have been consumed or
+            // discarded in Python-land.)
+            ..CpuState::default()
         };
         let mut stops = stop_pcs.unwrap_or_default();
         // Python passes a sorted tuple from CPU6502::_rust_delegate_stop_pcs; skip work when already sorted.
@@ -301,6 +355,7 @@ fn run_fast_batch_py<'py>(
             stops.sort_unstable();
         }
         stops.dedup();
+        let trace_path_opt = trace_path.as_deref();
         let (ins, cyc) = run_fast_batch(
             &mut cpu,
             &mut mem,
@@ -309,6 +364,7 @@ fn run_fast_batch_py<'py>(
             hybrid_effective,
             vicii_opt.as_mut(),
             resid_box.as_deref_mut(),
+            trace_path_opt,
         );
         mem.resid = std::ptr::null_mut();
 
@@ -317,7 +373,12 @@ fn run_fast_batch_py<'py>(
         let vpack = if let Some(ref eng) = vicii_opt {
             eng.export_u32()
         } else {
-            [0u32; 14]
+            // Preserve legacy defaults when Rust hybrid VIC is disabled: only
+            // the sprite exp_flop needs a non-zero default (0xFF to match the
+            // Python ViciiCycleEngine initial state; see vicii-cycle.c).
+            let mut z = [0u32; 22];
+            z[17] = 0xFF;
+            z
         };
 
         let out: OutTuple = (
@@ -351,28 +412,19 @@ fn run_fast_batch_py<'py>(
             mem.cia1_timer_b.irq_enabled,
             mem.cia1_timer_b.one_shot,
             mem.cia1_timer_b.input_mode,
+            mem.cia1_pra,
+            mem.cia1_prb,
+            mem.cia1_ddra,
+            mem.cia1_ddrb,
         );
         mem.beam_vic_ptr = std::ptr::null_mut();
         mem.beam_cia2_ptr = std::ptr::null_mut();
         mem.beam_enabled = false;
-        Ok((out, backing, pcm_bytes, vpack, beam_vic_backing, beam_cia2_backing))
+        Ok((out, backing, pcm_bytes, vpack))
     })());
-    let (out, backing_out, pcm_bytes, vpack, beam_vic_out, beam_cia2_out) =
-        result.map_err(|e: String| PyValueError::new_err(e))?;
+    let (out, backing_out, pcm_bytes, vpack) = result.map_err(|e: String| PyValueError::new_err(e))?;
     let dst = unsafe { ram.as_bytes_mut() };
     dst.copy_from_slice(&backing_out);
-    if let (Some(ref bv), Some(ref py_bv)) = (beam_vic_out.as_ref(), beam_vic_flat.as_ref()) {
-        let dst = unsafe { py_bv.as_bytes_mut() };
-        if dst.len() == bv.len() {
-            dst.copy_from_slice(bv);
-        }
-    }
-    if let (Some(ref bc), Some(ref py_bc)) = (beam_cia2_out.as_ref(), beam_cia2_flat.as_ref()) {
-        let dst = unsafe { py_bc.as_bytes_mut() };
-        if dst.len() == bc.len() {
-            dst.copy_from_slice(bc);
-        }
-    }
 
     let (
         ins,
@@ -405,6 +457,10 @@ fn run_fast_batch_py<'py>(
         tbie,
         tbos,
         tbi,
+        out_cia1_pra,
+        out_cia1_prb,
+        out_cia1_ddra,
+        out_cia1_ddrb,
     ) = out;
     let vic_bytes = PyBytes::new(py, &vregs);
     let pcm_py = PyBytes::new(py, &pcm_bytes);
@@ -444,6 +500,10 @@ fn run_fast_batch_py<'py>(
             tbie.into_bound_py_any(py)?,
             tbos.into_bound_py_any(py)?,
             tbi.into_bound_py_any(py)?,
+            out_cia1_pra.into_bound_py_any(py)?,
+            out_cia1_prb.into_bound_py_any(py)?,
+            out_cia1_ddra.into_bound_py_any(py)?,
+            out_cia1_ddrb.into_bound_py_any(py)?,
             pcm_py.into_any(),
             vpack[0].into_bound_py_any(py)?,
             vpack[1].into_bound_py_any(py)?,
@@ -459,6 +519,14 @@ fn run_fast_batch_py<'py>(
             vpack[11].into_bound_py_any(py)?,
             vpack[12].into_bound_py_any(py)?,
             vpack[13].into_bound_py_any(py)?,
+            vpack[14].into_bound_py_any(py)?,
+            vpack[15].into_bound_py_any(py)?,
+            vpack[16].into_bound_py_any(py)?,
+            vpack[17].into_bound_py_any(py)?,
+            vpack[18].into_bound_py_any(py)?,
+            vpack[19].into_bound_py_any(py)?,
+            vpack[20].into_bound_py_any(py)?,
+            vpack[21].into_bound_py_any(py)?,
             beam_vic_py.into_any(),
             beam_cia2_py.into_any(),
         ],

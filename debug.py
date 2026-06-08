@@ -116,20 +116,25 @@ class ViceTraceLogger:
     def enable(self) -> None:
         """Enable trace logging to file"""
         try:
-            self.file = open(self.filename, 'w')
+            # Write headers in truncate mode, then reopen in append mode.
+            # Both Python and Rust open in append mode so writes always go
+            # to EOF – no file-position sync needed between the two.
+            with open(self.filename, 'w') as hdr:
+                hdr.write("; c64py trace (VICE-compatible format)\n")
+                hdr.write("; Format: .C:addr  bytes  mnemonic  - A:xx X:xx Y:xx SP:xx flags  cycles\n")
+                if self._wall_time:
+                    if self._wall_inline:
+                        hdr.write(
+                            "; wall: host seconds since previous instruction appended as ' ; w <sec>' on same line\n"
+                        )
+                    else:
+                        hdr.write(
+                            "; wall: each following '; w' line is seconds since previous trace line (monotonic clock)\n"
+                        )
+            self.file = open(self.filename, 'a')
             self.enabled = True
-            self.file.write("; c64py trace (VICE-compatible format)\n")
-            self.file.write("; Format: .C:addr  bytes  mnemonic  - A:xx X:xx Y:xx SP:xx flags  cycles\n")
             if self._wall_time:
                 self._wall_last = time.monotonic()
-                if self._wall_inline:
-                    self.file.write(
-                        "; wall: host seconds since previous instruction appended as ' ; w <sec>' on same line\n"
-                    )
-                else:
-                    self.file.write(
-                        "; wall: each following '; w' line is seconds since previous trace line (monotonic clock)\n"
-                    )
         except Exception as e:
             print(f"Warning: Failed to open trace file: {e}", file=sys.stderr)
             self.enabled = False
@@ -169,7 +174,7 @@ class ViceTraceLogger:
         flags_str = ''.join(flag_chars)
         
         # VICE format: .C:0813  99 FB 00    STA $00FB,Y    - A:D8 X:00 Y:00 SP:f6 N.-..I..  2112858
-        line = f".C:{pc:04x}  {bytes_str} {instr_str} - A:{a:02X} X:{x:02X} Y:{y:02X} SP:{sp:02x} {flags_str}  {cycles}"
+        line = f".C:{pc:04x}  {bytes_str} {instr_str} - A:{a:02X} X:{x:02X} Y:{y:02X} SP:{sp:02x} {flags_str}  {cycles} ; python"
 
         self._line_count += 1
         if self._wall_time:

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Static analysis of Bruce Lee (and similar) PRG: disassemble driver + on-disk helper,
+Static analysis of a C64 PRG: disassemble driver + on-disk helper,
 scan for CIA/VIC/raster operands, locate ZP pointer traffic.
 
 Usage:
-  python3 scripts/loader_map_dump.py [path/to/game.prg]
-
-Default PRG: programs/BruceLee.prg relative to repo root.
+  python3 scripts/loader_map_dump.py path/to/game.prg
 """
 
 from __future__ import annotations
@@ -60,8 +58,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Static loader map from C64 PRG")
     ap.add_argument(
         "prg",
-        nargs="?",
-        default=str(Path(__file__).resolve().parents[1] / "programs" / "BruceLee.prg"),
         help="Path to .prg",
     )
     args = ap.parse_args()

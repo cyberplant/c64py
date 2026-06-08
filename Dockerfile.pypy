@@ -1,29 +1,41 @@
 # Dockerfile for C64py with PyPy (JIT-compiled Python)
+#
+# Headless smoke-test image: no pygame/SDL (saves long source compiles on PyPy).
+# The PyO3 Rust core (c64py_rust_core) targets CPython only — see Dockerfile.cpython.
 FROM pypy:3.10-slim
 
 WORKDIR /app
 
-# Install SDL development libraries and build tools for pygame-ce
+# Build tools + VICE-style reSID (no SDL — graphics/pygame not installed here)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev \
-    libportmidi-dev \
+    pkg-config \
+    git \
+    autoconf \
+    automake \
+    libtool \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-# Note: Skip numpy for PyPy - it has compatibility issues and PyPy's native
-# arrays are often faster anyway due to JIT compilation
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY docker/requirements-pypy-headless.txt /tmp/requirements-pypy-headless.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-pypy-headless.txt
 
 # Copy the rest of the application
 COPY . .
 
-# Install the package in development mode
-RUN pip install -e .
+RUN git clone --depth 1 https://github.com/cyberplant/resid.git /tmp/resid \
+    && cd /tmp/resid \
+    && autoreconf -i \
+    && ./configure CXXFLAGS="-fPIC -g -Wall -O3 -fno-exceptions" \
+    && make -j"$(nproc)" \
+    && make -C /app/src/resid_wrapper RESID_SRCDIR=/tmp/resid install \
+    && rm -rf /tmp/resid
 
-# ROMs must be mounted at /roms or set via C64PY_ROM_DIR
+# Package metadata lists pygame/textual; install emulator without pulling them.
+RUN pip install --no-cache-dir -e . --no-deps
+
+RUN pypy3 -c "import pathlib; assert pathlib.Path('resid_c.so').is_file()"
+
 ENV C64PY_ROM_DIR=/roms
 
 ENTRYPOINT ["pypy3", "C64.py"]
-CMD ["--benchmark"]
+CMD ["--benchmark", "--no-config", "--vic-emulation", "fast"]

@@ -34,8 +34,21 @@ htmlcov/
 .tox/
 .nox/
 
+# VIC hang matrix raw RAM dumps (see scripts/run_vic_hang_matrix.sh)
+vic_matrix_snapshots/
+
+# Emulator-state snapshots (--save-snapshot-at-cycle / at-exit / alt-s).
+# These are per-run binaries useful for debugging but not for VCS.
+snapshots/
+
+# Ad-hoc render output from scripts/snapshot_render_test.py and similar.
+out/
+
 # Accidental root-level ReSID/debug captures (not part of the repo).
 /test.wav
+
+# find_first_ram_diff_cycle.py RAM + log cache
+.c64py_ram_cache/
 
 # Local logs and benchmark NDJSON (see scripts/run_benchmark.sh)
 logs/*
@@ -48,8 +61,14 @@ roms/
 *.prg
 *.d64
 
+# External VICE test corpus (downloaded on demand)
+test/vice/*
+!test/vice/.gitkeep
+!test/vice/README.md
+
 # Editors / OS
 .DS_Store
 .idea/
 .vscode/
 .aider*
+.sentrux/

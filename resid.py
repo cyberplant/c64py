@@ -259,6 +259,7 @@ class ReSIDEmulator:
         chip_model: Optional[str] = None,
         sampling_method: int = SAMPLE_INTERPOLATE,
         cpu_lockstep: bool = True,
+        audio_volume: float = 1.0,
     ) -> None:
         self._lib = _load_resid_lib()
         self._sid_ptr = self._lib.resid_create()
@@ -287,6 +288,7 @@ class ReSIDEmulator:
         self._lib.resid_set_chip_model(self._sid_ptr, model_const)
 
         self._cpu_lockstep = bool(cpu_lockstep)
+        self._audio_volume = max(0.0, min(1.0, audio_volume))
 
         # Apply sampling parameters
         ok = self._lib.resid_set_sampling_parameters(
@@ -683,6 +685,8 @@ class ReSIDEmulator:
                 buffer=int(mixer_buffer),
             )
         self._channel = pygame.mixer.find_channel(True)
+        # Set volume for the channel
+        self._channel.set_volume(self._audio_volume)
         self._running = True
         # Block pygame's C-level signal handlers BEFORE creating the thread so
         # the new thread inherits the mask with no race window.  pygame registers

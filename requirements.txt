@@ -1,3 +1,5 @@
 rich>=13.0.0
 textual>=0.40.0
 pygame-ce>=2.5.0
+tomli>=2.0.0; python_version<"3.11"
+maturin>=1.7,<2
