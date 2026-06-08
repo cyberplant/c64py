@@ -4,7 +4,7 @@ C64 Emulator Package
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 __version__ = "1.0.1"
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from .ui import TextualInterface
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     if name == "C64":
         from .emulator import C64
 
